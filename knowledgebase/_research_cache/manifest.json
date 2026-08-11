@@ -1,0 +1,610 @@
+{
+  "VizenLink_Home_Community_CCTV_Feature_Seed_v0.1.md": {
+    "mtime": 1786431466.596213,
+    "size": 55978
+  },
+  "scenarios/INDEX.md": {
+    "mtime": 1786431466.513256,
+    "size": 32683
+  },
+  "features/INDEX.md": {
+    "mtime": 1786431466.604215,
+    "size": 117191
+  },
+  "scenarios/mobile-app-24-hour-offline-event-retention-target.md": {
+    "mtime": 1786431466.5148048,
+    "size": 3121
+  },
+  "scenarios/mobile-app-access-audit-log.md": {
+    "mtime": 1786431466.5152802,
+    "size": 2896
+  },
+  "scenarios/mobile-app-accessible-status-severity-indicators.md": {
+    "mtime": 1786431466.5158355,
+    "size": 2545
+  },
+  "scenarios/mobile-app-active-network-interface-indicator.md": {
+    "mtime": 1786431466.5164123,
+    "size": 3293
+  },
+  "scenarios/mobile-app-after-hours-rule-template.md": {
+    "mtime": 1786431466.517184,
+    "size": 2906
+  },
+  "scenarios/mobile-app-alert-evidence-snapshot-clip.md": {
+    "mtime": 1786431466.5177763,
+    "size": 4510
+  },
+  "scenarios/mobile-app-alert-quality-measurement-gating.md": {
+    "mtime": 1786431466.518124,
+    "size": 3205
+  },
+  "scenarios/mobile-app-approval-workflow-sensitive-access.md": {
+    "mtime": 1786431466.5184815,
+    "size": 3025
+  },
+  "scenarios/mobile-app-audio-recording-toggle.md": {
+    "mtime": 1786431466.5190737,
+    "size": 3073
+  },
+  "scenarios/mobile-app-buzzer-auto-stop-safety-timer.md": {
+    "mtime": 1786431466.5193353,
+    "size": 3358
+  },
+  "scenarios/mobile-app-camera-dashboard.md": {
+    "mtime": 1786431466.5198383,
+    "size": 5117
+  },
+  "scenarios/mobile-app-camera-offline-detection-recovery-logging.md": {
+    "mtime": 1786431466.5200906,
+    "size": 3610
+  },
+  "scenarios/mobile-app-camera-side-recording-modes.md": {
+    "mtime": 1786431466.5205047,
+    "size": 6670
+  },
+  "scenarios/mobile-app-camera-side-storage-capacity-estimation.md": {
+    "mtime": 1786431466.52098,
+    "size": 4277
+  },
+  "scenarios/mobile-app-camera-tamper-detection.md": {
+    "mtime": 1786431466.5213377,
+    "size": 5700
+  },
+  "scenarios/mobile-app-cellular-data-usage-awareness.md": {
+    "mtime": 1786431466.5215812,
+    "size": 2910
+  },
+  "scenarios/mobile-app-cloud-mqtt-connection-auto-recovery.md": {
+    "mtime": 1786431466.521836,
+    "size": 3423
+  },
+  "scenarios/mobile-app-cloud-snapshot-thumbnail-upload-for-notifications.md": {
+    "mtime": 1786431466.5220878,
+    "size": 4019
+  },
+  "scenarios/mobile-app-concurrent-multi-viewer-live-view.md": {
+    "mtime": 1786431466.5223181,
+    "size": 3610
+  },
+  "scenarios/mobile-app-configurable-retention-verified-deletion.md": {
+    "mtime": 1786431466.522643,
+    "size": 4385
+  },
+  "scenarios/mobile-app-core-object-detection.md": {
+    "mtime": 1786431466.5229876,
+    "size": 4770
+  },
+  "scenarios/mobile-app-corrective-action-guidance.md": {
+    "mtime": 1786431466.523204,
+    "size": 3375
+  },
+  "scenarios/mobile-app-cross-user-event-status-sync.md": {
+    "mtime": 1786431466.5235186,
+    "size": 4536
+  },
+  "scenarios/mobile-app-current-access-roster.md": {
+    "mtime": 1786431466.5378478,
+    "size": 2474
+  },
+  "scenarios/mobile-app-daily-security-digest.md": {
+    "mtime": 1786431466.538059,
+    "size": 3577
+  },
+  "scenarios/mobile-app-data-freshness-indicator.md": {
+    "mtime": 1786431466.5383599,
+    "size": 4231
+  },
+  "scenarios/mobile-app-data-handling-policy.md": {
+    "mtime": 1786431466.5385563,
+    "size": 3820
+  },
+  "scenarios/mobile-app-day-night-mode.md": {
+    "mtime": 1786431466.5389025,
+    "size": 9234
+  },
+  "scenarios/mobile-app-deep-link-live-view.md": {
+    "mtime": 1786431466.5393832,
+    "size": 4592
+  },
+  "scenarios/mobile-app-detection-sensitivity-tuning.md": {
+    "mtime": 1786431466.5395951,
+    "size": 3519
+  },
+  "scenarios/mobile-app-deterrence-confirmation-gate.md": {
+    "mtime": 1786431466.5398698,
+    "size": 4491
+  },
+  "scenarios/mobile-app-device-health-telemetry.md": {
+    "mtime": 1786431466.5400712,
+    "size": 3474
+  },
+  "scenarios/mobile-app-diagnostic-bundles.md": {
+    "mtime": 1786431466.5404162,
+    "size": 4785
+  },
+  "scenarios/mobile-app-digital-zoom.md": {
+    "mtime": 1786431466.5405984,
+    "size": 2823
+  },
+  "scenarios/mobile-app-direct-camera-to-cloud-live-view.md": {
+    "mtime": 1786431466.5407991,
+    "size": 3393
+  },
+  "scenarios/mobile-app-dirty-lens-haze-fogging-detection.md": {
+    "mtime": 1786431466.5409892,
+    "size": 4066
+  },
+  "scenarios/mobile-app-dropped-downgraded-event-accounting.md": {
+    "mtime": 1786431466.5411894,
+    "size": 3207
+  },
+  "scenarios/mobile-app-dwell-loitering-detection.md": {
+    "mtime": 1786431466.5413694,
+    "size": 2862
+  },
+  "scenarios/mobile-app-edge-event-creation-latency.md": {
+    "mtime": 1786431466.541541,
+    "size": 2712
+  },
+  "scenarios/mobile-app-event-bookmarks-incident-collections.md": {
+    "mtime": 1786431466.541713,
+    "size": 4027
+  },
+  "scenarios/mobile-app-event-clip-pre-roll-post-roll.md": {
+    "mtime": 1786431466.5419059,
+    "size": 2900
+  },
+  "scenarios/mobile-app-event-detail-screen.md": {
+    "mtime": 1786431466.542199,
+    "size": 5111
+  },
+  "scenarios/mobile-app-event-filtering.md": {
+    "mtime": 1786431466.5423732,
+    "size": 3741
+  },
+  "scenarios/mobile-app-event-lock-evidence-protection.md": {
+    "mtime": 1786431466.5425491,
+    "size": 2750
+  },
+  "scenarios/mobile-app-evidence-export-integrity-manifest.md": {
+    "mtime": 1786431466.5427086,
+    "size": 2987
+  },
+  "scenarios/mobile-app-export-watermarking-redaction-indicator.md": {
+    "mtime": 1786431466.5429711,
+    "size": 4334
+  },
+  "scenarios/mobile-app-factory-reset-label-reserved.md": {
+    "mtime": 1786431466.5431588,
+    "size": 3195
+  },
+  "scenarios/mobile-app-full-color-low-light-mode.md": {
+    "mtime": 1786431466.5434089,
+    "size": 4726
+  },
+  "scenarios/mobile-app-full-privacy-mode-physical-shutter.md": {
+    "mtime": 1786431466.543642,
+    "size": 5601
+  },
+  "scenarios/mobile-app-gate-door-left-open.md": {
+    "mtime": 1786431466.5438051,
+    "size": 2826
+  },
+  "scenarios/mobile-app-generic-digital-io-relay.md": {
+    "mtime": 1786431466.5439923,
+    "size": 3779
+  },
+  "scenarios/mobile-app-health-state-model.md": {
+    "mtime": 1786431466.5442421,
+    "size": 5167
+  },
+  "scenarios/mobile-app-household-vs-organization-roles.md": {
+    "mtime": 1786431466.5444043,
+    "size": 3258
+  },
+  "scenarios/mobile-app-image-rotation-corridor-format.md": {
+    "mtime": 1786431466.5445645,
+    "size": 2750
+  },
+  "scenarios/mobile-app-indexed-playback-time-event.md": {
+    "mtime": 1786431466.5447292,
+    "size": 2728
+  },
+  "scenarios/mobile-app-installation-reference-view-capture.md": {
+    "mtime": 1786431466.5448856,
+    "size": 2927
+  },
+  "scenarios/mobile-app-installer-support-no-default-footage-access.md": {
+    "mtime": 1786431466.5450525,
+    "size": 3101
+  },
+  "scenarios/mobile-app-installer-test-mode-notification-suppression.md": {
+    "mtime": 1786431466.5452974,
+    "size": 4480
+  },
+  "scenarios/mobile-app-isp-image-quality-controls.md": {
+    "mtime": 1786431466.5454721,
+    "size": 2804
+  },
+  "scenarios/mobile-app-jpeg-snapshot-capture.md": {
+    "mtime": 1786431466.545624,
+    "size": 2359
+  },
+  "scenarios/mobile-app-lan-live-view-startup-latency.md": {
+    "mtime": 1786431466.5457916,
+    "size": 2466
+  },
+  "scenarios/mobile-app-last-access-active-sessions.md": {
+    "mtime": 1786431466.545943,
+    "size": 2588
+  },
+  "scenarios/mobile-app-lens-dewarping.md": {
+    "mtime": 1786431466.5461164,
+    "size": 2976
+  },
+  "scenarios/mobile-app-local-event-evidence-buffering.md": {
+    "mtime": 1786431466.5462885,
+    "size": 3901
+  },
+  "scenarios/mobile-app-local-microsd-storage.md": {
+    "mtime": 1786431466.5465274,
+    "size": 4276
+  },
+  "scenarios/mobile-app-localization-architecture.md": {
+    "mtime": 1786431466.5466926,
+    "size": 2764
+  },
+  "scenarios/mobile-app-manual-clip-capture-from-live-stream.md": {
+    "mtime": 1786431466.5468497,
+    "size": 3068
+  },
+  "scenarios/mobile-app-mirror-flip-orientation.md": {
+    "mtime": 1786431466.5470002,
+    "size": 2345
+  },
+  "scenarios/mobile-app-mobile-live-view-substream.md": {
+    "mtime": 1786431466.547226,
+    "size": 5090
+  },
+  "scenarios/mobile-app-network-recovery.md": {
+    "mtime": 1786431466.5474641,
+    "size": 4296
+  },
+  "scenarios/mobile-app-night-vision-usability-monitoring.md": {
+    "mtime": 1786431466.5477087,
+    "size": 4509
+  },
+  "scenarios/mobile-app-notification-preferences.md": {
+    "mtime": 1786431466.5479505,
+    "size": 5154
+  },
+  "scenarios/mobile-app-object-tracking.md": {
+    "mtime": 1786431466.5481014,
+    "size": 2970
+  },
+  "scenarios/mobile-app-online-but-unusable-health-display.md": {
+    "mtime": 1786431466.548254,
+    "size": 3467
+  },
+  "scenarios/mobile-app-optional-cloud-event-backup.md": {
+    "mtime": 1786431466.548492,
+    "size": 4547
+  },
+  "scenarios/mobile-app-osd-overlay.md": {
+    "mtime": 1786431466.5487022,
+    "size": 2604
+  },
+  "scenarios/mobile-app-ownership-transfer-decommission.md": {
+    "mtime": 1786431466.5489988,
+    "size": 5334
+  },
+  "scenarios/mobile-app-package-arrival-removal.md": {
+    "mtime": 1786431466.5491548,
+    "size": 2990
+  },
+  "scenarios/mobile-app-parking-duration-rule.md": {
+    "mtime": 1786431466.549314,
+    "size": 2947
+  },
+  "scenarios/mobile-app-per-action-permission-enforcement.md": {
+    "mtime": 1786431466.5495646,
+    "size": 4303
+  },
+  "scenarios/mobile-app-per-site-per-camera-access-scope.md": {
+    "mtime": 1786431466.549728,
+    "size": 3133
+  },
+  "scenarios/mobile-app-post-mount-commissioning-checklist.md": {
+    "mtime": 1786431466.5499558,
+    "size": 4192
+  },
+  "scenarios/mobile-app-post-upload-clip-integrity-verification.md": {
+    "mtime": 1786431466.5501053,
+    "size": 3238
+  },
+  "scenarios/mobile-app-predictive-failure-trend-analysis.md": {
+    "mtime": 1786431466.5502453,
+    "size": 3620
+  },
+  "scenarios/mobile-app-privacy-masks.md": {
+    "mtime": 1786431466.5504167,
+    "size": 3217
+  },
+  "scenarios/mobile-app-prompt-access-revocation.md": {
+    "mtime": 1786431466.5506504,
+    "size": 4359
+  },
+  "scenarios/mobile-app-push-notification-delivery-latency.md": {
+    "mtime": 1786431466.5508034,
+    "size": 2769
+  },
+  "scenarios/mobile-app-qr-assisted-device-registration.md": {
+    "mtime": 1786431466.5509663,
+    "size": 2476
+  },
+  "scenarios/mobile-app-queue-full-policy-definition.md": {
+    "mtime": 1786431466.551139,
+    "size": 3395
+  },
+  "scenarios/mobile-app-recording-storage-failure-detection.md": {
+    "mtime": 1786431466.5512996,
+    "size": 3369
+  },
+  "scenarios/mobile-app-repetitive-event-grouping.md": {
+    "mtime": 1786431466.5515327,
+    "size": 4143
+  },
+  "scenarios/mobile-app-resumable-sync-without-duplication.md": {
+    "mtime": 1786431466.5516944,
+    "size": 3244
+  },
+  "scenarios/mobile-app-retention-policy-configuration.md": {
+    "mtime": 1786431466.551852,
+    "size": 3180
+  },
+  "scenarios/mobile-app-role-gated-event-actions.md": {
+    "mtime": 1786431466.55209,
+    "size": 4489
+  },
+  "scenarios/mobile-app-rule-driven-buzzer-alert.md": {
+    "mtime": 1786431466.5522342,
+    "size": 3103
+  },
+  "scenarios/mobile-app-rule-enable-disable-toggle.md": {
+    "mtime": 1786431466.5523908,
+    "size": 2909
+  },
+  "scenarios/mobile-app-rule-object-class-filter.md": {
+    "mtime": 1786431466.5525389,
+    "size": 2895
+  },
+  "scenarios/mobile-app-rule-recalibration-view-change.md": {
+    "mtime": 1786431466.5526881,
+    "size": 3142
+  },
+  "scenarios/mobile-app-rule-scheduling.md": {
+    "mtime": 1786431466.5530498,
+    "size": 4728
+  },
+  "scenarios/mobile-app-rule-test-mode.md": {
+    "mtime": 1786431466.553205,
+    "size": 2952
+  },
+  "scenarios/mobile-app-sd-card-format-action.md": {
+    "mtime": 1786431466.5534885,
+    "size": 4149
+  },
+  "scenarios/mobile-app-security-critical-update-messaging.md": {
+    "mtime": 1786431466.5537407,
+    "size": 4336
+  },
+  "scenarios/mobile-app-security-update-support-period.md": {
+    "mtime": 1786431466.5538816,
+    "size": 2936
+  },
+  "scenarios/mobile-app-severity-based-eviction-priority.md": {
+    "mtime": 1786431466.5541008,
+    "size": 3789
+  },
+  "scenarios/mobile-app-site-type-installation-templates.md": {
+    "mtime": 1786431466.5542467,
+    "size": 2751
+  },
+  "scenarios/mobile-app-smart-home-ecosystem-integration.md": {
+    "mtime": 1786431466.5544822,
+    "size": 4230
+  },
+  "scenarios/mobile-app-speaker-mic-volume-control.md": {
+    "mtime": 1786431466.554683,
+    "size": 2697
+  },
+  "scenarios/mobile-app-storage-failure-alert-prioritization.md": {
+    "mtime": 1786431466.5549164,
+    "size": 4513
+  },
+  "scenarios/mobile-app-storage-media-endurance.md": {
+    "mtime": 1786431466.5550575,
+    "size": 3264
+  },
+  "scenarios/mobile-app-stronger-admin-authentication.md": {
+    "mtime": 1786431466.555203,
+    "size": 3015
+  },
+  "scenarios/mobile-app-sync-state-display.md": {
+    "mtime": 1786431466.5553496,
+    "size": 3524
+  },
+  "scenarios/mobile-app-time-bounded-access-grants.md": {
+    "mtime": 1786431466.5554993,
+    "size": 2587
+  },
+  "scenarios/mobile-app-timestamp-integrity.md": {
+    "mtime": 1786431466.5556753,
+    "size": 3397
+  },
+  "scenarios/mobile-app-two-way-talk.md": {
+    "mtime": 1786431466.5559006,
+    "size": 4126
+  },
+  "scenarios/mobile-app-unified-timeline.md": {
+    "mtime": 1786431466.5561228,
+    "size": 4526
+  },
+  "scenarios/mobile-app-unusable-image-condition-detection.md": {
+    "mtime": 1786431466.5564752,
+    "size": 4123
+  },
+  "scenarios/mobile-app-unverified-ai-event-messaging-guardrail.md": {
+    "mtime": 1786431466.556703,
+    "size": 4513
+  },
+  "scenarios/mobile-app-user-invitation-access-grant.md": {
+    "mtime": 1786431466.5569172,
+    "size": 3459
+  },
+  "scenarios/mobile-app-user-triggered-camera-restart.md": {
+    "mtime": 1786431466.5570576,
+    "size": 3629
+  },
+  "scenarios/mobile-app-vulnerability-disclosure-process.md": {
+    "mtime": 1786431466.5572102,
+    "size": 3106
+  },
+  "scenarios/mobile-app-wdr-backlight-handling.md": {
+    "mtime": 1786431466.5573726,
+    "size": 3016
+  },
+  "scenarios/mobile-app-wifi-auto-reconnect.md": {
+    "mtime": 1786431466.5575397,
+    "size": 3455
+  },
+  "scenarios/mobile-app-wifi-ble-provisioning-completion-time.md": {
+    "mtime": 1786431466.5577047,
+    "size": 3655
+  },
+  "scenarios/mobile-app-wifi-signal-strength-indicator.md": {
+    "mtime": 1786431466.5578654,
+    "size": 3031
+  },
+  "scenarios/mobile-app-zone-line-rule-authoring.md": {
+    "mtime": 1786431466.5580926,
+    "size": 4175
+  },
+  "scenarios/mobile-app-zone-trigger-types.md": {
+    "mtime": 1786431466.558247,
+    "size": 3057
+  },
+  "features/FEAT-014-jpeg-snapshot-capture.md": {
+    "mtime": 1786431466.5994925,
+    "size": 1668
+  },
+  "features/FEAT-015-osd-overlay.md": {
+    "mtime": 1786431466.5997758,
+    "size": 1327
+  },
+  "features/FEAT-017-isp-image-quality-controls.md": {
+    "mtime": 1786431466.6008384,
+    "size": 1303
+  },
+  "features/FEAT-019-mirror-flip-orientation-control.md": {
+    "mtime": 1786431466.6010087,
+    "size": 1580
+  },
+  "features/FEAT-020-image-rotation-corridor-format.md": {
+    "mtime": 1786431466.6012173,
+    "size": 3031
+  },
+  "features/FEAT-027-buzzer-auto-stop-safety-timer.md": {
+    "mtime": 1786431466.601361,
+    "size": 1692
+  },
+  "features/FEAT-028-rule-driven-automatic-buzzer-alert-channel.md": {
+    "mtime": 1786431466.6015134,
+    "size": 1614
+  },
+  "features/FEAT-029-speaker-mic-volume-control.md": {
+    "mtime": 1786431466.6016612,
+    "size": 1430
+  },
+  "features/FEAT-030-aec-two-way-talk.md": {
+    "mtime": 1786431466.601809,
+    "size": 1553
+  },
+  "features/FEAT-045-manual-clip-capture.md": {
+    "mtime": 1786431466.601944,
+    "size": 1245
+  },
+  "features/FEAT-046-multi-camera-grid-view.md": {
+    "mtime": 1786431466.6020827,
+    "size": 1913
+  },
+  "features/FEAT-047-media-sharing-share-link.md": {
+    "mtime": 1786431466.602262,
+    "size": 1323
+  },
+  "features/FEAT-048-cloud-snapshot-thumbnail-upload.md": {
+    "mtime": 1786431466.6024873,
+    "size": 1555
+  },
+  "features/FEAT-049-storage-capacity-estimation.md": {
+    "mtime": 1786431466.6026723,
+    "size": 1663
+  },
+  "features/FEAT-051-sd-card-format-action.md": {
+    "mtime": 1786431466.602823,
+    "size": 1381
+  },
+  "features/FEAT-082-per-rule-enable-disable-toggle.md": {
+    "mtime": 1786431466.602962,
+    "size": 1358
+  },
+  "features/FEAT-096-wifi-signal-strength-indicator.md": {
+    "mtime": 1786431466.6031103,
+    "size": 1267
+  },
+  "features/FEAT-097-active-network-interface-indicator.md": {
+    "mtime": 1786431466.6033347,
+    "size": 1750
+  },
+  "features/FEAT-098-user-triggered-camera-restart.md": {
+    "mtime": 1786431466.6034923,
+    "size": 1513
+  },
+  "features/FEAT-111-cloud-mqtt-auto-recovery.md": {
+    "mtime": 1786431466.603638,
+    "size": 1730
+  },
+  "features/FEAT-112-wifi-auto-reconnect.md": {
+    "mtime": 1786431466.6037803,
+    "size": 1629
+  },
+  "features/FEAT-113-buffered-event-timestamp-reconciliation.md": {
+    "mtime": 1786431466.6039174,
+    "size": 2149
+  },
+  "features/FEAT-225-full-camera-privacy-mode.md": {
+    "mtime": 1786431466.604049,
+    "size": 2654
+  }
+}

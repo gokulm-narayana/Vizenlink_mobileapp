@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the app's light-mode background (AppColors.lightBase) and the
+         SplashScreen's light-mode color, so the OS's pre-Flutter window
+         doesn't flash white before the splash screen appears. -->
+    <color name="launch_background_color">#F4F6FB</color>
+</resources>

@@ -1,0 +1,408 @@
+import 'package:camera_api/camera_api.dart';
+import 'package:flutter/material.dart';
+
+import '../../app_state/homes_controller.dart';
+import '../../models/scanned_camera.dart';
+import '../../theme/app_colors.dart';
+import '../../widgets/glass_card.dart';
+import '../../widgets/gradient_background.dart';
+import '../../widgets/gradient_button.dart';
+import 'scanning_popup.dart';
+
+const _defaultUsername = 'admin';
+const _defaultPassword = 'password';
+
+class ScannedDevicesScreen extends StatefulWidget {
+  const ScannedDevicesScreen({super.key, required this.homesController});
+
+  static const routeName = 'scan';
+
+  final HomesController homesController;
+
+  @override
+  State<ScannedDevicesScreen> createState() => _ScannedDevicesScreenState();
+}
+
+class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
+  final _discovery = WsDiscoveryClient();
+  List<ScannedCamera> _found = const [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInitial();
+  }
+
+  Future<void> _loadInitial() async {
+    final results = await _scan();
+    if (!mounted) return;
+    setState(() {
+      _found = results;
+      _loading = false;
+    });
+  }
+
+  Future<void> _rescan() async {
+    final scanFuture = _scan();
+    await showScanningPopup(context);
+    final results = await scanFuture;
+    if (!mounted) return;
+    setState(() => _found = results);
+  }
+
+  /// WS-Discovery only yields a device's network address, not its identity or
+  /// setup state — that requires `OnvifDeviceClient`/`CapabilitiesClient`
+  /// (next integration pass), so every discovered candidate is surfaced as
+  /// "Unconfigured" for now rather than guessing.
+  Future<List<ScannedCamera>> _scan() async {
+    var candidates = await _discovery.scanMulticast();
+    if (candidates.isEmpty) {
+      candidates = await _discovery.scanUnicast();
+    }
+    return [
+      for (final candidate in candidates)
+        ScannedCamera(
+          id: candidate.host,
+          name: 'Camera at ${candidate.host}',
+          ipAddress: candidate.host,
+          isConfigured: false,
+        ),
+    ];
+  }
+
+  Future<void> _handleTap(ScannedCamera camera) async {
+    if (camera.isConfigured) {
+      await _showSetupForm(
+        camera,
+        prefillUsername: null,
+        prefillPassword: null,
+        requireConfirm: false,
+      );
+      return;
+    }
+
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return _GlassDialog(
+          key: const Key('SCAN-007'),
+          title: camera.name,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'This camera is factory-reset. How would you like to set it up?',
+                style: Theme.of(dialogContext).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 20),
+              OutlinedButton(
+                onPressed: () => Navigator.of(dialogContext).pop('default'),
+                child: const Text('Connect with default credentials'),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: () => Navigator.of(dialogContext).pop('change'),
+                child: const Text('Change credentials'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (action == null) return;
+
+    if (action == 'default') {
+      await _showSetupForm(
+        camera,
+        prefillUsername: _defaultUsername,
+        prefillPassword: _defaultPassword,
+        requireConfirm: false,
+      );
+    } else {
+      await _showSetupForm(
+        camera,
+        prefillUsername: _defaultUsername,
+        prefillPassword: '',
+        requireConfirm: true,
+      );
+    }
+  }
+
+  Future<void> _showSetupForm(
+    ScannedCamera camera, {
+    required String? prefillUsername,
+    required String? prefillPassword,
+    required bool requireConfirm,
+  }) async {
+    final rooms = widget.homesController.value.selectedHome.rooms;
+    final usernameController = TextEditingController(
+      text: prefillUsername ?? '',
+    );
+    final passwordController = TextEditingController(
+      text: prefillPassword ?? '',
+    );
+    final confirmPasswordController = TextEditingController(
+      text: prefillPassword ?? '',
+    );
+    String? selectedRoom = rooms.isNotEmpty ? rooms.first : null;
+    String? errorText;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return _GlassDialog(
+              key: const Key('SCAN-010'),
+              title: camera.name,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: usernameController,
+                    decoration: const InputDecoration(
+                      labelText: 'Username',
+                      prefixIcon: Icon(Icons.person_outline),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: InputDecoration(
+                      labelText: requireConfirm ? 'New password' : 'Password',
+                      prefixIcon: const Icon(Icons.lock_outline),
+                    ),
+                  ),
+                  if (requireConfirm) ...[
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: confirmPasswordController,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Confirm password',
+                        prefixIcon: Icon(Icons.lock_outline),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  if (rooms.isEmpty)
+                    Text(
+                      'This home has no rooms yet. The camera will be added without a room.',
+                      style: Theme.of(dialogContext).textTheme.bodySmall,
+                    )
+                  else
+                    DropdownButtonFormField<String?>(
+                      initialValue: selectedRoom,
+                      decoration: const InputDecoration(
+                        labelText: 'Room',
+                        prefixIcon: Icon(Icons.meeting_room_outlined),
+                      ),
+                      items: [
+                        for (final room in rooms)
+                          DropdownMenuItem<String?>(
+                            value: room,
+                            child: Text(room),
+                          ),
+                      ],
+                      onChanged: (value) =>
+                          setDialogState(() => selectedRoom = value),
+                    ),
+                  if (errorText != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      errorText!,
+                      style: TextStyle(
+                        color: Theme.of(dialogContext).colorScheme.error,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 24),
+                  GradientButton(
+                    onPressed: () {
+                      if (requireConfirm &&
+                          passwordController.text !=
+                              confirmPasswordController.text) {
+                        setDialogState(
+                          () => errorText = 'Passwords do not match',
+                        );
+                        return;
+                      }
+                      Navigator.of(dialogContext).pop(true);
+                    },
+                    child: const Text('Connect'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    final enteredUsername = usernameController.text;
+    final enteredPassword = passwordController.text;
+    usernameController.dispose();
+    passwordController.dispose();
+    confirmPasswordController.dispose();
+
+    if (confirmed != true) return;
+
+    widget.homesController.addCamera(
+      widget.homesController.value.selectedHome.id,
+      name: camera.name,
+      room: selectedRoom,
+      isOnline: true,
+      host: camera.ipAddress,
+      username: enteredUsername,
+      password: enteredPassword,
+    );
+
+    if (!mounted) return;
+    Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GradientBackground(
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        appBar: AppBar(
+          key: const Key('SCAN-003'),
+          title: const Text('Scanned devices'),
+          actions: [
+            IconButton(
+              key: const Key('SCAN-006'),
+              tooltip: 'Rescan',
+              icon: const Icon(Icons.refresh),
+              onPressed: _rescan,
+            ),
+          ],
+        ),
+        body: _buildResults(context),
+      ),
+    );
+  }
+
+  Widget _buildResults(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    if (_loading) {
+      return const Center(
+        child: CircularProgressIndicator(key: Key('SCAN-011')),
+      );
+    }
+
+    if (_found.isEmpty) {
+      return Center(
+        child: Text(
+          key: const Key('SCAN-005'),
+          'No cameras found on the network.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+      );
+    }
+
+    return ListView.builder(
+      key: const Key('SCAN-004'),
+      padding: const EdgeInsets.all(16),
+      itemCount: _found.length,
+      itemBuilder: (context, index) {
+        final camera = _found[index];
+        final statusColor = camera.isConfigured
+            ? AppColors.online
+            : Colors.amber;
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: GlassCard(
+            padding: EdgeInsets.zero,
+            borderRadius: 16,
+            child: Material(
+              type: MaterialType.transparency,
+              child: ListTile(
+                onTap: () => _handleTap(camera),
+                leading: Container(
+                  width: 44,
+                  height: 44,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: colorScheme.primary.withValues(
+                      alpha: isDark ? 0.25 : 0.12,
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(
+                    Icons.videocam_rounded,
+                    color: colorScheme.primary,
+                  ),
+                ),
+                title: Text(camera.name),
+                subtitle: Text(camera.ipAddress),
+                trailing: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    camera.isConfigured ? 'Configured' : 'Unconfigured',
+                    style: TextStyle(
+                      color: statusColor,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Glass-styled dialog shell shared by the scan setup dialogs, matching the
+/// app's Login/Signup visual language instead of a default AlertDialog.
+class _GlassDialog extends StatelessWidget {
+  const _GlassDialog({super.key, required this.title, required this.child});
+
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24),
+      child: GlassCard(
+        padding: const EdgeInsets.all(24),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(title, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 16),
+              child,
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
