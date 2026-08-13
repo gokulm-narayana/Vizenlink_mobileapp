@@ -5,6 +5,7 @@ import '../../camera_connection.dart';
 import '../../camera_result.dart';
 import '../insecure_camera_http_client.dart';
 import '../wsse_digest.dart';
+import 'soap_fault.dart';
 
 /// Whether the camera reports audio hardware at all — presence only, not full configuration.
 /// Mirrors the ONVIF `GetAudioSources`/`GetAudioOutputs` presence check `FR-MOB-082` already
@@ -13,7 +14,10 @@ import '../wsse_digest.dart';
 /// control, since talking through the camera needs its speaker, and hearing a response needs
 /// its mic.
 class AudioCapability {
-  const AudioCapability({required this.hasSpeaker, required this.hasMicrophone});
+  const AudioCapability({
+    required this.hasSpeaker,
+    required this.hasMicrophone,
+  });
 
   /// `GetAudioOutputs` returned at least one `AudioOutput` — needed for the camera to play the
   /// phone's mic audio (the talk control's minimum requirement).
@@ -29,7 +33,7 @@ class AudioCapability {
 /// today, only the audio-hardware-presence check used to gate the two-way talk control.
 class AudioCapabilityClient {
   AudioCapabilityClient(this.connection, {http.Client? httpClient})
-      : _http = httpClient ?? createCameraHttpClient();
+    : _http = httpClient ?? createCameraHttpClient();
 
   final CameraConnection connection;
   final http.Client _http;
@@ -58,19 +62,22 @@ class AudioCapabilityClient {
     final sourcesBody = (sourcesResult as CameraSuccess<String>).value;
     final outputsBody = (outputsResult as CameraSuccess<String>).value;
 
-    final hasMicrophone = XmlDocument.parse(sourcesBody)
-        .findAllElements('AudioSources', namespace: '*')
-        .isNotEmpty;
-    final hasSpeaker = XmlDocument.parse(outputsBody)
-        .findAllElements('AudioOutputs', namespace: '*')
-        .isNotEmpty;
+    final hasMicrophone = XmlDocument.parse(
+      sourcesBody,
+    ).findAllElements('AudioSources', namespace: '*').isNotEmpty;
+    final hasSpeaker = XmlDocument.parse(
+      outputsBody,
+    ).findAllElements('AudioOutputs', namespace: '*').isNotEmpty;
 
-    return CameraSuccess(AudioCapability(hasSpeaker: hasSpeaker, hasMicrophone: hasMicrophone));
+    return CameraSuccess(
+      AudioCapability(hasSpeaker: hasSpeaker, hasMicrophone: hasMicrophone),
+    );
   }
 
   Future<CameraResult<String>> _post(String bodyXml, Duration timeout) async {
     final digest = WsseDigest.generate(connection.password);
-    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope =
+        '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -92,13 +99,19 @@ class AudioCapabilityClient {
       final response = await _http
           .post(
             connection.onvifMediaEndpoint,
-            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
+            headers: const {
+              'Content-Type': 'application/soap+xml; charset=utf-8',
+            },
             body: envelope,
           )
           .timeout(timeout);
 
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
+      }
+      final faultReason = soapFaultReason(response.body);
+      if (faultReason != null) {
+        return CameraFailure(faultReason);
       }
       return CameraSuccess(response.body);
     } on Exception catch (e) {

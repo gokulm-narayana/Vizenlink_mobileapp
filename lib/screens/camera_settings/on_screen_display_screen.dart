@@ -1,5 +1,10 @@
+import 'dart:async';
+
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_sync.dart';
+import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
 import '../../widgets/color_picker_field.dart';
@@ -80,20 +85,164 @@ extension on _OverlayPosition {
 const _defaultTimeOffset = Offset(0.04, 0.04);
 const _defaultCustomTextOffset = Offset(0.04, 0.78);
 
+/// `_OverlayPosition` <-> ONVIF `tt:Position/tt:Type` wire values.
+String _wirePosType(_OverlayPosition position) => switch (position) {
+  _OverlayPosition.topLeft => kOsdPositionUpperLeft,
+  _OverlayPosition.topRight => kOsdPositionUpperRight,
+  _OverlayPosition.bottomLeft => kOsdPositionLowerLeft,
+  _OverlayPosition.bottomRight => kOsdPositionLowerRight,
+  _OverlayPosition.custom => kOsdPositionCustom,
+};
+
+_OverlayPosition? _overlayPositionFromWire(String? wireValue) =>
+    switch (wireValue) {
+      kOsdPositionUpperLeft => _OverlayPosition.topLeft,
+      kOsdPositionUpperRight => _OverlayPosition.topRight,
+      kOsdPositionLowerLeft => _OverlayPosition.bottomLeft,
+      kOsdPositionLowerRight => _OverlayPosition.bottomRight,
+      kOsdPositionCustom => _OverlayPosition.custom,
+      _ => null,
+    };
+
+/// [Offset] here is already fractional (0-1, top-left origin, Y-down — same
+/// convention `DrawableZone.rect` uses) — exactly what `pixelPointToOnvifPos`/
+/// `onvifPosToPixelPoint` expect for a 1x1 "pixel" container.
+const _unitContainer = PixelSize(1, 1);
+
+OnvifPoint _offsetToOnvifPos(Offset offset) =>
+    pixelPointToOnvifPos(PixelPoint(offset.dx, offset.dy), _unitContainer);
+
+Offset _onvifPosToOffset(double x, double y) {
+  final point = onvifPosToPixelPoint(OnvifPoint(x, y), _unitContainer);
+  return Offset(point.dx, point.dy);
+}
+
+Color _colorFromWire(OsdColor color) =>
+    Color.from(alpha: 1, red: color.x, green: color.y, blue: color.z);
+
+OsdColor _colorToWire(Color color) => OsdColor(
+  x: color.r,
+  y: color.g,
+  z: color.b,
+  colorspace: kOnvifColorspaceRgb,
+);
+
+/// Fallback wire strings, used only when the camera hasn't reported a real
+/// `dateFormats` list yet (no connection, or the options call failed) —
+/// `_resolveDateFormatWire` always prefers a real reported string when one
+/// is available. **Confirmed by direct hardware testing** that guessing
+/// isn't safe here even for `dmy`/`h12`, which reuse this package's own
+/// documented defaults (`kOsdDefaultDateFormat`/`kOsdDefaultTimeFormat`):
+/// the real camera rejected a `SetOSD` call with `ter:InvalidArgVal`
+/// ("Argument Value Invalid") on the very first hardware test of this
+/// screen, and the date/time format fields were the only ones sent by that
+/// call with no real-options backing at all — see `_resolveDateFormatWire`/
+/// `_resolveTimeFormatWire` for the fix.
+const _dateFormatWireByEnum = {
+  _DateFormat.ymd: 'yyyy/MM/dd',
+  _DateFormat.dmy: kOsdDefaultDateFormat,
+  _DateFormat.mdy: 'MM/dd/yyyy',
+};
+
+const _timeFormatWireByEnum = {
+  _TimeFormat.h24: 'HH:mm:ss',
+  _TimeFormat.h12: kOsdDefaultTimeFormat,
+};
+
+/// Resolves [format] to one of the camera's own reported `dateFormats`
+/// (matched by token order — y/M/d — since the two vocabularies otherwise
+/// don't correspond), falling back to `_dateFormatWireByEnum`'s guess only
+/// when the camera hasn't reported a real list. Always prefer a real
+/// reported string over an invented one — see this file's `OsdOptions`
+/// comment for why the guess alone isn't safe to send.
+String _resolveDateFormatWire(_DateFormat format, OsdOptions? options) {
+  final real = options?.dateFormats;
+  if (real == null || real.isEmpty) return _dateFormatWireByEnum[format]!;
+  bool matchesOrder(String wire) {
+    final lower = wire.toLowerCase();
+    final y = lower.indexOf('y');
+    final m = lower.indexOf('m');
+    final d = lower.indexOf('d');
+    if (y == -1 || m == -1 || d == -1) return false;
+    return switch (format) {
+      _DateFormat.ymd => y < m && m < d,
+      _DateFormat.dmy => d < m && m < y,
+      _DateFormat.mdy => m < d && d < y,
+    };
+  }
+
+  for (final wire in real) {
+    if (matchesOrder(wire)) return wire;
+  }
+  return real.first;
+}
+
+/// Resolves [format] to one of the camera's own reported `timeFormats`
+/// (matched by AM/PM-marker presence), same reasoning as
+/// [_resolveDateFormatWire].
+String _resolveTimeFormatWire(_TimeFormat format, OsdOptions? options) {
+  final real = options?.timeFormats;
+  if (real == null || real.isEmpty) return _timeFormatWireByEnum[format]!;
+  bool hasAmPmMarker(String wire) {
+    final lower = wire.toLowerCase();
+    return lower.contains('tt') || lower.contains(' a') || lower.endsWith('a');
+  }
+
+  for (final wire in real) {
+    if (hasAmPmMarker(wire) == (format == _TimeFormat.h12)) return wire;
+  }
+  return real.first;
+}
+
+/// Position choices to actually offer — only what the camera's own
+/// `getOsdOptions().positionTypes` reports (all 5 when unverified — no
+/// connection yet), always keeping [current] so a dropdown's selected value
+/// is never outside its own item list.
+List<_OverlayPosition> _availablePositions(
+  OsdOptions? options,
+  _OverlayPosition current,
+) {
+  if (options == null) return _OverlayPosition.values;
+  final supported =
+      options.positionTypes
+          .map(_overlayPositionFromWire)
+          .whereType<_OverlayPosition>()
+          .toSet()
+        ..add(current);
+  return [
+    for (final position in _OverlayPosition.values)
+      if (supported.contains(position)) position,
+  ];
+}
+
 /// On-Screen Display: a live preview showing Time and Custom Text overlays.
 /// Each has a position (one of 4 fixed corners, or Custom — freely
-/// draggable) and a text color. Local-only draft state — no backend/
-/// protocol wired up yet (see CLAUDE.md), so Save does not persist beyond
-/// this screen. Bitrate and Signal Strength (app-side, non-draggable status
-/// badges that actually apply to the Camera Live page) live on the
-/// separate Tags screen, since they affect the Camera Live page rather than
-/// this screen's own preview. Save is disabled until a field changes.
+/// draggable) and a text color. Backed by `OsdClient` (ONVIF Media2
+/// `GetOSDs`/`CreateOSD`/`SetOSD`/`DeleteOSD`/`GetOSDOptions`) when the
+/// camera has a saved connection — Time is the `DateAndTime` OSD slot,
+/// Custom Text is the `Plain` slot; each slot's server-assigned token is
+/// tracked internally so Save knows whether to `SetOSD` (already exists) or
+/// `CreateOSD` (doesn't yet), and disabling a slot that exists on the camera
+/// sends `DeleteOSD`. Falls back to local-only `HomesController`-free draft
+/// state (`simulateCameraSave`) for a camera with no saved connection yet —
+/// this screen never persisted its fields through `HomesController` even
+/// before this, unlike other camera-settings screens (see CLAUDE.md). WAN
+/// fallback (`WanOsdClient`) isn't wired up yet. Bitrate and Signal Strength
+/// (app-side, non-draggable status badges that actually apply to the Camera
+/// Live page) live on the separate Tags screen, since they affect the
+/// Camera Live page rather than this screen's own preview. Save is disabled
+/// until a field changes.
 class OnScreenDisplayScreen extends StatefulWidget {
-  const OnScreenDisplayScreen({super.key, required this.camera});
+  const OnScreenDisplayScreen({
+    super.key,
+    required this.camera,
+    required this.homesController,
+  });
 
   static const routeName = 'on-screen-display';
 
   final Camera camera;
+  final HomesController homesController;
 
   @override
   State<OnScreenDisplayScreen> createState() => _OnScreenDisplayScreenState();
@@ -118,6 +267,101 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// Server-assigned OSD token for each slot that already exists on the
+  /// camera — null means that slot doesn't exist there yet, so Save should
+  /// `CreateOSD` for it instead of `SetOSD`.
+  String? _timeToken;
+  String? _customTextToken;
+
+  /// The camera's own OSD capability envelope (`getOsdOptions`) — null means
+  /// "camera not verified yet". Used to gate the Position dropdowns and the
+  /// color pickers to what the camera actually reports.
+  OsdOptions? _osdOptions;
+
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
+  /// actually shows up without leaving and re-entering this screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRealOsd();
+  }
+
+  Future<void> _loadRealOsd() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final client = OsdClient(connection);
+    final results = await Future.wait([
+      client.getOsds(),
+      client.getOsdOptions(),
+    ]);
+    client.close();
+    if (!mounted) return;
+
+    final osdsResult = results[0] as CameraResult<List<OsdEntry>>;
+    final optionsResult = results[1] as CameraResult<OsdOptions>;
+
+    setState(() {
+      if (osdsResult case CameraSuccess(:final value)) {
+        OsdEntry? timeEntry;
+        OsdEntry? textEntry;
+        for (final entry in value) {
+          if (entry.textType == 'DateAndTime') timeEntry = entry;
+          if (entry.textType == 'Plain') textEntry = entry;
+        }
+
+        _timeEnabled = timeEntry != null;
+        _timeToken = timeEntry?.token;
+        if (timeEntry != null) {
+          final position = _overlayPositionFromWire(timeEntry.posType);
+          if (position != null) _timePosition = position;
+          if (timeEntry.posType == kOsdPositionCustom &&
+              timeEntry.posX != null &&
+              timeEntry.posY != null) {
+            _timeCustomOffset = _onvifPosToOffset(
+              timeEntry.posX!,
+              timeEntry.posY!,
+            );
+          }
+          if (timeEntry.fontColor != null) {
+            _timeColor = _colorFromWire(timeEntry.fontColor!);
+          }
+        }
+
+        _customTextEnabled = textEntry != null;
+        _customTextToken = textEntry?.token;
+        if (textEntry != null) {
+          _customTextController.text = textEntry.plainText ?? '';
+          final position = _overlayPositionFromWire(textEntry.posType);
+          if (position != null) _customTextPosition = position;
+          if (textEntry.posType == kOsdPositionCustom &&
+              textEntry.posX != null &&
+              textEntry.posY != null) {
+            _customTextCustomOffset = _onvifPosToOffset(
+              textEntry.posX!,
+              textEntry.posY!,
+            );
+          }
+          if (textEntry.fontColor != null) {
+            _customTextColor = _colorFromWire(textEntry.fontColor!);
+          }
+        }
+      }
+      if (optionsResult case CameraSuccess(:final value)) {
+        _osdOptions = value;
+      }
+    });
+  }
+
   @override
   void dispose() {
     _customTextController.dispose();
@@ -132,18 +376,147 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
   }
 
   Future<void> _refreshPreview() async {
+    final connection = _camera.connection;
+    if (connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
     setState(() => _isRefreshing = true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final succeeded = await refreshCameraSnapshot(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
     if (!mounted) return;
     setState(() {
       _isRefreshing = false;
       _previewReloadKey++;
     });
+    if (!succeeded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to refresh preview')),
+      );
+    }
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    final failures = <String>[];
+    String reasonOf(CameraResult<Object?> result) => switch (result) {
+      CameraFailure(:final reason) => reason,
+      CameraTimeout() => 'timed out',
+      CameraSuccess() => '',
+    };
+
+    if (connection != null) {
+      final client = OsdClient(connection);
+
+      // Time (DateAndTime) slot.
+      if (_timeEnabled) {
+        final posType = _wirePosType(_timePosition);
+        final onvifPos = _timePosition == _OverlayPosition.custom
+            ? _offsetToOnvifPos(_timeCustomOffset)
+            : null;
+        final dateWire = _resolveDateFormatWire(_dateFormat, _osdOptions);
+        final timeWire = _resolveTimeFormatWire(_timeFormat, _osdOptions);
+        final color = _colorToWire(_timeColor);
+        final timeToken = _timeToken;
+        if (timeToken != null) {
+          final result = await client.updateTimestampPosition(
+            timeToken,
+            posType: posType,
+            posX: onvifPos?.x ?? 0,
+            posY: onvifPos?.y ?? 0,
+            dateFormat: dateWire,
+            timeFormat: timeWire,
+            fontColor: color,
+          );
+          if (result is! CameraSuccess) {
+            failures.add('time (${reasonOf(result)})');
+          }
+        } else {
+          final result = await client.createTimestampOsd(
+            posType: posType,
+            posX: onvifPos?.x ?? 0.8,
+            posY: onvifPos?.y ?? 1,
+            dateFormat: dateWire,
+            timeFormat: timeWire,
+            fontColor: color,
+          );
+          if (result case CameraSuccess(:final value)) {
+            _timeToken = value;
+          } else {
+            failures.add('time (${reasonOf(result)})');
+          }
+        }
+      } else if (_timeToken != null) {
+        final result = await client.deleteOsd(_timeToken!);
+        if (result is CameraSuccess) {
+          _timeToken = null;
+        } else {
+          failures.add('time (${reasonOf(result)})');
+        }
+      }
+
+      // Custom Text (Plain) slot — treated as "off" when enabled but empty,
+      // same as the preview's own display condition.
+      final hasCustomText =
+          _customTextEnabled && _customTextController.text.isNotEmpty;
+      if (hasCustomText) {
+        final posType = _wirePosType(_customTextPosition);
+        final onvifPos = _customTextPosition == _OverlayPosition.custom
+            ? _offsetToOnvifPos(_customTextCustomOffset)
+            : null;
+        final color = _colorToWire(_customTextColor);
+        final customTextToken = _customTextToken;
+        if (customTextToken != null) {
+          final result = await client.updateTextOsd(
+            customTextToken,
+            _customTextController.text,
+            posType: posType,
+            posX: onvifPos?.x ?? -1,
+            posY: onvifPos?.y ?? 1,
+            fontColor: color,
+          );
+          if (result is! CameraSuccess) {
+            failures.add('custom text (${reasonOf(result)})');
+          }
+        } else {
+          final result = await client.createTextOsd(
+            _customTextController.text,
+            posType: posType,
+            posX: onvifPos?.x ?? -1,
+            posY: onvifPos?.y ?? 1,
+            fontColor: color,
+          );
+          if (result case CameraSuccess(:final value)) {
+            _customTextToken = value;
+          } else {
+            failures.add('custom text (${reasonOf(result)})');
+          }
+        }
+      } else if (_customTextToken != null) {
+        final result = await client.deleteOsd(_customTextToken!);
+        if (result is CameraSuccess) {
+          _customTextToken = null;
+        } else {
+          failures.add('custom text (${reasonOf(result)})');
+        }
+      }
+
+      client.close();
+      succeeded = failures.isEmpty;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -151,9 +524,16 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Changes saved')));
+      if (connection != null) unawaited(_refreshPreview());
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to save changes. Try again.')),
+        SnackBar(
+          content: Text(
+            failures.isEmpty
+                ? 'Failed to save changes. Try again.'
+                : 'Failed to save: ${failures.join(', ')}',
+          ),
+        ),
       );
     }
   }
@@ -196,7 +576,7 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                   _OsdPreview(
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('OSD-005'),
-                    camera: widget.camera,
+                    camera: _camera,
                     timeEnabled: _timeEnabled,
                     timeText:
                         '${_dateFormat.format(DateTime.now())} '
@@ -288,7 +668,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           labelText: 'Position',
                         ),
                         items: [
-                          for (final position in _OverlayPosition.values)
+                          for (final position in _availablePositions(
+                            _osdOptions,
+                            _timePosition,
+                          ))
                             DropdownMenuItem(
                               value: position,
                               child: Text(
@@ -309,19 +692,27 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                       ],
-                      const SizedBox(height: 12),
-                      Text(
-                        'Color',
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
-                      const SizedBox(height: 8),
-                      ColorPickerField(
-                        settingsKey: const Key('OSD-013'),
-                        color: _timeColor,
-                        enabled: _timeEnabled,
-                        onChanged: (color) =>
-                            _markDirty(() => _timeColor = color),
-                      ),
+                      // Hidden outright when the camera reports neither a
+                      // continuous RGB range nor a discrete color list — per
+                      // OsdOptions' doc, a color control with nothing behind
+                      // it isn't a real choice.
+                      if (_osdOptions == null ||
+                          _osdOptions!.fontColorRangeAvailable ||
+                          _osdOptions!.fontColors.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          'Color',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        const SizedBox(height: 8),
+                        ColorPickerField(
+                          settingsKey: const Key('OSD-013'),
+                          color: _timeColor,
+                          enabled: _timeEnabled,
+                          onChanged: (color) =>
+                              _markDirty(() => _timeColor = color),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -355,7 +746,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           labelText: 'Position',
                         ),
                         items: [
-                          for (final position in _OverlayPosition.values)
+                          for (final position in _availablePositions(
+                            _osdOptions,
+                            _customTextPosition,
+                          ))
                             DropdownMenuItem(
                               value: position,
                               child: Text(
@@ -376,19 +770,23 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                       ],
-                      const SizedBox(height: 12),
-                      Text(
-                        'Color',
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
-                      const SizedBox(height: 8),
-                      ColorPickerField(
-                        settingsKey: const Key('OSD-015'),
-                        color: _customTextColor,
-                        enabled: _customTextEnabled,
-                        onChanged: (color) =>
-                            _markDirty(() => _customTextColor = color),
-                      ),
+                      if (_osdOptions == null ||
+                          _osdOptions!.fontColorRangeAvailable ||
+                          _osdOptions!.fontColors.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          'Color',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        const SizedBox(height: 8),
+                        ColorPickerField(
+                          settingsKey: const Key('OSD-015'),
+                          color: _customTextColor,
+                          enabled: _customTextEnabled,
+                          onChanged: (color) =>
+                              _markDirty(() => _customTextColor = color),
+                        ),
+                      ],
                     ],
                   ),
                 ),

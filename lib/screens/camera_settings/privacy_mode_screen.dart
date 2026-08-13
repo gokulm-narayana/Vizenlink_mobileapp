@@ -1,5 +1,9 @@
+import 'dart:async';
+
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/drawable_zone.dart';
@@ -11,12 +15,60 @@ import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
+/// `CameraPrivacyMode` <-> `PrivacyMode` (NuraEye `GetPrivacyMode`/
+/// `SetPrivacyMode`).
+PrivacyMode _toWirePrivacyMode(CameraPrivacyMode mode) => switch (mode) {
+  CameraPrivacyMode.off => PrivacyMode.none,
+  CameraPrivacyMode.full => PrivacyMode.full,
+  CameraPrivacyMode.zone => PrivacyMode.zone,
+};
+
+CameraPrivacyMode _fromWirePrivacyMode(PrivacyMode mode) => switch (mode) {
+  PrivacyMode.none => CameraPrivacyMode.off,
+  PrivacyMode.full => CameraPrivacyMode.full,
+  PrivacyMode.zone => CameraPrivacyMode.zone,
+};
+
+/// [DrawableZone.rect] is already fractional (0-1, top-left origin, Y-down —
+/// see that class's doc) — exactly what `pixelRectToOnvifPolygon`/
+/// `onvifPolygonToPixelRect` expect for a 1x1 "pixel" container, so no real
+/// preview pixel size is needed for this conversion to be correct.
+const _unitContainer = PixelSize(1, 1);
+
+List<OnvifPoint> _zoneToPolygon(Rect rect) => pixelRectToOnvifPolygon(
+  PixelRect(
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+  ),
+  _unitContainer,
+);
+
+Rect _polygonToZoneRect(List<OnvifPoint> polygon) {
+  final pixelRect = onvifPolygonToPixelRect(polygon, _unitContainer);
+  return Rect.fromLTWH(
+    pixelRect.left,
+    pixelRect.top,
+    pixelRect.width,
+    pixelRect.height,
+  );
+}
+
 /// Privacy Mode: Off / Full / Zone selector (PRIV-002). Full blocks the
 /// entire feed; Zone reveals privacy zones — up to 8 draggable/resizable
-/// mask rectangles drawn over regions of the preview. Zones can be
+/// mask rectangles drawn over regions of the preview (fewer if the camera's
+/// own `getMaskOptions().maxMasks` reports a lower limit). Zones can be
 /// configured any time but only take effect in Zone mode, so the zones
-/// section is only shown then. Persisted through [HomesController] (see
-/// `updateCamera`) — see the note on `videoMode` in `lib/models/camera.dart`.
+/// section is only shown then. Backed by real `camera_api` when the camera
+/// has a saved connection: `PrivacyModeClient` for the mode, `MaskClient`
+/// for the zones themselves (`getMasks`/`createMask`/`setMask`/`deleteMask`
+/// — there's no bulk-update call, so Save diffs the zone list against
+/// what's on the camera: new zones get `createMask`, edited zones get
+/// `setMask` by their server-assigned token, removed zones get
+/// `deleteMask`). Falls back to local-only `HomesController` state
+/// (`simulateCameraSave`) for a camera with no saved connection yet. WAN
+/// fallback (`WanPrivacyModeClient`/`WanMaskClient`) isn't wired up yet.
 class PrivacyModeScreen extends StatefulWidget {
   const PrivacyModeScreen({
     super.key,
@@ -34,8 +86,8 @@ class PrivacyModeScreen extends StatefulWidget {
 }
 
 class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
-  late CameraPrivacyMode _mode = widget.camera.privacyMode;
-  late final List<DrawableZone> _zones = [...widget.camera.privacyZones];
+  late CameraPrivacyMode _mode = _camera.privacyMode;
+  late final List<DrawableZone> _zones = [..._camera.privacyZones];
   int? _selectedZoneId;
   late int _nextZoneId =
       (_zones.isEmpty
@@ -47,6 +99,76 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// Server-assigned mask token for each zone that already exists on the
+  /// camera — a zone id with no entry here is new (never saved), so Save
+  /// knows to `createMask` for it instead of `setMask`.
+  final Map<int, String> _maskTokenByZoneId = {};
+
+  /// The camera's own mask capability envelope (`getMaskOptions`) — null
+  /// means "camera not verified yet". Used for the real `maxMasks` limit and
+  /// the `type`/`color` fields every `createMask`/`setMask` call needs.
+  MaskOptions? _maskOptions;
+
+  int get _maxZones => (_maskOptions != null && _maskOptions!.maxMasks > 0)
+      ? (_maskOptions!.maxMasks < maxDrawableZones
+            ? _maskOptions!.maxMasks
+            : maxDrawableZones)
+      : maxDrawableZones;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRealPrivacy();
+  }
+
+  Future<void> _loadRealPrivacy() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final nuraeye = NuraeyeClient(connection);
+    final maskClient = MaskClient(connection);
+    final results = await Future.wait([
+      PrivacyModeClient(nuraeye).getPrivacyMode(),
+      maskClient.getMasks(),
+      maskClient.getMaskOptions(),
+    ]);
+    nuraeye.close();
+    maskClient.close();
+    if (!mounted) return;
+
+    final modeResult = results[0] as CameraResult<PrivacyMode>;
+    final masksResult = results[1] as CameraResult<List<MaskEntry>>;
+    final optionsResult = results[2] as CameraResult<MaskOptions>;
+
+    setState(() {
+      if (modeResult case CameraSuccess(:final value)) {
+        _mode = _fromWirePrivacyMode(value);
+      }
+      if (masksResult case CameraSuccess(:final value)) {
+        _zones.clear();
+        _maskTokenByZoneId.clear();
+        _selectedZoneId = null;
+        var nextId = 0;
+        for (final mask in value) {
+          final id = nextId++;
+          _zones.add(
+            DrawableZone(id: id, rect: _polygonToZoneRect(mask.polygon)),
+          );
+          _maskTokenByZoneId[id] = mask.token;
+        }
+        _nextZoneId = nextId;
+      }
+      if (optionsResult case CameraSuccess(:final value)) {
+        _maskOptions = value;
+      }
+    });
+
+    widget.homesController.updateCamera(
+      widget.camera.id,
+      (camera) =>
+          camera.copyWith(privacyMode: _mode, privacyZones: [..._zones]),
+    );
+  }
+
   void _markDirty(VoidCallback update) {
     setState(() {
       update();
@@ -55,7 +177,7 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
   }
 
   void _addZone() {
-    if (_zones.length >= maxDrawableZones) return;
+    if (_zones.length >= _maxZones) return;
     final id = _nextZoneId++;
     final offset = 0.03 * (_zones.length % 4);
     _markDirty(() {
@@ -107,19 +229,117 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     });
   }
 
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
+  /// actually shows up without leaving and re-entering this screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
   Future<void> _refreshPreview() async {
+    final connection = _camera.connection;
+    if (connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
     setState(() => _isRefreshing = true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final succeeded = await refreshCameraSnapshot(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
     if (!mounted) return;
     setState(() {
       _isRefreshing = false;
       _previewReloadKey++;
     });
+    if (!succeeded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to refresh preview')),
+      );
+    }
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    if (connection != null) {
+      final nuraeye = NuraeyeClient(connection);
+      final modeResult = await PrivacyModeClient(
+        nuraeye,
+      ).setPrivacyMode(_toWirePrivacyMode(_mode));
+      nuraeye.close();
+
+      final maskClient = MaskClient(connection);
+      // ONVIF masks have no bulk-update call — diff the zone list against
+      // what's already on the camera (tracked in _maskTokenByZoneId).
+      final maskType = _maskOptions != null && _maskOptions!.types.isNotEmpty
+          ? _maskOptions!.types.first
+          : 'Color';
+      final maskColor =
+          _maskOptions != null && _maskOptions!.colorList.isNotEmpty
+          ? _maskOptions!.colorList.first
+          : null;
+      var masksOk = true;
+
+      final currentZoneIds = _zones.map((zone) => zone.id).toSet();
+      final removedZoneIds = _maskTokenByZoneId.keys
+          .where((id) => !currentZoneIds.contains(id))
+          .toList();
+      for (final id in removedZoneIds) {
+        final token = _maskTokenByZoneId[id]!;
+        final result = await maskClient.deleteMask(token);
+        if (result is CameraSuccess) {
+          _maskTokenByZoneId.remove(id);
+        } else {
+          masksOk = false;
+        }
+      }
+
+      for (final zone in _zones) {
+        final polygon = _zoneToPolygon(zone.rect);
+        final existingToken = _maskTokenByZoneId[zone.id];
+        if (existingToken != null) {
+          final result = await maskClient.setMask(
+            token: existingToken,
+            polygon: polygon,
+            enabled: true,
+            type: maskType,
+            color: maskColor,
+          );
+          if (result is! CameraSuccess) masksOk = false;
+        } else {
+          final result = await maskClient.createMask(
+            polygon: polygon,
+            enabled: true,
+            type: maskType,
+            color: maskColor,
+          );
+          if (result case CameraSuccess(:final value)) {
+            _maskTokenByZoneId[zone.id] = value;
+          } else {
+            masksOk = false;
+          }
+        }
+      }
+      maskClient.close();
+
+      succeeded = modeResult is CameraSuccess && masksOk;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -132,6 +352,7 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Changes saved')));
+      if (connection != null) unawaited(_refreshPreview());
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to save changes. Try again.')),
@@ -177,7 +398,7 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
                   _PrivacyPreview(
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('PRIV-004'),
-                    camera: widget.camera,
+                    camera: _camera,
                     mode: _mode,
                     zones: _zones,
                     selectedZoneId: _selectedZoneId,
@@ -263,15 +484,13 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
                     children: [
                       Expanded(
                         child: Text(
-                          'Privacy zones (${_zones.length}/$maxDrawableZones)',
+                          'Privacy zones (${_zones.length}/$_maxZones)',
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
                       ),
                       TextButton.icon(
                         key: const Key('PRIV-006'),
-                        onPressed: _zones.length < maxDrawableZones
-                            ? _addZone
-                            : null,
+                        onPressed: _zones.length < _maxZones ? _addZone : null,
                         icon: const Icon(Icons.add, size: 18),
                         label: const Text('Add zone'),
                       ),

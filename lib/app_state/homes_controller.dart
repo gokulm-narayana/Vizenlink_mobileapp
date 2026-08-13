@@ -1,7 +1,104 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/camera.dart';
 import '../models/home.dart';
+import 'camera_credentials_store.dart';
+
+/// Marks a persisted `thumbnailUrl` as a filename under this app's own
+/// `camera_snapshots` documents subfolder (written by
+/// `_saveSnapshotLocally`/`syncCameraFromDevice` in `camera_sync.dart`),
+/// rather than an absolute path or a `picsum.photos` placeholder URL. The
+/// absolute path a snapshot was saved under is only valid for the app
+/// container instance that wrote it — iOS/the simulator can assign a new
+/// container path on a later install, which silently breaks any absolute
+/// path saved straight into `SharedPreferences`. Storing just the filename
+/// here and re-resolving it against the *current* documents directory in
+/// [HomesController.load] keeps local snapshots showing up after a fresh
+/// install/relaunch instead of quietly falling back to the placeholder.
+const _localSnapshotPrefix = 'local-snapshot:';
+
+/// Converts an in-memory [Camera.thumbnailUrl] (an absolute file path for a
+/// locally-saved snapshot, or an `http(s)://` placeholder URL) to what
+/// actually gets written to `SharedPreferences` — see [_localSnapshotPrefix].
+String? _persistableThumbnailUrl(String? thumbnailUrl) {
+  if (thumbnailUrl == null) return null;
+  if (thumbnailUrl.startsWith('http://') ||
+      thumbnailUrl.startsWith('https://')) {
+    return thumbnailUrl;
+  }
+  final slash = thumbnailUrl.lastIndexOf('/');
+  final filename = slash == -1
+      ? thumbnailUrl
+      : thumbnailUrl.substring(slash + 1);
+  return '$_localSnapshotPrefix$filename';
+}
+
+/// Persisted subset of [Camera] — identity/connection fields only (what
+/// `addCamera`/`syncCameraFromDevice` populate), not every settings field
+/// (recording, detection, OSD, imaging, …). Those reset to [Camera]'s own
+/// constructor defaults on every app restart; only "don't make me re-scan
+/// and re-add this camera" is in scope here.
+///
+/// The password is deliberately excluded — it's secret and must not sit in
+/// plaintext in `SharedPreferences`. It's stored separately in
+/// [CameraCredentialsStore] (Android Keystore/iOS Keychain-backed) and
+/// stitched back onto the restored [Camera] in [HomesController.load].
+Map<String, dynamic> _persistedCameraJson(String homeId, Camera camera) => {
+  'homeId': homeId,
+  'id': camera.id,
+  'name': camera.name,
+  'room': camera.room,
+  'isOnline': camera.isOnline,
+  'host': camera.host,
+  'username': camera.username,
+  'ipAddress': camera.ipAddress,
+  'manufacturer': camera.manufacturer,
+  'model': camera.model,
+  'firmwareVersion': camera.firmwareVersion,
+  'serialNumber': camera.serialNumber,
+  'hardwareId': camera.hardwareId,
+  'macAddress': camera.macAddress,
+  'thingName': camera.thingName,
+  'wanLiveViewCapable': camera.wanLiveViewCapable,
+  'thumbnailUrl': _persistableThumbnailUrl(camera.thumbnailUrl),
+  'timezone': camera.timezone,
+};
+
+({String homeId, Camera camera})? _cameraFromPersistedJson(
+  Map<String, dynamic> json,
+) {
+  final homeId = json['homeId'] as String?;
+  final id = json['id'] as String?;
+  final name = json['name'] as String?;
+  if (homeId == null || id == null || name == null) return null;
+  return (
+    homeId: homeId,
+    camera: Camera(
+      id: id,
+      name: name,
+      isOnline: json['isOnline'] as bool? ?? false,
+      room: json['room'] as String?,
+      host: json['host'] as String?,
+      username: json['username'] as String?,
+      ipAddress: json['ipAddress'] as String? ?? '—',
+      manufacturer: json['manufacturer'] as String? ?? '—',
+      model: json['model'] as String? ?? '—',
+      firmwareVersion: json['firmwareVersion'] as String? ?? '—',
+      serialNumber: json['serialNumber'] as String? ?? '—',
+      hardwareId: json['hardwareId'] as String? ?? '—',
+      macAddress: json['macAddress'] as String? ?? '—',
+      thingName: json['thingName'] as String?,
+      wanLiveViewCapable: json['wanLiveViewCapable'] as bool?,
+      thumbnailUrl: json['thumbnailUrl'] as String?,
+      timezone: json['timezone'] as String? ?? 'UTC',
+    ),
+  );
+}
 
 const maxHomes = 10;
 const maxRoomsPerHome = 10;
@@ -24,7 +121,92 @@ class HomesState {
 }
 
 class HomesController extends ValueNotifier<HomesState> {
-  HomesController() : super(_seedState());
+  HomesController({CameraCredentialsStore? credentialsStore})
+    : _credentialsStore = credentialsStore ?? CameraCredentialsStore(),
+      super(_seedState());
+
+  static const _prefsKey = 'homes_controller_cameras_v1';
+
+  final CameraCredentialsStore _credentialsStore;
+
+  /// True once [load] has run (successfully or not) — persisting before then
+  /// would overwrite the saved cameras with the empty seed state, since
+  /// [load] itself sets `value` and this class persists on every `value`
+  /// write (see the [value] setter override below).
+  bool _loaded = false;
+
+  /// Restores previously-added cameras (see [_persistedCameraJson]'s doc for
+  /// what's actually saved) into the seeded homes/rooms. Call once at
+  /// startup, awaited before the splash screen hands off — same convention
+  /// as [ThemeController.load]/`AiModelManager.load`. A camera whose saved
+  /// `homeId` no longer exists (e.g. a future seed change) is dropped rather
+  /// than crashing.
+  Future<void> load() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefsKey);
+      if (raw != null) {
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        final restored = [
+          for (final entry in decoded)
+            _cameraFromPersistedJson(entry as Map<String, dynamic>),
+        ].nonNulls.toList();
+        final docsDir = await getApplicationDocumentsDirectory();
+        final withPasswords = <({String homeId, Camera camera})>[];
+        for (final r in restored) {
+          final password = await _credentialsStore.readPassword(r.camera.id);
+          final thumbnailUrl = r.camera.thumbnailUrl;
+          final resolvedThumbnailUrl =
+              thumbnailUrl != null &&
+                  thumbnailUrl.startsWith(_localSnapshotPrefix)
+              ? '${docsDir.path}/camera_snapshots/'
+                    '${thumbnailUrl.substring(_localSnapshotPrefix.length)}'
+              : thumbnailUrl;
+          withPasswords.add((
+            homeId: r.homeId,
+            camera: r.camera.copyWith(
+              password: password,
+              thumbnailUrl: resolvedThumbnailUrl,
+            ),
+          ));
+        }
+        if (withPasswords.isNotEmpty) {
+          value = value.copyWith(
+            homes: [
+              for (final home in value.homes)
+                home.copyWith(
+                  cameras: [
+                    ...home.cameras,
+                    for (final r in withPasswords)
+                      if (r.homeId == home.id) r.camera,
+                  ],
+                ),
+            ],
+          );
+        }
+      }
+    } on FormatException {
+      // Corrupt saved data — start from the empty seed rather than crash.
+    } finally {
+      _loaded = true;
+    }
+  }
+
+  @override
+  set value(HomesState newValue) {
+    super.value = newValue;
+    if (_loaded) unawaited(_persistCameras());
+  }
+
+  Future<void> _persistCameras() async {
+    final prefs = await SharedPreferences.getInstance();
+    final entries = [
+      for (final home in value.homes)
+        for (final camera in home.cameras)
+          _persistedCameraJson(home.id, camera),
+    ];
+    await prefs.setString(_prefsKey, jsonEncode(entries));
+  }
 
   static String _thumbnailFor(String seed) =>
       'https://picsum.photos/seed/$seed/480/270';
@@ -317,7 +499,10 @@ class HomesController extends ValueNotifier<HomesState> {
     return home.rooms.length < maxRoomsPerHome;
   }
 
-  void addCamera(
+  /// Returns the newly created camera so callers can chain further action on
+  /// it (e.g. an immediate `syncCameraFromDevice` call right after scan
+  /// setup) without a separate lookup.
+  Camera addCamera(
     String homeId, {
     required String name,
     String? room,
@@ -325,6 +510,13 @@ class HomesController extends ValueNotifier<HomesState> {
     String? host,
     String? username,
     String? password,
+    String? manufacturer,
+    String? model,
+    String? firmwareVersion,
+    String? serialNumber,
+    String? hardwareId,
+    String? macAddress,
+    String? thingName,
   }) {
     final cameraId = 'cam-${DateTime.now().microsecondsSinceEpoch}';
     final newCamera = Camera(
@@ -337,6 +529,13 @@ class HomesController extends ValueNotifier<HomesState> {
       username: username,
       password: password,
       ipAddress: host ?? '—',
+      manufacturer: manufacturer ?? '—',
+      model: model ?? '—',
+      firmwareVersion: firmwareVersion ?? '—',
+      serialNumber: serialNumber ?? '—',
+      hardwareId: hardwareId ?? '—',
+      macAddress: macAddress ?? '—',
+      thingName: thingName,
     );
     final updated = [
       for (final home in value.homes)
@@ -346,6 +545,8 @@ class HomesController extends ValueNotifier<HomesState> {
           home,
     ];
     value = value.copyWith(homes: updated);
+    unawaited(_credentialsStore.savePassword(cameraId, password));
+    return newCamera;
   }
 
   void addRoom(String homeId, String roomName) {
@@ -396,6 +597,7 @@ class HomesController extends ValueNotifier<HomesState> {
           home,
     ];
     value = value.copyWith(homes: updated);
+    unawaited(_credentialsStore.deletePassword(cameraId));
   }
 
   void deleteRoom(String homeId, String roomName) {

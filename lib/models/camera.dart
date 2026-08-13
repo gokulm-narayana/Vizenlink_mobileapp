@@ -118,6 +118,8 @@ class Camera {
     this.liveTagOsdEnabled = true,
     this.videoMode = CameraVideoMode.auto,
     this.nightMode = CameraNightMode.smart,
+    this.nightVisionColorCapable,
+    this.nightVisionSmartCapable,
     this.privacyMode = CameraPrivacyMode.off,
     this.privacyZones = const [],
     this.mirrorFlip = CameraMirrorFlip.off,
@@ -232,6 +234,13 @@ class Camera {
   /// They currently have no visible effect on the dummy preview video.
   final CameraVideoMode videoMode;
   final CameraNightMode nightMode;
+
+  /// Hardware/firmware capability flags from the camera's own
+  /// `GetNightVisionType` response — null means "camera not verified yet"
+  /// (no connection, or the check hasn't returned), same fallback reasoning
+  /// as the screen-local flags this mirrors in `night_mode_screen.dart`.
+  final bool? nightVisionColorCapable;
+  final bool? nightVisionSmartCapable;
   final CameraPrivacyMode privacyMode;
   final List<DrawableZone> privacyZones;
   final CameraMirrorFlip mirrorFlip;
@@ -376,10 +385,12 @@ class Camera {
   /// e.g. when the room a camera belonged to is deleted.
   Camera copyWith({
     String? name,
+    bool? isOnline,
     bool? isFavorite,
     bool? isPinned,
     String? room,
     bool setRoom = false,
+    String? thumbnailUrl,
     String? timezone,
     RecordingStatus? recordingStatus,
     List<RecordingScheduleWindow>? recordingScheduleWindows,
@@ -405,6 +416,8 @@ class Camera {
     bool? liveTagOsdEnabled,
     CameraVideoMode? videoMode,
     CameraNightMode? nightMode,
+    bool? nightVisionColorCapable,
+    bool? nightVisionSmartCapable,
     CameraPrivacyMode? privacyMode,
     List<DrawableZone>? privacyZones,
     CameraMirrorFlip? mirrorFlip,
@@ -454,11 +467,11 @@ class Camera {
     return Camera(
       id: id,
       name: name ?? this.name,
-      isOnline: isOnline,
+      isOnline: isOnline ?? this.isOnline,
       room: setRoom ? room : this.room,
       isFavorite: isFavorite ?? this.isFavorite,
       isPinned: isPinned ?? this.isPinned,
-      thumbnailUrl: thumbnailUrl,
+      thumbnailUrl: thumbnailUrl ?? this.thumbnailUrl,
       lastSeen: lastSeen,
       timezone: timezone ?? this.timezone,
       recordingStatus: recordingStatus ?? this.recordingStatus,
@@ -488,6 +501,10 @@ class Camera {
       liveTagOsdEnabled: liveTagOsdEnabled ?? this.liveTagOsdEnabled,
       videoMode: videoMode ?? this.videoMode,
       nightMode: nightMode ?? this.nightMode,
+      nightVisionColorCapable:
+          nightVisionColorCapable ?? this.nightVisionColorCapable,
+      nightVisionSmartCapable:
+          nightVisionSmartCapable ?? this.nightVisionSmartCapable,
       privacyMode: privacyMode ?? this.privacyMode,
       privacyZones: privacyZones ?? this.privacyZones,
       mirrorFlip: mirrorFlip ?? this.mirrorFlip,

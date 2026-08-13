@@ -6,6 +6,7 @@ import '../../camera_result.dart';
 import '../../util/onvif_rect_coordinates.dart';
 import '../insecure_camera_http_client.dart';
 import 'onvif_device_client.dart';
+import 'soap_fault.dart';
 import '../wsse_digest.dart';
 
 const _kVideoSourceConfigToken = 'VideoSourceCfg_1';
@@ -42,7 +43,12 @@ class MaskEntry {
 }
 
 class MaskColor {
-  const MaskColor({required this.x, required this.y, required this.z, required this.colorspace});
+  const MaskColor({
+    required this.x,
+    required this.y,
+    required this.z,
+    required this.colorspace,
+  });
   final double x;
   final double y;
   final double z;
@@ -133,9 +139,13 @@ class MaskClient {
     final servicesResult = await _device.getServices(timeout: timeout);
     switch (servicesResult) {
       case CameraSuccess<List<OnvifServiceEntry>>(:final value):
-        final entry = value.where((e) => e.namespace == _kMedia2Namespace).firstOrNull;
+        final entry = value
+            .where((e) => e.namespace == _kMedia2Namespace)
+            .firstOrNull;
         if (entry == null) {
-          return const CameraFailure('Media2 service not offered by this camera');
+          return const CameraFailure(
+            'Media2 service not offered by this camera',
+          );
         }
         _endpointCacheByHost[connection.host] = entry.xAddr;
         return CameraSuccess(entry.xAddr);
@@ -159,14 +169,20 @@ class MaskClient {
       for (final el in doc.findAllElements('Masks', namespace: '*')) {
         final token = el.getAttribute('token');
         if (token == null || token.isEmpty) continue;
-        final cfgTokenEl = el.findElements('ConfigurationToken', namespace: '*');
+        final cfgTokenEl = el.findElements(
+          'ConfigurationToken',
+          namespace: '*',
+        );
         final typeEl = el.findElements('Type', namespace: '*');
         final enabledEl = el.findElements('Enabled', namespace: '*');
         if (typeEl.isEmpty || enabledEl.isEmpty) continue;
 
         final points = <OnvifPoint>[];
         for (final polygonEl in el.findElements('Polygon', namespace: '*')) {
-          for (final pointEl in polygonEl.findElements('Point', namespace: '*')) {
+          for (final pointEl in polygonEl.findElements(
+            'Point',
+            namespace: '*',
+          )) {
             final x = double.tryParse(pointEl.getAttribute('x') ?? '');
             final y = double.tryParse(pointEl.getAttribute('y') ?? '');
             if (x != null && y != null) points.add(OnvifPoint(x, y));
@@ -177,14 +193,24 @@ class MaskClient {
         entries.add(
           MaskEntry(
             token: token,
-            vsrcCfgToken: cfgTokenEl.isEmpty ? '' : cfgTokenEl.first.innerText.trim(),
+            vsrcCfgToken: cfgTokenEl.isEmpty
+                ? ''
+                : cfgTokenEl.first.innerText.trim(),
             polygon: points,
             type: typeEl.first.innerText.trim(),
             enabled: enabledEl.first.innerText.trim() == 'true',
-            colorX: colorEl.isEmpty ? null : double.tryParse(colorEl.first.getAttribute('X') ?? ''),
-            colorY: colorEl.isEmpty ? null : double.tryParse(colorEl.first.getAttribute('Y') ?? ''),
-            colorZ: colorEl.isEmpty ? null : double.tryParse(colorEl.first.getAttribute('Z') ?? ''),
-            colorspace: colorEl.isEmpty ? null : colorEl.first.getAttribute('Colorspace'),
+            colorX: colorEl.isEmpty
+                ? null
+                : double.tryParse(colorEl.first.getAttribute('X') ?? ''),
+            colorY: colorEl.isEmpty
+                ? null
+                : double.tryParse(colorEl.first.getAttribute('Y') ?? ''),
+            colorZ: colorEl.isEmpty
+                ? null
+                : double.tryParse(colorEl.first.getAttribute('Z') ?? ''),
+            colorspace: colorEl.isEmpty
+                ? null
+                : colorEl.first.getAttribute('Colorspace'),
           ),
         );
       }
@@ -231,7 +257,10 @@ class MaskClient {
           .toList(growable: false);
       final colorList = <MaskColor>[];
       for (final colorOptEl in el.findElements('Color', namespace: '*')) {
-        for (final listEl in colorOptEl.findElements('ColorList', namespace: '*')) {
+        for (final listEl in colorOptEl.findElements(
+          'ColorList',
+          namespace: '*',
+        )) {
           final x = double.tryParse(listEl.getAttribute('X') ?? '');
           final y = double.tryParse(listEl.getAttribute('Y') ?? '');
           final z = double.tryParse(listEl.getAttribute('Z') ?? '');
@@ -244,8 +273,12 @@ class MaskClient {
       return MaskOptions(
         rectangleOnly: el.getAttribute('RectangleOnly') == 'true',
         singleColorOnly: el.getAttribute('SingleColorOnly') == 'true',
-        maxMasks: maxMasksEl.isEmpty ? 0 : int.tryParse(maxMasksEl.first.innerText.trim()) ?? 0,
-        maxPoints: maxPointsEl.isEmpty ? 4 : int.tryParse(maxPointsEl.first.innerText.trim()) ?? 4,
+        maxMasks: maxMasksEl.isEmpty
+            ? 0
+            : int.tryParse(maxMasksEl.first.innerText.trim()) ?? 0,
+        maxPoints: maxPointsEl.isEmpty
+            ? 4
+            : int.tryParse(maxPointsEl.first.innerText.trim()) ?? 4,
         types: types,
         colorList: colorList,
       );
@@ -323,7 +356,9 @@ class MaskClient {
     required String type,
     MaskColor? color,
   }) {
-    final pointsXml = polygon.map((p) => '<tt:Point x="${p.x}" y="${p.y}"/>').join();
+    final pointsXml = polygon
+        .map((p) => '<tt:Point x="${p.x}" y="${p.y}"/>')
+        .join();
     final colorXml = color == null
         ? ''
         : '<tr2:Color X="${color.x}" Y="${color.y}" Z="${color.z}" '
@@ -350,7 +385,8 @@ class MaskClient {
     }
 
     final digest = WsseDigest.generate(connection.password);
-    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope =
+        '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -372,13 +408,19 @@ class MaskClient {
       final response = await _http
           .post(
             endpoint,
-            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
+            headers: const {
+              'Content-Type': 'application/soap+xml; charset=utf-8',
+            },
             body: envelope,
           )
           .timeout(timeout);
 
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
+      }
+      final faultReason = soapFaultReason(response.body);
+      if (faultReason != null) {
+        return CameraFailure(faultReason);
       }
       return CameraSuccess(response.body);
     } on Exception catch (e) {

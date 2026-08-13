@@ -9,6 +9,14 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"/>
+    <!-- Needed by the wifi_scan package to list nearby networks on
+         wifi_config_screen (Android only — iOS has no public API for this).
+         ACCESS_FINE_LOCATION is what the package's own canStartScan/
+         canGetScannedResults checks request; Android ties Wi-Fi scan
+         results to location permission, no way around it. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <application
         android:label="mobilecctvapp"
         android:name="${applicationName}"

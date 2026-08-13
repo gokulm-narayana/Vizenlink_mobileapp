@@ -10,6 +10,7 @@ import 'app_state/theme_controller.dart';
 import 'models/camera.dart';
 import 'models/alert.dart';
 import 'models/event.dart';
+import 'models/scanned_camera.dart';
 import 'screens/account/account_screen.dart';
 import 'screens/account/account_settings_screen.dart';
 import 'screens/account/active_sessions_screen.dart';
@@ -60,11 +61,6 @@ void main() {
   runApp(const MobileCctvApp());
 }
 
-/// Minimum time the splash screen stays up, so it's actually visible even
-/// though real startup work (SharedPreferences reads) usually finishes
-/// almost instantly — see `SplashScreen`.
-const _splashMinDuration = Duration(seconds: 15);
-
 class MobileCctvApp extends StatefulWidget {
   const MobileCctvApp({super.key});
 
@@ -86,14 +82,15 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
   @override
   void initState() {
     super.initState();
-    // Real startup work (SharedPreferences reads) usually finishes in a few
-    // milliseconds — waiting on it alone would make the splash flash by
-    // invisibly. `_splashMinDuration` guarantees it's actually visible,
-    // while still waiting longer if real loading ever takes more than that.
+    // The splash stays up for exactly as long as this real background
+    // loading takes — no artificial padding. It used to force a fixed
+    // 15-second minimum regardless of how fast loading actually finished,
+    // making every app launch wait 15s even though this work normally
+    // completes in milliseconds.
     _appReady = Future.wait([
       _themeController.load(),
       _aiModelManager.load(),
-      Future.delayed(_splashMinDuration),
+      _homesController.load(),
     ]);
     _router = _buildRouter();
   }
@@ -154,6 +151,7 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
                       path: ScannedDevicesScreen.routeName,
                       builder: (context, state) => ScannedDevicesScreen(
                         homesController: _homesController,
+                        initialResults: state.extra as List<ScannedCamera>?,
                       ),
                     ),
                     GoRoute(
@@ -220,6 +218,7 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
                                   builder: (context, state) =>
                                       OnScreenDisplayScreen(
                                         camera: state.extra as Camera,
+                                        homesController: _homesController,
                                       ),
                                 ),
                                 GoRoute(

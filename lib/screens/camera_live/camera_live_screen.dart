@@ -16,6 +16,7 @@ import 'package:video_player/video_player.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../theme/app_colors.dart';
+import '../../widgets/camera_thumbnail_image.dart';
 import '../../widgets/camera_timeline.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
@@ -603,11 +604,10 @@ class _OfflineThumbnail extends StatelessWidget {
     if (thumbnailUrl == null) {
       return const ColoredBox(color: Colors.black);
     }
-    return Image.network(
-      thumbnailUrl,
+    return CameraThumbnailImage(
+      thumbnailUrl: thumbnailUrl,
       fit: BoxFit.cover,
-      errorBuilder: (context, error, stackTrace) =>
-          const ColoredBox(color: Colors.black),
+      placeholderBuilder: () => const ColoredBox(color: Colors.black),
     );
   }
 }

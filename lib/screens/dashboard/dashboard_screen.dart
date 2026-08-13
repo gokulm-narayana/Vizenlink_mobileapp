@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../app_state/ai_model_manager.dart';
 import '../../app_state/alerts_controller.dart';
+import '../../app_state/camera_sync.dart';
 import '../../app_state/events_controller.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
@@ -21,6 +24,11 @@ const _manageHomesMenuValue = '__manage_homes__';
 const _allTabLabel = 'All';
 const _favouritesTabLabel = 'Favourites';
 const _unassignedRoomLabel = 'Unassigned';
+
+/// How often the Dashboard silently re-fetches a live snapshot for every
+/// camera with a saved connection, so tiles don't go stale while the user
+/// just sits on this screen without manually hitting Refresh anywhere.
+const _thumbnailRefreshInterval = Duration(minutes: 5);
 
 enum _CollectionLayout { grid, list }
 
@@ -51,6 +59,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   _CollectionLayout _layout = _CollectionLayout.grid;
   bool _isReorderMode = false;
   bool _isFabExpanded = true;
+  Timer? _thumbnailRefreshTimer;
 
   @override
   void initState() {
@@ -61,13 +70,40 @@ class _DashboardScreenState extends State<DashboardScreen>
       vsync: this,
     );
     widget.homesController.addListener(_onHomesChanged);
+    _thumbnailRefreshTimer = Timer.periodic(
+      _thumbnailRefreshInterval,
+      (_) => _refreshAllThumbnails(),
+    );
   }
 
   @override
   void dispose() {
     widget.homesController.removeListener(_onHomesChanged);
     _collectionTabController.dispose();
+    _thumbnailRefreshTimer?.cancel();
     super.dispose();
+  }
+
+  /// Silently re-fetches a live snapshot for every camera (across every
+  /// home, not just the one currently selected) that has a saved connection
+  /// — same underlying call as each camera's own manual "Refresh preview"
+  /// button, just fired on a timer instead of a tap. Fire-and-forget:
+  /// per-camera failures are dropped rather than surfaced, exactly like a
+  /// missed manual refresh would be — the next tick tries again.
+  void _refreshAllThumbnails() {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        final connection = camera.connection;
+        if (connection == null) continue;
+        unawaited(
+          refreshCameraSnapshot(
+            homesController: widget.homesController,
+            cameraId: camera.id,
+            connection: connection,
+          ),
+        );
+      }
+    }
   }
 
   void _onHomesChanged() {
@@ -133,10 +169,17 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Future<void> _startAddCameraFlow() async {
-    await showScanningPopup(context);
-    if (!mounted) return;
+    // Runs the real scan behind a popup that stays on the Dashboard route —
+    // cancelable (Cancel button or back gesture/button), both confirming
+    // first via "Do you want to stop scanning?" (see scanning_popup.dart).
+    // Only navigates to the results screen once a real (non-cancelled) scan
+    // has actually finished, passing its results along so that screen
+    // doesn't re-run the same scan a second time.
+    final results = await showDashboardScanningPopup(context);
+    if (results == null || !mounted) return;
     context.push(
       '${DashboardScreen.routeName}/${ScannedDevicesScreen.routeName}',
+      extra: results,
     );
   }
 

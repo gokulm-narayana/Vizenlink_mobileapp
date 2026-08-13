@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
@@ -45,14 +46,44 @@ class _MotionDetectionScreenState extends State<MotionDetectionScreen> {
     });
   }
 
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
+  /// actually shows up without leaving and re-entering this screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
   Future<void> _refreshPreview() async {
+    final connection = _camera.connection;
+    if (connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
     setState(() => _isRefreshing = true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final succeeded = await refreshCameraSnapshot(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
     if (!mounted) return;
     setState(() {
       _isRefreshing = false;
       _previewReloadKey++;
     });
+    if (!succeeded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to refresh preview')),
+      );
+    }
   }
 
   Future<void> _save() async {
@@ -117,7 +148,7 @@ class _MotionDetectionScreenState extends State<MotionDetectionScreen> {
                   CameraPreviewThumbnail(
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('MOTION-005'),
-                    camera: widget.camera,
+                    camera: _camera,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(

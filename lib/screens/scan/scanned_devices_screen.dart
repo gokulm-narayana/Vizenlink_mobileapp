@@ -1,6 +1,11 @@
+import 'dart:async';
+
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
+import '../../app_state/camera_scan.dart';
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/scanned_camera.dart';
 import '../../theme/app_colors.dart';
@@ -9,33 +14,54 @@ import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_button.dart';
 import 'scanning_popup.dart';
 
-const _defaultUsername = 'admin';
-const _defaultPassword = 'password';
-
 class ScannedDevicesScreen extends StatefulWidget {
-  const ScannedDevicesScreen({super.key, required this.homesController});
+  const ScannedDevicesScreen({
+    super.key,
+    required this.homesController,
+    this.initialResults,
+    this.scan = scanForCameras,
+    this.httpClient,
+  });
 
   static const routeName = 'scan';
 
   final HomesController homesController;
+
+  /// Results from a scan the caller already ran (the Dashboard's scanning
+  /// popup — see `dashboard_screen.dart`'s `_startAddCameraFlow`) — when
+  /// present, skips this screen's own initial scan entirely rather than
+  /// running `scanForCameras()` a second time back-to-back.
+  final List<ScannedCamera>? initialResults;
+
+  /// Defaults to the real [scanForCameras] (LAN WS-Discovery over UDP
+  /// sockets) — overridable so tests can supply canned results instead of
+  /// hitting real network hardware, which isn't available in a sandboxed
+  /// test environment (see `scan_cameras_screen.md`'s Notes).
+  final Future<List<ScannedCamera>> Function() scan;
+
+  /// Threaded into every `OnvifDeviceClient` this screen constructs for the
+  /// setup form's real credential verification (`OnvifDeviceClient.
+  /// getDeviceInformation` and friends) — `null` means the real HTTP
+  /// client. Overridable for the same reason as [scan]: tests can supply a
+  /// `MockClient` instead of calling a real camera.
+  final http.Client? httpClient;
 
   @override
   State<ScannedDevicesScreen> createState() => _ScannedDevicesScreenState();
 }
 
 class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
-  final _discovery = WsDiscoveryClient();
-  List<ScannedCamera> _found = const [];
-  bool _loading = true;
+  late List<ScannedCamera> _found = widget.initialResults ?? const [];
+  late bool _loading = widget.initialResults == null;
 
   @override
   void initState() {
     super.initState();
-    _loadInitial();
+    if (widget.initialResults == null) _loadInitial();
   }
 
   Future<void> _loadInitial() async {
-    final results = await _scan();
+    final results = await widget.scan();
     if (!mounted) return;
     setState(() {
       _found = results;
@@ -44,31 +70,11 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
   }
 
   Future<void> _rescan() async {
-    final scanFuture = _scan();
+    final scanFuture = widget.scan();
     await showScanningPopup(context);
     final results = await scanFuture;
     if (!mounted) return;
     setState(() => _found = results);
-  }
-
-  /// WS-Discovery only yields a device's network address, not its identity or
-  /// setup state — that requires `OnvifDeviceClient`/`CapabilitiesClient`
-  /// (next integration pass), so every discovered candidate is surfaced as
-  /// "Unconfigured" for now rather than guessing.
-  Future<List<ScannedCamera>> _scan() async {
-    var candidates = await _discovery.scanMulticast();
-    if (candidates.isEmpty) {
-      candidates = await _discovery.scanUnicast();
-    }
-    return [
-      for (final candidate in candidates)
-        ScannedCamera(
-          id: candidate.host,
-          name: 'Camera at ${candidate.host}',
-          ipAddress: candidate.host,
-          isConfigured: false,
-        ),
-    ];
   }
 
   Future<void> _handleTap(ScannedCamera camera) async {
@@ -117,14 +123,14 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
     if (action == 'default') {
       await _showSetupForm(
         camera,
-        prefillUsername: _defaultUsername,
-        prefillPassword: _defaultPassword,
+        prefillUsername: kScanDefaultUsername,
+        prefillPassword: kScanDefaultPassword,
         requireConfirm: false,
       );
     } else {
       await _showSetupForm(
         camera,
-        prefillUsername: _defaultUsername,
+        prefillUsername: kScanDefaultUsername,
         prefillPassword: '',
         requireConfirm: true,
       );
@@ -149,9 +155,15 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
     );
     String? selectedRoom = rooms.isNotEmpty ? rooms.first : null;
     String? errorText;
+    bool verifying = false;
+    DeviceInformation? verifiedInfo;
+    String? verifiedMacAddress;
+    String? verifiedThingName;
+    String? verifiedName;
 
     final confirmed = await showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (dialogContext, setDialogState) {
@@ -221,24 +233,111 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
                       ),
                     ),
                   ],
+                  if (verifying) ...[
+                    const SizedBox(height: 16),
+                    const Center(
+                      child: SizedBox(
+                        key: Key('SCAN-012'),
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 24),
                   GradientButton(
-                    onPressed: () {
-                      if (requireConfirm &&
-                          passwordController.text !=
-                              confirmPasswordController.text) {
-                        setDialogState(
-                          () => errorText = 'Passwords do not match',
-                        );
-                        return;
-                      }
-                      Navigator.of(dialogContext).pop(true);
-                    },
+                    onPressed: verifying
+                        ? null
+                        : () async {
+                            if (requireConfirm &&
+                                passwordController.text !=
+                                    confirmPasswordController.text) {
+                              setDialogState(
+                                () => errorText = 'Passwords do not match',
+                              );
+                              return;
+                            }
+
+                            setDialogState(() {
+                              verifying = true;
+                              errorText = null;
+                            });
+
+                            final connection = CameraConnection(
+                              host: camera.ipAddress,
+                              username: usernameController.text,
+                              password: passwordController.text,
+                            );
+                            final deviceClient = OnvifDeviceClient(
+                              connection,
+                              httpClient: widget.httpClient,
+                            );
+                            final infoResult = await deviceClient
+                                .getDeviceInformation();
+
+                            final failureMessage = switch (infoResult) {
+                              CameraSuccess(:final value) => () {
+                                verifiedInfo = value;
+                                return null;
+                              }(),
+                              CameraFailure(:final reason) => reason,
+                              CameraTimeout() =>
+                                'Camera did not respond. Check the '
+                                    'username/password and try again.',
+                            };
+
+                            if (failureMessage != null) {
+                              deviceClient.close();
+                              if (!dialogContext.mounted) return;
+                              setDialogState(() {
+                                verifying = false;
+                                errorText = failureMessage;
+                              });
+                              return;
+                            }
+
+                            // Best-effort — a WAN thing name or MAC address
+                            // isn't required for the camera to be usable over
+                            // LAN, so a failure here doesn't block setup.
+                            switch (await deviceClient.getSerialNumber()) {
+                              case CameraSuccess(:final value):
+                                verifiedThingName = value;
+                              case CameraFailure() || CameraTimeout():
+                                break;
+                            }
+                            switch (await deviceClient
+                                .getNetworkInterfaceInfo()) {
+                              case CameraSuccess(:final value):
+                                verifiedMacAddress = value.macAddress;
+                              case CameraFailure() || CameraTimeout():
+                                break;
+                            }
+                            // The camera's actually-configured display name
+                            // (ONVIF GetScopes) — falls back to whatever name
+                            // was already showing (the scan-list entry, or
+                            // this dialog's title) if the camera has none set
+                            // yet (empty scope) or this call fails.
+                            switch (await deviceClient.getDeviceIdentity()) {
+                              case CameraSuccess(:final value)
+                                  when value.name.isNotEmpty:
+                                verifiedName = value.name;
+                              case CameraSuccess() ||
+                                  CameraFailure() ||
+                                  CameraTimeout():
+                                break;
+                            }
+                            deviceClient.close();
+
+                            if (!dialogContext.mounted) return;
+                            Navigator.of(dialogContext).pop(true);
+                          },
                     child: const Text('Connect'),
                   ),
                   const SizedBox(height: 8),
                   TextButton(
-                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    onPressed: verifying
+                        ? null
+                        : () => Navigator.of(dialogContext).pop(false),
                     child: const Text('Cancel'),
                   ),
                 ],
@@ -251,21 +350,54 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
 
     final enteredUsername = usernameController.text;
     final enteredPassword = passwordController.text;
+
+    // showDialog's Future resolves as soon as Navigator.pop() is called, not
+    // after the dialog's exit transition actually finishes — its TextFields
+    // (and their bound controllers) are still mounted and animating out for
+    // a short time after this point. Disposing immediately intermittently
+    // crashed with "TextEditingController used after being disposed" once
+    // Connect started taking several real seconds (credential verification)
+    // instead of closing instantly. 300ms comfortably clears Material's
+    // ~150ms default dialog transition.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
     usernameController.dispose();
     passwordController.dispose();
     confirmPasswordController.dispose();
 
     if (confirmed != true) return;
 
-    widget.homesController.addCamera(
+    final newCamera = widget.homesController.addCamera(
       widget.homesController.value.selectedHome.id,
-      name: camera.name,
+      name: verifiedName ?? camera.name,
       room: selectedRoom,
       isOnline: true,
       host: camera.ipAddress,
       username: enteredUsername,
       password: enteredPassword,
+      manufacturer: verifiedInfo?.manufacturer,
+      model: verifiedInfo?.model,
+      firmwareVersion: verifiedInfo?.firmwareVersion,
+      serialNumber: verifiedInfo?.serialNumber,
+      hardwareId: verifiedInfo?.hardwareId,
+      macAddress: verifiedMacAddress,
+      thingName: verifiedThingName,
     );
+
+    // Fire-and-forget: enriches the camera with fields the Connect-time
+    // check above doesn't fetch (timezone, a real snapshot) without making
+    // the user wait through a second multi-second round trip before
+    // returning to the Dashboard. Safe to leave running after this screen
+    // pops — it only touches homesController, no BuildContext.
+    final syncConnection = newCamera.connection;
+    if (syncConnection != null) {
+      unawaited(
+        syncCameraFromDevice(
+          homesController: widget.homesController,
+          cameraId: newCamera.id,
+          connection: syncConnection,
+        ),
+      );
+    }
 
     if (!mounted) return;
     Navigator.of(context).pop();

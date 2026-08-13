@@ -1,10 +1,46 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # mobilecctvapp
 
-A Flutter mobile app for viewing/managing CCTV camera feeds. Scope and core features (live view, playback, alerts, etc.) are still being defined.
+A Flutter mobile app for viewing/managing CCTV camera feeds (VizenLink/NuraEye cameras). Scope and core features (live view, playback, alerts, etc.) derive from `VizenLink_Home_Community_CCTV_Feature_Seed_v0.1.md` and the `scenarios/`/`features/` specs.
+
+## Commands
+
+Run from the repo root unless noted.
+
+- `flutter analyze && dart format --output=none --set-exit-if-changed .` — lint/format gate (same as the `flutter-lint` skill). Run before considering any Dart change done.
+- `flutter test` — run the app's widget/unit tests (`test/widget_test.dart`).
+- `flutter test test/widget_test.dart --plain-name "Dashboard is the initial route"` — run a single test by name.
+- `flutter run` — run the app on a connected device/simulator/desktop/web target (see `flutter-run` skill).
+- `flutter build apk` / `flutter build appbundle` / `flutter build ipa` — release artifacts (see `flutter-release` skill).
+- `flutter pub get` — after pulling changes that touch `pubspec.yaml`.
+
+`packages/camera_api` is a separate pure-Dart package with its own test suite:
+- `cd packages/camera_api && flutter test` — run its tests (mock-based, no real camera needed).
+- `cd packages/camera_api && dart test test/mask_client_test.dart` — run a single file.
+
+## Architecture
+
+**State management**: no external state-management package — plain `ValueNotifier<State>` subclasses in `lib/app_state/` (e.g. `HomesController extends ValueNotifier<HomesState>`), instantiated once in `_MobileCctvAppState` (`lib/main.dart`) and passed down explicitly through widget constructors. There is no DI framework/service locator; a screen that needs a controller receives it as a constructor parameter from its `GoRoute` builder.
+
+**Routing**: `go_router`, built in `main.dart`'s `_buildRouter()`. Top-level routes (`/splash`, `/login`, `/signup`) sit outside a `StatefulShellRoute.indexedStack` (`MainShell`) with four branches — Dashboard, Alerts, Events, Account — each an independently-nested route tree (e.g. camera live → camera settings → video display → video mode). Screens needing a data object (a `Camera`, `Alert`, `RecordedEvent`) receive it via `state.extra`, cast at the route builder.
+
+**`packages/camera_api`** is the sole network-access layer for talking to a NuraEye/VizenLink camera, as a separate pure-Dart package (zero `package:flutter` dependency) consumed via a `path:` pubspec dependency. It has no UI or app-decision logic — every call returns a typed `CameraResult<T>` (`CameraSuccess`/`CameraFailure`/`CameraTimeout`) rather than throwing. Two transport families live side by side:
+- `lib/src/lan/onvif/` — ONVIF SOAP clients (WS-UsernameToken digest auth) for on-LAN control.
+- `lib/src/lan/nuraeye/` — the camera's proprietary `/nuraeye/*` REST API (some files are generated — `rest_*.dart`, `nuraeye_rest_client.dart`).
+- `lib/src/wan/` — AWS IoT MQTT command relay + Kinesis Video Streams (KVS) playback, for off-LAN control/streaming.
+
+Full client-by-client reference: `packages/camera_api/API_REFERENCE.md`; which client/capability flag to use for a given setting: `packages/camera_api/SETTINGS_API_GUIDE.md`. The app-side policy for *how* screens call these clients (LAN-vs-WAN selection, caching capability responses, retry-on-failure, settings-screen Apply/Reset/Reload UX, call-style session UX) is documented in `.claude/rules/mobile-app-screen-conventions.md`, not in the package itself. Build/branding/lint/SDK conventions (not yet applied: VizenLink branding rename, explicit Android SDK version pinning) live in `.claude/rules/mobile-app.md`. **Any actual change to `packages/camera_api/**` requires the user's explicit confirmation first** — see `.claude/rules/api-change-confirmation.md`.
+
+**Design-ID convention**: every interactive/documented UI element carries a stable `key: const Key('<SCREEN-PREFIX>-NNN')`, matched 1:1 to a row in that screen's `docs/screens/**/*.md` file — see the Screen documentation rule below before touching screen code.
 
 ## Project structure
 
-- `lib/` — Dart application source: `screens/` (route-level widgets), `widgets/` (reusable components), `app_state/` (controllers), `models/`, `theme/`.
+- `lib/` — Dart application source: `screens/` (route-level widgets), `widgets/` (reusable components), `app_state/` (`ValueNotifier`-based controllers), `models/`, `theme/`, `utils/`.
+- `packages/camera_api/` — pure-Dart camera network client package (see Architecture above); has its own `pubspec.yaml`, tests, and `API_REFERENCE.md`/`SETTINGS_API_GUIDE.md`.
+- `docs/screens/` — one markdown file per screen, design-ID tables (see Screen documentation rule).
 - `docs/client_code/` — per-file reference tables documenting client Dart files (functions/classes/purpose), generated by the `client-code-docs` skill. Separate from `docs/screens/`.
 - `test/` — Dart/Flutter tests (`flutter test`).
 - `android/`, `ios/`, `macos/`, `linux/`, `windows/`, `web/` — platform runner projects generated by `flutter create`. Avoid hand-editing generated files unless configuring platform-specific permissions (e.g. camera/network permissions in `Info.plist` / `AndroidManifest.xml`).
@@ -19,9 +55,9 @@ A Flutter mobile app for viewing/managing CCTV camera feeds. Scope and core feat
 
 - Package name: `com.onchiptech.mobilecctvapp`.
 - Follow standard Dart/Flutter style — enforced via `flutter analyze` and `dart format`. Use the `flutter-lint` skill before considering work done.
-- Prefer `flutter test` for unit/widget tests; there is no test suite yet beyond the default template.
-- No state management library or backend/networking layer has been chosen yet — confirm with the user before introducing one (e.g. Provider, Riverpod, Bloc) rather than assuming.
-- No CCTV protocol (RTSP/ONVIF/etc.) or camera integration has been decided yet — confirm with the user before adding video-streaming dependencies.
+- Prefer `flutter test` for unit/widget tests.
+- State management is plain `ValueNotifier` controllers in `lib/app_state/` (see Architecture above) — this has already been decided; don't introduce Provider/Riverpod/Bloc without confirming with the user first.
+- Camera integration is via `packages/camera_api` (ONVIF over LAN, AWS IoT/KVS over WAN) — this has already been decided; confirm with the user before adding a different/competing CCTV protocol or streaming dependency.
 
 ## Screen documentation rule
 
@@ -54,7 +90,7 @@ Use `client-code-docs`, `integrate-client-code`, or the combined `client-pipelin
 - `scenario-gap-audit` — cross-reference this workspace's `scenarios/`+`features/` against `lib/screens/` and report what's implemented/partial/missing.
 - `ui-api-gap-audit` — cross-reference built UI screens against documented client/API code (`docs/client_code/`) to find screens still running on mock data vs. really wired up.
 
-## Commands
+## Commands (slash)
 
 - `/client-code-docs <filename.dart>` — document a file from `client_code_inbox/`.
 - `/integrate-client-code <filename.dart>` — integrate a file from `client_code_inbox/` into the existing UI.
@@ -62,3 +98,4 @@ Use `client-code-docs`, `integrate-client-code`, or the combined `client-pipelin
 - `/scenario-gap-audit` — generate `docs/scenario_audit/gap_report.md` comparing `scenarios/`+`features/` against current screens.
 - `/ui-api-gap-audit` — generate `docs/api_coverage_audit/gap_report.md` comparing built screens against documented client/API code.
 - `/art-refine <prompt or .claude/ path>` — restructure a prompt into ART format, preview, then execute on approval.
+- `/git-push` — push the current branch to its remote, after checking status and confirming anything risky.

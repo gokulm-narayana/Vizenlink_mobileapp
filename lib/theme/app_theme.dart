@@ -96,21 +96,23 @@ class AppTheme {
         fillColor: scheme.brightness == Brightness.dark
             ? Colors.white.withValues(alpha: 0.06)
             : Colors.white.withValues(alpha: 0.6),
+        // No visible stroke in the default/enabled state — `OutlineInputBorder`
+        // still needs to be the border type (for its rounded fill shape and
+        // the floating-label notch geometry), but an actually-drawn line
+        // here sits on top of this app's frosted-glass dialog backgrounds
+        // (BackdropFilter blur, not a flat color), making the floating
+        // label's notch look like it's awkwardly cutting through the box's
+        // top edge instead of cleanly separating from it. The focused state
+        // below keeps a real stroke — useful feedback with only one field
+        // ever focused at a time, unlike the enabled state which every field
+        // sits in most of the time.
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(
-            color: scheme.brightness == Brightness.dark
-                ? Colors.white.withValues(alpha: 0.12)
-                : Colors.white.withValues(alpha: 0.8),
-          ),
+          borderSide: BorderSide.none,
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(
-            color: scheme.brightness == Brightness.dark
-                ? Colors.white.withValues(alpha: 0.12)
-                : Colors.white.withValues(alpha: 0.8),
-          ),
+          borderSide: BorderSide.none,
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),

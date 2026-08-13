@@ -8,6 +8,7 @@ import '../../camera_result.dart';
 import '../insecure_camera_http_client.dart';
 import '../wsse_digest.dart';
 import 'onvif_device_client.dart';
+import 'soap_fault.dart';
 
 const _kMedia2Namespace = 'http://www.onvif.org/ver20/media/wsdl';
 
@@ -39,8 +40,12 @@ class SpeakerVolume {
   /// `0`-`100` (`FR-OV-046`'s advertised range).
   final int outputLevel;
 
-  SpeakerVolume withLevel(int level) =>
-      SpeakerVolume(token: token, name: name, outputToken: outputToken, outputLevel: level);
+  SpeakerVolume withLevel(int level) => SpeakerVolume(
+    token: token,
+    name: name,
+    outputToken: outputToken,
+    outputLevel: level,
+  );
 
   /// Value equality — lets UI code (`_SettingCard<SpeakerVolume>`'s pending-vs-applied dirty
   /// check, mirroring `NightVisionStatus`'s own convention) compare by content instead of
@@ -100,9 +105,13 @@ class SpeakerVolumeClient {
     final servicesResult = await _device.getServices(timeout: timeout);
     switch (servicesResult) {
       case CameraSuccess<List<OnvifServiceEntry>>(:final value):
-        final entry = value.where((e) => e.namespace == _kMedia2Namespace).firstOrNull;
+        final entry = value
+            .where((e) => e.namespace == _kMedia2Namespace)
+            .firstOrNull;
         if (entry == null) {
-          return const CameraFailure('Media2 service not offered by this camera');
+          return const CameraFailure(
+            'Media2 service not offered by this camera',
+          );
         }
         _endpointCacheByHost[connection.host] = entry.xAddr;
         return CameraSuccess(entry.xAddr);
@@ -122,15 +131,21 @@ class SpeakerVolumeClient {
       '</tr2:GetAudioOutputConfigurations>',
       timeout,
     );
-    if (bodyResult is CameraFailure<String>) return CameraFailure(bodyResult.reason);
+    if (bodyResult is CameraFailure<String>) {
+      return CameraFailure(bodyResult.reason);
+    }
     if (bodyResult is CameraTimeout<String>) return const CameraTimeout();
     final body = (bodyResult as CameraSuccess<String>).value;
 
-    final cfgEl = XmlDocument.parse(body).findAllElements('Configurations', namespace: '*');
+    final cfgEl = XmlDocument.parse(
+      body,
+    ).findAllElements('Configurations', namespace: '*');
     if (cfgEl.isEmpty) {
       // Empty list means no speaker on this build (FR-OV-037) — the UI is expected to have
       // already gated this control on `AudioCapabilityClient.hasSpeaker` and never call here.
-      return const CameraFailure('camera has no AudioOutputConfiguration (no speaker)');
+      return const CameraFailure(
+        'camera has no AudioOutputConfiguration (no speaker)',
+      );
     }
     final el = cfgEl.first;
     final token = el.getAttribute('token') ?? '';
@@ -141,7 +156,12 @@ class SpeakerVolumeClient {
 
     final level = int.tryParse(text('OutputLevel')) ?? 0;
     return CameraSuccess(
-      SpeakerVolume(token: token, name: text('Name'), outputToken: text('OutputToken'), outputLevel: level),
+      SpeakerVolume(
+        token: token,
+        name: text('Name'),
+        outputToken: text('OutputToken'),
+        outputLevel: level,
+      ),
     );
   }
 
@@ -161,7 +181,9 @@ class SpeakerVolumeClient {
       '</tr2:SetAudioOutputConfiguration>',
       timeout,
     );
-    if (bodyResult is CameraFailure<String>) return CameraFailure(bodyResult.reason);
+    if (bodyResult is CameraFailure<String>) {
+      return CameraFailure(bodyResult.reason);
+    }
     if (bodyResult is CameraTimeout<String>) return const CameraTimeout();
     return const CameraSuccess(null);
   }
@@ -179,7 +201,8 @@ class SpeakerVolumeClient {
     }
 
     final digest = WsseDigest.generate(connection.password);
-    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope =
+        '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -201,13 +224,19 @@ class SpeakerVolumeClient {
       final response = await _http
           .post(
             endpoint,
-            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
+            headers: const {
+              'Content-Type': 'application/soap+xml; charset=utf-8',
+            },
             body: envelope,
           )
           .timeout(timeout);
 
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
+      }
+      final faultReason = soapFaultReason(response.body);
+      if (faultReason != null) {
+        return CameraFailure(faultReason);
       }
       return CameraSuccess(response.body);
     } on TimeoutException {

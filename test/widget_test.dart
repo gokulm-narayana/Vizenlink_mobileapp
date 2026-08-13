@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:mobilecctvapp/app_state/ai_model_manager.dart';
@@ -7,24 +10,171 @@ import 'package:mobilecctvapp/app_state/alerts_controller.dart';
 import 'package:mobilecctvapp/app_state/events_controller.dart';
 import 'package:mobilecctvapp/app_state/homes_controller.dart';
 import 'package:mobilecctvapp/main.dart';
+import 'package:mobilecctvapp/models/camera.dart';
+import 'package:mobilecctvapp/models/scanned_camera.dart';
 import 'package:mobilecctvapp/screens/dashboard/dashboard_screen.dart';
 import 'package:mobilecctvapp/screens/homes/manage_homes_screen.dart';
 import 'package:mobilecctvapp/screens/scan/scanned_devices_screen.dart';
 import 'package:mobilecctvapp/screens/scan/scanning_popup.dart';
 
+/// Seeds `homesController`'s "Main House" (`home-1`) with three demo
+/// cameras matching what the Dashboard tests below assert on. Replaces the
+/// hardcoded seed-data cameras `HomesController._seedState()` used to ship
+/// with — removed once real camera scanning replaced fake demo data, which
+/// left these tests with no cameras to find. Returns the added cameras in
+/// (front door, living room, bedroom) order — real ids are timestamp-based
+/// (`HomesController.addCamera`), not the old hardcoded `cam-1`/etc., so
+/// callers needing a specific camera's key must use the returned `Camera`,
+/// not a literal id string.
+List<Camera> _seedDemoCameras(HomesController homesController) {
+  final frontDoor = homesController.addCamera(
+    'home-1',
+    name: 'Front Door Cam',
+    room: 'Living Room',
+    isOnline: true,
+  );
+  homesController.toggleFavorite('home-1', frontDoor.id);
+  final livingRoom = homesController.addCamera(
+    'home-1',
+    name: 'Living Room Cam',
+    room: 'Living Room',
+    isOnline: true,
+  );
+  // Also favourited, so it's still expected in the Favourites tab after the
+  // Favourites test un-favourites Front Door Cam.
+  homesController.toggleFavorite('home-1', livingRoom.id);
+  final bedroom = homesController.addCamera(
+    'home-1',
+    name: 'Bedroom Cam',
+    room: 'Bedroom',
+    isOnline: true,
+  );
+  return [frontDoor, livingRoom, bedroom];
+}
+
+/// Fixed (non-randomised) stand-in for a real `scanForCameras()` LAN
+/// discovery pass — one "Configured" and one "Unconfigured" result, which
+/// is everything `ScannedDevicesScreen`'s own tests below tap through.
+/// Passed as `ScannedDevicesScreen.scan` so those tests don't depend on
+/// real network hardware (unavailable in a sandboxed test environment —
+/// see `scan_cameras_screen.md`'s Notes) or a flaky retry-until-found loop.
+Future<List<ScannedCamera>> _fakeScanResults() async => const [
+  ScannedCamera(
+    id: '192.168.1.50',
+    name: 'Camera at 192.168.1.50',
+    ipAddress: '192.168.1.50',
+    isConfigured: true,
+  ),
+  ScannedCamera(
+    id: '192.168.1.51',
+    name: 'VZL-CAM',
+    ipAddress: '192.168.1.51',
+    isConfigured: false,
+  ),
+];
+
+/// A `MockClient` standing in for the real camera during the setup form's
+/// "Connect" credential verification (`OnvifDeviceClient.
+/// getDeviceInformation`/`getSerialNumber`/`getNetworkInterfaceInfo`/
+/// `getDeviceIdentity`) — passed as `ScannedDevicesScreen.httpClient`.
+/// Response shapes match `packages/camera_api/test/onvif_device_client_test
+/// .dart`'s own fixtures for the same calls. Only `GetDeviceInformation`'s
+/// response actually matters for these tests (it's what gates whether
+/// "Connect" succeeds) — the other three are best-effort enrichment calls
+/// that don't block adding the camera even if left generic/empty.
+http.Client _mockOnvifDeviceHttpClient() => MockClient((request) async {
+  const envelopeOpen =
+      '<?xml version="1.0" encoding="UTF-8"?>'
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>';
+  const envelopeClose = '</s:Body></s:Envelope>';
+
+  if (request.body.contains('GetDeviceInformation')) {
+    return http.Response(
+      '$envelopeOpen'
+      '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+      '<tds:Manufacturer>VizenLink</tds:Manufacturer>'
+      '<tds:Model>VZL-CAM</tds:Model>'
+      '<tds:FirmwareVersion>1.0.0</tds:FirmwareVersion>'
+      '<tds:SerialNumber>VZL-CAM-000001</tds:SerialNumber>'
+      '<tds:HardwareId>HW-VZL-DEV-A</tds:HardwareId>'
+      '</tds:GetDeviceInformationResponse>'
+      '$envelopeClose',
+      200,
+    );
+  }
+  if (request.body.contains('GetNetworkInterfaces')) {
+    return http.Response(
+      '$envelopeOpen'
+      '<tds:GetNetworkInterfacesResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+      '<tds:Name>eth</tds:Name>'
+      '<tds:HwAddress>00:11:22:33:44:55</tds:HwAddress>'
+      '<tds:Address>192.168.1.50</tds:Address>'
+      '</tds:GetNetworkInterfacesResponse>'
+      '$envelopeClose',
+      200,
+    );
+  }
+  if (request.body.contains('GetScopes')) {
+    return http.Response(
+      '$envelopeOpen'
+      '<tds:GetScopesResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>'
+      '$envelopeClose',
+      200,
+    );
+  }
+  return http.Response('$envelopeOpen$envelopeClose', 200);
+});
+
+/// `CameraCredentialsStore` (backing `HomesController`'s camera passwords)
+/// talks to `flutter_secure_storage`'s platform channel, which has no
+/// implementation registered in the test environment — without a mock
+/// handler, every call hangs instead of throwing, which stalls
+/// `pumpAndSettle`. Mirrors `SharedPreferences.setMockInitialValues` below
+/// for the same reason.
+void _mockSecureStorageChannel() {
+  const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+  final store = <String, String>{};
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(channel, (MethodCall call) async {
+        final args = (call.arguments as Map?)?.cast<String, dynamic>();
+        switch (call.method) {
+          case 'write':
+            store[args!['key'] as String] = args['value'] as String;
+            return null;
+          case 'read':
+            return store[args!['key'] as String];
+          case 'readAll':
+            return store;
+          case 'delete':
+            store.remove(args!['key'] as String);
+            return null;
+          case 'deleteAll':
+            store.clear();
+            return null;
+          case 'containsKey':
+            return store.containsKey(args!['key'] as String);
+          default:
+            return null;
+        }
+      });
+}
+
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   // AiModelManager/ThemeController.load() both call
   // SharedPreferences.getInstance(), which never resolves in a test
   // environment without a mock store — SplashScreen (the app's initial
   // route) waits on both before navigating to the dashboard, so every test
   // that pumps the full app needs this.
   SharedPreferences.setMockInitialValues({});
+  _mockSecureStorageChannel();
 
   testWidgets('Dashboard is the initial route', (WidgetTester tester) async {
     await tester.pumpWidget(const MobileCctvApp());
     // The splash screen hands off to the dashboard once app startup
-    // (theme/AI-consent loading, plus a minimum visible duration) resolves.
-    await tester.pump(const Duration(seconds: 15));
+    // (theme/AI-consent/homes loading) resolves — no more fixed minimum
+    // delay to pump through, just real (mocked) SharedPreferences reads.
     await tester.pumpAndSettle();
 
     expect(find.text('Main House'), findsOneWidget);
@@ -79,6 +229,7 @@ void main() {
   ) async {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
+    final cameras = _seedDemoCameras(homesController);
     final alertsController = AlertsController();
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
@@ -103,7 +254,7 @@ void main() {
 
     await tester.tap(find.byKey(const Key('DASH-004')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('DASH-006-cam-1')), findsOneWidget);
+    expect(find.byKey(Key('DASH-006-${cameras[0].id}')), findsOneWidget);
   });
 
   testWidgets('Dashboard Favourites tab reflects favourite toggles', (
@@ -111,6 +262,7 @@ void main() {
   ) async {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
+    final cameras = _seedDemoCameras(homesController);
     final alertsController = AlertsController();
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
@@ -129,9 +281,9 @@ void main() {
       ),
     );
 
-    // cam-1 (Front Door Cam) starts favourited; un-favourite it from the All
-    // tab via the long-press actions menu.
-    await tester.longPress(find.byKey(const Key('DASH-006-cam-1')));
+    // Front Door Cam starts favourited (see _seedDemoCameras); un-favourite
+    // it from the All tab via the long-press actions menu.
+    await tester.longPress(find.byKey(Key('DASH-006-${cameras[0].id}')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('DASH-016-favorite')));
     await tester.pumpAndSettle();
@@ -148,6 +300,7 @@ void main() {
   ) async {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
+    _seedDemoCameras(homesController);
     final alertsController = AlertsController();
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
@@ -296,8 +449,14 @@ void main() {
     addTearDown(homesController.dispose);
 
     await tester.pumpWidget(
-      MaterialApp(home: ScannedDevicesScreen(homesController: homesController)),
+      MaterialApp(
+        home: ScannedDevicesScreen(
+          homesController: homesController,
+          scan: _fakeScanResults,
+        ),
+      ),
     );
+    await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('SCAN-004')), findsOneWidget);
   });
@@ -310,20 +469,18 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: ScannedDevicesScreen(homesController: homesController),
+          home: ScannedDevicesScreen(
+            homesController: homesController,
+            scan: _fakeScanResults,
+            httpClient: _mockOnvifDeviceHttpClient(),
+          ),
         ),
       );
+      await tester.pumpAndSettle();
 
       final camerasBefore = homesController.value.selectedHome.cameras.length;
 
-      // Keep retrying a scan until a configured camera shows up (results are
-      // randomised), then tap it — configured cameras skip straight to the
-      // setup form.
-      while (!find.text('Configured').evaluate().isNotEmpty) {
-        await tester.tap(find.byKey(const Key('SCAN-006')));
-        await tester.pumpAndSettle(const Duration(seconds: 3));
-      }
-
+      // Configured cameras skip straight to the setup form.
       await tester.tap(find.text('Configured').first);
       await tester.pumpAndSettle();
 
@@ -347,16 +504,16 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: ScannedDevicesScreen(homesController: homesController),
+          home: ScannedDevicesScreen(
+            homesController: homesController,
+            scan: _fakeScanResults,
+            httpClient: _mockOnvifDeviceHttpClient(),
+          ),
         ),
       );
+      await tester.pumpAndSettle();
 
       final camerasBefore = homesController.value.selectedHome.cameras.length;
-
-      while (!find.text('Unconfigured').evaluate().isNotEmpty) {
-        await tester.tap(find.byKey(const Key('SCAN-006')));
-        await tester.pumpAndSettle(const Duration(seconds: 3));
-      }
 
       await tester.tap(find.text('Unconfigured').first);
       await tester.pumpAndSettle();
@@ -385,16 +542,16 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: ScannedDevicesScreen(homesController: homesController),
+          home: ScannedDevicesScreen(
+            homesController: homesController,
+            scan: _fakeScanResults,
+            httpClient: _mockOnvifDeviceHttpClient(),
+          ),
         ),
       );
+      await tester.pumpAndSettle();
 
       final camerasBefore = homesController.value.selectedHome.cameras.length;
-
-      while (!find.text('Unconfigured').evaluate().isNotEmpty) {
-        await tester.tap(find.byKey(const Key('SCAN-006')));
-        await tester.pumpAndSettle(const Duration(seconds: 3));
-      }
 
       await tester.tap(find.text('Unconfigured').first);
       await tester.pumpAndSettle();

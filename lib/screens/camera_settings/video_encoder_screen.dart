@@ -1,3 +1,4 @@
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
 import '../../app_state/homes_controller.dart';
@@ -17,11 +18,89 @@ const _defaultQuality = 3.0;
 const _defaultBitrateMode = CameraBitrateMode.cbr;
 const _defaultBitrateKbps = 2048.0;
 
+/// `CameraEncoderType` <-> ONVIF `"H264"`/`"H265"` wire values.
+CameraEncoderType _encoderTypeFromWire(String wire) =>
+    wire.toUpperCase() == 'H265'
+    ? CameraEncoderType.h265
+    : CameraEncoderType.h264;
+
+String _encoderTypeToWire(CameraEncoderType type) => switch (type) {
+  CameraEncoderType.h264 => 'H264',
+  CameraEncoderType.h265 => 'H265',
+};
+
+/// `CameraEncoderProfile` <-> ONVIF `"Baseline"`/`"Main"`/`"High"` wire values.
+CameraEncoderProfile? _encoderProfileFromWire(String wire) =>
+    switch (wire.toLowerCase()) {
+      'baseline' => CameraEncoderProfile.baseline,
+      'main' => CameraEncoderProfile.main,
+      'high' => CameraEncoderProfile.high,
+      _ => null,
+    };
+
+String _encoderProfileToWire(CameraEncoderProfile profile) => switch (profile) {
+  CameraEncoderProfile.baseline => 'Baseline',
+  CameraEncoderProfile.main => 'Main',
+  CameraEncoderProfile.high => 'High',
+};
+
+/// This app's fixed `CameraResolution` enum has no direct ONVIF equivalent —
+/// the real wire shape is a `(width, height)` pixel pair, from whichever
+/// entries the camera's own Options response reports (usually exactly one,
+/// per `EncodingOptions.resolutions`'s doc). Derives the closest enum value
+/// from reported pixels for display; `_save`'s own resolution-resolving
+/// block does the reverse when pushing a change.
+CameraResolution _resolutionFromPixels(int width, int height) {
+  if (width >= 1920 && height >= 1080) return CameraResolution.p1080;
+  if (width >= 1280 && height >= 720) return CameraResolution.p720;
+  return CameraResolution.p480;
+}
+
+String _resolutionLabel(CameraResolution resolution) => switch (resolution) {
+  CameraResolution.p1080 => '1080p',
+  CameraResolution.p720 => '720p',
+  CameraResolution.p480 => '480p',
+};
+
+/// Real bounds for a slider from the camera's own Options response, or a
+/// fallback `(min, max)` pair when unverified. The app's own default ranges
+/// (e.g. Quality 1-5) don't necessarily match the camera's real range (ONVIF
+/// quality is typically 1-10) — using the real range isn't just cosmetic
+/// here, a loaded value outside the fallback range would violate `Slider`'s
+/// own `value` bounds assertion.
+(double min, double max) _sliderBounds(
+  IntRange? range,
+  double fallbackMin,
+  double fallbackMax,
+) {
+  if (range == null) return (fallbackMin, fallbackMax);
+  return (range.min.toDouble(), range.max.toDouble());
+}
+
+/// Filters [fallback] (this screen's original fixed choice list) down to
+/// whatever [real] actually reports — never a hardcoded fixed set once the
+/// camera is verified, per `.claude/rules/mobile-app-screen-conventions.md`
+/// — while always keeping [current] in the result so a dropdown/segmented
+/// control's selected value is never outside its own item list. Returns
+/// [fallback] unfiltered when [real] is null (camera not verified yet).
+List<T> _optionsOrFallback<T>(Iterable<T>? real, T current, List<T> fallback) {
+  if (real == null) return fallback;
+  final supported = real.toSet()..add(current);
+  return [
+    for (final value in fallback)
+      if (supported.contains(value)) value,
+  ];
+}
+
 /// Video Encoder: resolution, encoder/profile, frame rate, GOV, quality,
-/// bitrate mode, and bitrate. Persisted through [HomesController] (see
-/// `updateCamera`) — see the note on `videoMode` in `lib/models/camera.dart`.
-/// "Reset to Default" resets to this screen's hardcoded factory defaults,
-/// not to whatever was last saved.
+/// bitrate mode, and bitrate. Backed by `OnvifVideoEncoderClient`
+/// (`VideoEncoderCfg_1`, the high-res profile) when the camera has a saved
+/// connection — every field is bounded/gated by the camera's own
+/// `getVideoEncoderSettingsOptions()` response per encoding (H264/H265 can
+/// report different bounds/profile lists/resolution choices), never a
+/// hardcoded assumption. Falls back to local-only `HomesController` state
+/// (`simulateCameraSave`) for a camera with no saved connection yet. WAN
+/// fallback (`WanVideoEncoderClient`) isn't wired up yet.
 class VideoEncoderScreen extends StatefulWidget {
   const VideoEncoderScreen({
     super.key,
@@ -39,16 +118,106 @@ class VideoEncoderScreen extends StatefulWidget {
 }
 
 class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
-  late CameraResolution _resolution = widget.camera.videoResolution;
-  late CameraEncoderType _encoder = widget.camera.encoderType;
-  late CameraEncoderProfile _profile = widget.camera.encoderProfile;
-  late double _frameRate = widget.camera.frameRate;
-  late double _gov = widget.camera.govLength;
-  late double _quality = widget.camera.encoderQuality;
-  late CameraBitrateMode _bitrateMode = widget.camera.bitrateMode;
-  late double _bitrateKbps = widget.camera.bitrateKbps;
+  late CameraResolution _resolution = _camera.videoResolution;
+  late CameraEncoderType _encoder = _camera.encoderType;
+  late CameraEncoderProfile _profile = _camera.encoderProfile;
+  late double _frameRate = _camera.frameRate;
+  late double _gov = _camera.govLength;
+  late double _quality = _camera.encoderQuality;
+  late CameraBitrateMode _bitrateMode = _camera.bitrateMode;
+  late double _bitrateKbps = _camera.bitrateKbps;
   bool _isDirty = false;
   bool _isSaving = false;
+
+  /// Native pixel size backing [_resolution] — loaded from the camera,
+  /// needed on Save since the wire format is `(width, height)`, not an
+  /// enum. Defaults are placeholders only used for a camera with no saved
+  /// connection (local-only save path never reads these).
+  int _width = 1920;
+  int _height = 1080;
+
+  /// Per-encoding bounds/choice lists from the camera's own
+  /// `getVideoEncoderSettingsOptions()` — null means "camera not verified
+  /// yet", in which case every control falls back to a fixed set (same
+  /// reasoning as `_dummyTimezones` in camera_info_screen).
+  VideoEncoderSettingsOptions? _encoderOptions;
+
+  EncodingOptions? get _currentEncodingOptions =>
+      _encoderOptions?.forEncoding(_encoderTypeToWire(_encoder));
+
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly), matching every other camera-settings screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRealVideoEncoder();
+  }
+
+  Future<void> _loadRealVideoEncoder() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final client = OnvifVideoEncoderClient(connection);
+    final results = await Future.wait([
+      client.getVideoEncoderSettings(),
+      client.getVideoEncoderSettingsOptions(),
+    ]);
+    client.close();
+    if (!mounted) return;
+
+    final settingsResult = results[0] as CameraResult<VideoEncoderSettings>;
+    final optionsResult =
+        results[1] as CameraResult<VideoEncoderSettingsOptions>;
+
+    setState(() {
+      if (settingsResult case CameraSuccess(:final value)) {
+        _encoder = _encoderTypeFromWire(value.encoding);
+        final profile = _encoderProfileFromWire(value.encoderProfile);
+        if (profile != null) _profile = profile;
+        _frameRate = value.frameRate.toDouble();
+        _gov = value.govLength.toDouble();
+        _quality = value.quality.toDouble();
+        _bitrateMode = value.cbr
+            ? CameraBitrateMode.cbr
+            : CameraBitrateMode.vbr;
+        _bitrateKbps = value.bitrate.toDouble();
+        _width = value.width;
+        _height = value.height;
+        _resolution = _resolutionFromPixels(value.width, value.height);
+      }
+      if (optionsResult case CameraSuccess(:final value)) {
+        _encoderOptions = value;
+      }
+    });
+
+    if (settingsResult case CameraSuccess(:final value)) {
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (camera) => camera.copyWith(
+          videoResolution: _resolutionFromPixels(value.width, value.height),
+          encoderType: _encoderTypeFromWire(value.encoding),
+          encoderProfile:
+              _encoderProfileFromWire(value.encoderProfile) ??
+              camera.encoderProfile,
+          frameRate: value.frameRate.toDouble(),
+          govLength: value.govLength.toDouble(),
+          encoderQuality: value.quality.toDouble(),
+          bitrateMode: value.cbr
+              ? CameraBitrateMode.cbr
+              : CameraBitrateMode.vbr,
+          bitrateKbps: value.bitrate.toDouble(),
+        ),
+      );
+    }
+  }
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -71,8 +240,49 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    if (connection != null) {
+      final client = OnvifVideoEncoderClient(connection);
+      // Resolution has no direct enum on the wire — resolve the selected
+      // enum to one of the camera's own reported (width, height) choices
+      // for the current encoding; keep the camera's current pixel size
+      // unchanged if the enum doesn't match any of them (e.g. this
+      // firmware's typical single-resolution report).
+      var width = _width;
+      var height = _height;
+      final resolutions = _currentEncodingOptions?.resolutions;
+      if (resolutions != null && resolutions.isNotEmpty) {
+        for (final candidate in resolutions) {
+          if (_resolutionFromPixels(candidate.width, candidate.height) ==
+              _resolution) {
+            width = candidate.width;
+            height = candidate.height;
+            break;
+          }
+        }
+      }
+      final result = await client.setVideoEncoderSettings(
+        VideoEncoderSettings(
+          bitrate: _bitrateKbps.round(),
+          frameRate: _frameRate.round(),
+          govLength: _gov.round(),
+          quality: _quality.round(),
+          encoderProfile: _encoderProfileToWire(_profile),
+          width: width,
+          height: height,
+          encoding: _encoderTypeToWire(_encoder),
+          cbr: _bitrateMode == CameraBitrateMode.cbr,
+        ),
+      );
+      client.close();
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -148,24 +358,42 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                   style: Theme.of(context).textTheme.bodyMedium,
                 ),
                 const SizedBox(height: 8),
-                DropdownButtonFormField<CameraResolution>(
-                  key: const Key('ENC-003'),
-                  initialValue: _resolution,
-                  items: const [
-                    DropdownMenuItem(
-                      value: CameraResolution.p1080,
-                      child: Text('1080p'),
-                    ),
-                    DropdownMenuItem(
-                      value: CameraResolution.p720,
-                      child: Text('720p'),
-                    ),
-                    DropdownMenuItem(
-                      value: CameraResolution.p480,
-                      child: Text('480p'),
-                    ),
-                  ],
-                  onChanged: (value) => _markDirty(() => _resolution = value!),
+                Builder(
+                  builder: (context) {
+                    final resolutions = _currentEncodingOptions?.resolutions;
+                    // Read-only when the camera reports one (or zero) valid
+                    // resolution for this encoding — a picker with a single
+                    // option isn't a real choice. Per
+                    // EncodingOptions.resolutions's doc, this is the common
+                    // case on this firmware today.
+                    if (resolutions != null && resolutions.length <= 1) {
+                      return Text(
+                        key: const Key('ENC-003'),
+                        _resolutionLabel(_resolution),
+                        style: Theme.of(context).textTheme.bodyLarge,
+                      );
+                    }
+                    final available = _optionsOrFallback(
+                      resolutions?.map(
+                        (r) => _resolutionFromPixels(r.width, r.height),
+                      ),
+                      _resolution,
+                      CameraResolution.values,
+                    );
+                    return DropdownButtonFormField<CameraResolution>(
+                      key: const Key('ENC-003'),
+                      initialValue: _resolution,
+                      items: [
+                        for (final res in available)
+                          DropdownMenuItem(
+                            value: res,
+                            child: Text(_resolutionLabel(res)),
+                          ),
+                      ],
+                      onChanged: (value) =>
+                          _markDirty(() => _resolution = value!),
+                    );
+                  },
                 ),
                 const SizedBox(height: 16),
                 Text(
@@ -176,17 +404,32 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraEncoderType>(
                   key: const Key('ENC-007'),
                   initialValue: _encoder,
-                  items: const [
-                    DropdownMenuItem(
-                      value: CameraEncoderType.h264,
-                      child: Text('H.264'),
-                    ),
-                    DropdownMenuItem(
-                      value: CameraEncoderType.h265,
-                      child: Text('H.265'),
-                    ),
+                  items: [
+                    for (final type in _optionsOrFallback(
+                      _encoderOptions?.availableEncodings.map(
+                        _encoderTypeFromWire,
+                      ),
+                      _encoder,
+                      CameraEncoderType.values,
+                    ))
+                      DropdownMenuItem(
+                        value: type,
+                        child: Text(
+                          type == CameraEncoderType.h265 ? 'H.265' : 'H.264',
+                        ),
+                      ),
                   ],
-                  onChanged: (value) => _markDirty(() => _encoder = value!),
+                  onChanged: (value) => _markDirty(() {
+                    _encoder = value!;
+                    // Each encoding has its own supportsCbr — if the new
+                    // one doesn't allow CBR, force VBR so ENC-012's
+                    // dropdown (which hides CBR entirely when unsupported)
+                    // never ends up with a selected value outside its own
+                    // item list.
+                    if (!(_currentEncodingOptions?.supportsCbr ?? true)) {
+                      _bitrateMode = CameraBitrateMode.vbr;
+                    }
+                  }),
                 ),
                 const SizedBox(height: 16),
                 Text(
@@ -197,19 +440,22 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraEncoderProfile>(
                   key: const Key('ENC-008'),
                   initialValue: _profile,
-                  items: const [
-                    DropdownMenuItem(
-                      value: CameraEncoderProfile.baseline,
-                      child: Text('Baseline'),
-                    ),
-                    DropdownMenuItem(
-                      value: CameraEncoderProfile.main,
-                      child: Text('Main'),
-                    ),
-                    DropdownMenuItem(
-                      value: CameraEncoderProfile.high,
-                      child: Text('High'),
-                    ),
+                  items: [
+                    for (final profile in _optionsOrFallback(
+                      _currentEncodingOptions?.encoderProfiles
+                          .map(_encoderProfileFromWire)
+                          .whereType<CameraEncoderProfile>(),
+                      _profile,
+                      CameraEncoderProfile.values,
+                    ))
+                      DropdownMenuItem(
+                        value: profile,
+                        child: Text(switch (profile) {
+                          CameraEncoderProfile.baseline => 'Baseline',
+                          CameraEncoderProfile.main => 'Main',
+                          CameraEncoderProfile.high => 'High',
+                        }),
+                      ),
                   ],
                   onChanged: (value) => _markDirty(() => _profile = value!),
                 ),
@@ -222,14 +468,23 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                         'Frame rate (${_frameRate.round()} fps)',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
-                      Slider(
-                        key: const Key('ENC-009'),
-                        value: _frameRate,
-                        min: 1,
-                        max: 25,
-                        divisions: 24,
-                        onChanged: (value) =>
-                            _markDirty(() => _frameRate = value),
+                      Builder(
+                        builder: (context) {
+                          final (min, max) = _sliderBounds(
+                            _currentEncodingOptions?.frameRateRange,
+                            1,
+                            25,
+                          );
+                          return Slider(
+                            key: const Key('ENC-009'),
+                            value: _frameRate.clamp(min, max),
+                            min: min,
+                            max: max,
+                            divisions: (max - min).round(),
+                            onChanged: (value) =>
+                                _markDirty(() => _frameRate = value),
+                          );
+                        },
                       ),
                     ],
                   ),
@@ -243,13 +498,23 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                         'GOV (${_gov.round()})',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
-                      Slider(
-                        key: const Key('ENC-010'),
-                        value: _gov,
-                        min: 10,
-                        max: 50,
-                        divisions: 40,
-                        onChanged: (value) => _markDirty(() => _gov = value),
+                      Builder(
+                        builder: (context) {
+                          final (min, max) = _sliderBounds(
+                            _currentEncodingOptions?.govLengthRange,
+                            10,
+                            50,
+                          );
+                          return Slider(
+                            key: const Key('ENC-010'),
+                            value: _gov.clamp(min, max),
+                            min: min,
+                            max: max,
+                            divisions: (max - min).round(),
+                            onChanged: (value) =>
+                                _markDirty(() => _gov = value),
+                          );
+                        },
                       ),
                     ],
                   ),
@@ -263,14 +528,23 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                         'Quality (${_quality.round()})',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
-                      Slider(
-                        key: const Key('ENC-011'),
-                        value: _quality,
-                        min: 1,
-                        max: 5,
-                        divisions: 4,
-                        onChanged: (value) =>
-                            _markDirty(() => _quality = value),
+                      Builder(
+                        builder: (context) {
+                          final (min, max) = _sliderBounds(
+                            _currentEncodingOptions?.qualityRange,
+                            1,
+                            5,
+                          );
+                          return Slider(
+                            key: const Key('ENC-011'),
+                            value: _quality.clamp(min, max),
+                            min: min,
+                            max: max,
+                            divisions: (max - min).round(),
+                            onChanged: (value) =>
+                                _markDirty(() => _quality = value),
+                          );
+                        },
                       ),
                     ],
                   ),
@@ -284,15 +558,19 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraBitrateMode>(
                   key: const Key('ENC-012'),
                   initialValue: _bitrateMode,
-                  items: const [
-                    DropdownMenuItem(
-                      value: CameraBitrateMode.cbr,
-                      child: Text('CBR (Constant)'),
-                    ),
-                    DropdownMenuItem(
+                  items: [
+                    const DropdownMenuItem(
                       value: CameraBitrateMode.vbr,
                       child: Text('VBR (Variable)'),
                     ),
+                    // Hidden, not just disabled, when the camera's own
+                    // Options response says this encoding doesn't support
+                    // CBR — per EncodingOptions.supportsCbr's doc.
+                    if (_currentEncodingOptions?.supportsCbr ?? true)
+                      const DropdownMenuItem(
+                        value: CameraBitrateMode.cbr,
+                        child: Text('CBR (Constant)'),
+                      ),
                   ],
                   onChanged: (value) => _markDirty(() => _bitrateMode = value!),
                 ),
@@ -305,14 +583,23 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                         'Bitrate (${_bitrateKbps.round()} kbps)',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
-                      Slider(
-                        key: const Key('ENC-013'),
-                        value: _bitrateKbps,
-                        min: 32,
-                        max: 8192,
-                        divisions: 254,
-                        onChanged: (value) =>
-                            _markDirty(() => _bitrateKbps = value),
+                      Builder(
+                        builder: (context) {
+                          final (min, max) = _sliderBounds(
+                            _currentEncodingOptions?.bitrateRange,
+                            32,
+                            8192,
+                          );
+                          return Slider(
+                            key: const Key('ENC-013'),
+                            value: _bitrateKbps.clamp(min, max),
+                            min: min,
+                            max: max,
+                            divisions: (max - min).round(),
+                            onChanged: (value) =>
+                                _markDirty(() => _bitrateKbps = value),
+                          );
+                        },
                       ),
                     ],
                   ),

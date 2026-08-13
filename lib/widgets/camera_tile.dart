@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/camera.dart';
 import '../theme/app_colors.dart';
+import 'camera_thumbnail_image.dart';
 import 'glass_card.dart';
 
 Widget _thumbnailPlaceholder(
@@ -398,14 +399,10 @@ class _CameraTileState extends State<CameraTile> {
                 fit: StackFit.expand,
                 children: [
                   if (thumbnailUrl != null)
-                    Image.network(
-                      thumbnailUrl,
+                    CameraThumbnailImage(
+                      thumbnailUrl: thumbnailUrl,
                       fit: BoxFit.cover,
-                      loadingBuilder: (context, child, progress) {
-                        if (progress == null) return child;
-                        return _thumbnailPlaceholder(colorScheme, isDark);
-                      },
-                      errorBuilder: (context, error, stackTrace) =>
+                      placeholderBuilder: () =>
                           _thumbnailPlaceholder(colorScheme, isDark),
                     )
                   else
@@ -607,23 +604,14 @@ class _CameraListTileState extends State<CameraListTile> {
                       fit: StackFit.expand,
                       children: [
                         thumbnailUrl != null
-                            ? Image.network(
-                                thumbnailUrl,
+                            ? CameraThumbnailImage(
+                                thumbnailUrl: thumbnailUrl,
                                 fit: BoxFit.cover,
-                                loadingBuilder: (context, child, progress) {
-                                  if (progress == null) return child;
-                                  return _thumbnailPlaceholder(
-                                    colorScheme,
-                                    isDark,
-                                    iconSize: 22,
-                                  );
-                                },
-                                errorBuilder: (context, error, stackTrace) =>
-                                    _thumbnailPlaceholder(
-                                      colorScheme,
-                                      isDark,
-                                      iconSize: 22,
-                                    ),
+                                placeholderBuilder: () => _thumbnailPlaceholder(
+                                  colorScheme,
+                                  isDark,
+                                  iconSize: 22,
+                                ),
                               )
                             : _thumbnailPlaceholder(
                                 colorScheme,

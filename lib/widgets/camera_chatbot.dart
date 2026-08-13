@@ -15,6 +15,7 @@ import '../models/event.dart';
 import '../models/event_type_display.dart';
 import '../screens/events/event_detail_screen.dart';
 import '../screens/events/events_screen.dart';
+import 'camera_thumbnail_image.dart';
 
 const _quickPrompts = [
   "Today's events",
@@ -447,7 +448,13 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
     );
   }
 
+  /// [url] is either an `http(s)://` placeholder image or a local file path
+  /// (a real camera snapshot written to disk by `syncCameraFromDevice`) —
+  /// same dual meaning as `CameraThumbnailImage`'s `thumbnailUrl`.
   Future<Uint8List> _fetchImageBytes(String url) async {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return File(url).readAsBytes();
+    }
     final request = await HttpClient().getUrl(Uri.parse(url));
     final response = await request.close();
     return Uint8List.fromList(
@@ -507,7 +514,11 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
               child: InteractiveViewer(
                 minScale: 1,
                 maxScale: 4,
-                child: Image.network(url, fit: BoxFit.contain),
+                child: CameraThumbnailImage(
+                  thumbnailUrl: url,
+                  fit: BoxFit.contain,
+                  placeholderBuilder: () => const SizedBox.shrink(),
+                ),
               ),
             ),
             SafeArea(
@@ -922,7 +933,17 @@ class _ImageResultCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         child: SizedBox(
           width: 90,
-          child: Image.network(url, fit: BoxFit.cover),
+          child: CameraThumbnailImage(
+            thumbnailUrl: url,
+            fit: BoxFit.cover,
+            placeholderBuilder: () => ColoredBox(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              child: Icon(
+                Icons.image_outlined,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
         ),
       ),
     );

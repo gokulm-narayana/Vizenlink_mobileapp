@@ -6,7 +6,10 @@ plugins {
 
 android {
     namespace = "com.onchiptech.mobilecctvapp"
-    compileSdk = flutter.compileSdkVersion
+    // flutter_secure_storage requires compileSdk 37+ — pinned explicitly
+    // since Flutter's own default (flutter.compileSdkVersion) lags behind
+    // it; see .claude/rules/mobile-app.md.
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

@@ -2,6 +2,7 @@ import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../models/home.dart';
@@ -17,7 +18,12 @@ const _unassignedRoomLabel = 'Unassigned';
 /// User's choice in the unsaved-changes leave-confirmation dialog.
 enum _LeaveChoice { save, discard }
 
-/// Dummy timezone options until a real camera can report its own list.
+/// Fallback timezone options — shown only when this camera has no saved
+/// connection yet, or its firmware predates `GetSupportedTimezones` (see
+/// `NetworkInfoClient.getSupportedTimezones`'s doc). Deliberately IANA-style
+/// labels, not POSIX codes: since these aren't camera-verified, Save leaves
+/// them local-only rather than guessing a POSIX string to push to the
+/// device (see `_confirmAndSave`).
 const _dummyTimezones = [
   'UTC',
   'America/New_York',
@@ -30,6 +36,33 @@ const _dummyTimezones = [
   'Asia/Tokyo',
   'Australia/Sydney',
 ];
+
+/// Reformats a camera-reported timezone name like "India Standard Time -
+/// Kolkata (UTC+05:30)" into a shorter "IST-Kolkata (UTC +5:30)" form. The
+/// abbreviation is the initials of each word in the region name — matches
+/// every example this catalog has returned so far ("China Standard Time" ->
+/// CST, "Greenwich Mean Time" -> GMT, "Eastern Time" -> ET). Falls back to
+/// the original string unmodified for anything that doesn't match the
+/// expected shape (e.g. the bare "Coordinated Universal Time (UTC)" entry,
+/// or a future firmware build changing the format) rather than showing a
+/// mangled result.
+String _formatTimezoneLabel(String name) {
+  final match = RegExp(
+    r'^(.+) - (.+) \(UTC([+-])(\d{1,2}):(\d{2})\)$',
+  ).firstMatch(name);
+  if (match == null) return name;
+  final abbreviation = match
+      .group(1)!
+      .split(' ')
+      .where((word) => word.isNotEmpty)
+      .map((word) => word[0])
+      .join();
+  final city = match.group(2)!;
+  final sign = match.group(3)!;
+  final hour = int.parse(match.group(4)!);
+  final minute = match.group(5)!;
+  return '$abbreviation-$city (UTC $sign$hour:$minute)';
+}
 
 /// Camera Info: editable name and home/room location, read-only
 /// device-info fields sourced from the [Camera] model (stub data until a
@@ -59,6 +92,13 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
   late String _timezone;
   bool _isDirty = false;
   bool _syncing = false;
+  bool _saving = false;
+
+  /// The camera's own curated timezone list (`code` is the POSIX string
+  /// `OnvifDeviceClient.setTimeZone` expects), fetched once a connection is
+  /// available. Null means "use the [_dummyTimezones] fallback" — either no
+  /// connection yet, or the camera's firmware predates this call.
+  List<TimezoneOption>? _cameraTimezones;
 
   /// The camera's current state from [HomesController], looked up fresh on
   /// every build rather than [widget.camera] directly — needed so
@@ -84,6 +124,21 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     _homeId = _originalHomeId;
     _room = widget.camera.room;
     _timezone = widget.camera.timezone;
+    _loadCameraTimezones();
+  }
+
+  /// Loads the camera's real timezone catalog if it has a saved connection.
+  /// Left as [_dummyTimezones] (does nothing) if not — see that list's doc.
+  Future<void> _loadCameraTimezones() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final client = NetworkInfoClient(connection);
+    final result = await client.getSupportedTimezones();
+    client.close();
+    if (!mounted) return;
+    if (result case CameraSuccess(:final value)) {
+      setState(() => _cameraTimezones = value);
+    }
   }
 
   @override
@@ -127,15 +182,44 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     });
   }
 
-  void _commitChanges() {
+  /// Returns the human-readable reason for each device push that failed
+  /// (name and/or timezone) — empty means everything that needed to reach
+  /// the camera did, or nothing needed to.
+  Future<List<String>> _commitChanges() async {
+    final failures = <String>[];
+    final connection = _camera.connection;
+
     final newName = _nameController.text.trim();
     if (newName.isNotEmpty && newName != widget.camera.name) {
-      widget.homesController.renameCamera(
-        _originalHomeId,
-        widget.camera.id,
-        newName,
-      );
+      // Pushed to the device (ONVIF SetScopes) whenever a connection is
+      // known, keeping the app's label and the camera's own reported name
+      // in sync — only falls back to a local-only rename for a camera that
+      // predates credential capture and so has nothing to push to.
+      if (connection != null) {
+        final client = OnvifDeviceClient(connection);
+        final result = await client.setDeviceName(newName);
+        client.close();
+        switch (result) {
+          case CameraSuccess():
+            widget.homesController.renameCamera(
+              _originalHomeId,
+              widget.camera.id,
+              newName,
+            );
+          case CameraFailure(:final reason):
+            failures.add('name ($reason)');
+          case CameraTimeout():
+            failures.add('name (timed out)');
+        }
+      } else {
+        widget.homesController.renameCamera(
+          _originalHomeId,
+          widget.camera.id,
+          newName,
+        );
+      }
     }
+
     if (_homeId != _originalHomeId || _room != widget.camera.room) {
       widget.homesController.moveCameraToHome(
         fromHomeId: _originalHomeId,
@@ -144,14 +228,39 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
         room: _room,
       );
     }
+
     if (_timezone != widget.camera.timezone) {
-      widget.homesController.updateCameraTimezone(
-        _homeId,
-        widget.camera.id,
-        _timezone,
-      );
+      // Only push to the real camera when this code came from its own
+      // verified catalog (_cameraTimezones) — never send a POSIX string
+      // guessed from the [_dummyTimezones] fallback. In that fallback case,
+      // stay local-only, same as home/room.
+      if (_cameraTimezones != null && connection != null) {
+        final client = OnvifDeviceClient(connection);
+        final result = await client.setTimeZone(_timezone);
+        client.close();
+        switch (result) {
+          case CameraSuccess():
+            widget.homesController.updateCameraTimezone(
+              _homeId,
+              widget.camera.id,
+              _timezone,
+            );
+          case CameraFailure(:final reason):
+            failures.add('timezone ($reason)');
+          case CameraTimeout():
+            failures.add('timezone (timed out)');
+        }
+      } else {
+        widget.homesController.updateCameraTimezone(
+          _homeId,
+          widget.camera.id,
+          _timezone,
+        );
+      }
     }
-    setState(() => _isDirty = false);
+
+    if (mounted) setState(() => _isDirty = false);
+    return failures;
   }
 
   Future<void> _confirmAndSave() async {
@@ -178,10 +287,20 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
       ),
     );
     if (shouldSave != true || !mounted) return;
-    _commitChanges();
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Changes saved')));
+    setState(() => _saving = true);
+    final failures = await _commitChanges();
+    if (!mounted) return;
+    setState(() => _saving = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          failures.isEmpty
+              ? 'Changes saved'
+              : 'Some changes saved, but ${failures.join(', ')} failed on '
+                    'the camera',
+        ),
+      ),
+    );
   }
 
   /// Called when the user tries to leave the screen with unsaved edits.
@@ -227,10 +346,10 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     );
   }
 
-  /// Fetches this camera's live device information, network interface, and
-  /// WAN capability over LAN (`OnvifDeviceClient`/`CapabilitiesClient`) and
-  /// persists whatever comes back via [HomesController.updateCamera]. Only
-  /// available once a `CameraConnection` has been saved for this camera
+  /// Fetches this camera's live device info/network/capabilities/timezone
+  /// and a fresh snapshot over LAN, persisting whatever succeeds via
+  /// [syncCameraFromDevice] (shared with the scan setup flow's auto-sync).
+  /// Only available once a `CameraConnection` has been saved for this camera
   /// (see [Camera.connection]'s doc) — cameras added before onboarding
   /// captured credentials, or whose scan setup form hasn't actually
   /// connected yet, have nothing to sync from.
@@ -246,84 +365,23 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     }
 
     setState(() => _syncing = true);
-    final device = OnvifDeviceClient(connection);
-    final nuraeye = NuraeyeClient(connection);
-    try {
-      final results = await Future.wait([
-        device.getDeviceInformation(),
-        device.getNetworkInterfaceInfo(),
-        CapabilitiesClient(nuraeye).getCapabilities(),
-      ]);
-      final infoResult = results[0] as CameraResult<DeviceInformation>;
-      final netResult = results[1] as CameraResult<NetworkInterfaceInfo>;
-      final capsResult = results[2] as CameraResult<CameraCapabilities>;
+    final failures = await syncCameraFromDevice(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
 
-      final failures = <String>[];
-      DeviceInformation? info;
-      NetworkInterfaceInfo? net;
-      CameraCapabilities? caps;
-
-      switch (infoResult) {
-        case CameraSuccess(:final value):
-          info = value;
-        case CameraFailure(:final reason):
-          failures.add('device info ($reason)');
-        case CameraTimeout():
-          failures.add('device info (timed out)');
-      }
-      switch (netResult) {
-        case CameraSuccess(:final value):
-          net = value;
-        case CameraFailure(:final reason):
-          failures.add('network info ($reason)');
-        case CameraTimeout():
-          failures.add('network info (timed out)');
-      }
-      switch (capsResult) {
-        case CameraSuccess(:final value):
-          caps = value;
-        case CameraFailure(:final reason):
-          failures.add('capabilities ($reason)');
-        case CameraTimeout():
-          failures.add('capabilities (timed out)');
-      }
-
-      if (info != null || net != null || caps != null) {
-        widget.homesController.updateCamera(
-          widget.camera.id,
-          (current) => current.copyWith(
-            manufacturer: info?.manufacturer,
-            model: info?.model,
-            firmwareVersion: info?.firmwareVersion,
-            serialNumber: info?.serialNumber,
-            hardwareId: info?.hardwareId,
-            macAddress: net?.macAddress,
-            ipAddress: net?.ipv4Address,
-            // The device's serial number doubles as its AWS IoT thing
-            // name/KVS stream name (OnvifDeviceClient.getSerialNumber's
-            // doc) — this is what unlocks the WAN identity/live-view
-            // clients for a camera onboarded via LAN.
-            thingName: info?.serialNumber,
-            wanLiveViewCapable: caps?.wanLiveViewCapable,
-          ),
-        );
-      }
-
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            failures.isEmpty
-                ? 'Synced with camera'
-                : 'Synced with camera, but ${failures.join(', ')} failed',
-          ),
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          failures.isEmpty
+              ? 'Synced with camera'
+              : 'Synced with camera, but ${failures.join(', ')} failed',
         ),
-      );
-    } finally {
-      device.close();
-      nuraeye.close();
-      if (mounted) setState(() => _syncing = false);
-    }
+      ),
+    );
+    setState(() => _syncing = false);
   }
 
   @override
@@ -343,8 +401,14 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
             actions: [
               TextButton(
                 key: const Key('CAMINFO-002'),
-                onPressed: _isDirty ? _confirmAndSave : null,
-                child: const Text('Save'),
+                onPressed: (_isDirty && !_saving) ? _confirmAndSave : null,
+                child: _saving
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Save'),
               ),
             ],
           ),
@@ -383,6 +447,7 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                     TextField(
                       key: const Key('CAMINFO-003'),
                       controller: _nameController,
+                      maxLength: kMaxDeviceNameLength,
                       decoration: const InputDecoration(
                         labelText: 'Camera name',
                       ),
@@ -412,8 +477,14 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                     _InfoRow(
                       settingsKey: const Key('CAMINFO-011'),
                       icon: Icons.precision_manufacturing_outlined,
-                      label: 'Manufacturer & model',
-                      value: '${_camera.manufacturer} ${_camera.model}',
+                      label: 'Manufacturer',
+                      value: _camera.manufacturer,
+                    ),
+                    _InfoRow(
+                      settingsKey: const Key('CAMINFO-033'),
+                      icon: Icons.camera_outlined,
+                      label: 'Model',
+                      value: _camera.model,
                     ),
                     _InfoRow(
                       settingsKey: const Key('CAMINFO-013'),
@@ -527,17 +598,40 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                       onChanged: _onRoomChanged,
                     ),
                     const SizedBox(height: 16),
-                    DropdownButtonFormField<String>(
-                      key: const Key('CAMINFO-006'),
-                      initialValue: _dummyTimezones.contains(_timezone)
-                          ? _timezone
-                          : _dummyTimezones.first,
-                      decoration: const InputDecoration(labelText: 'Timezone'),
-                      items: [
-                        for (final zone in _dummyTimezones)
-                          DropdownMenuItem(value: zone, child: Text(zone)),
-                      ],
-                      onChanged: _onTimezoneChanged,
+                    Builder(
+                      builder: (context) {
+                        final cameraTimezones = _cameraTimezones;
+                        final codes = cameraTimezones != null
+                            ? [for (final tz in cameraTimezones) tz.code]
+                            : _dummyTimezones;
+                        return DropdownButtonFormField<String>(
+                          key: const Key('CAMINFO-006'),
+                          initialValue: codes.contains(_timezone)
+                              ? _timezone
+                              : codes.first,
+                          decoration: const InputDecoration(
+                            labelText: 'Timezone',
+                          ),
+                          items: cameraTimezones != null
+                              ? [
+                                  for (final tz in cameraTimezones)
+                                    DropdownMenuItem(
+                                      value: tz.code,
+                                      child: Text(
+                                        _formatTimezoneLabel(tz.name),
+                                      ),
+                                    ),
+                                ]
+                              : [
+                                  for (final zone in _dummyTimezones)
+                                    DropdownMenuItem(
+                                      value: zone,
+                                      child: Text(zone),
+                                    ),
+                                ],
+                          onChanged: _onTimezoneChanged,
+                        );
+                      },
                     ),
                   ],
                 ),

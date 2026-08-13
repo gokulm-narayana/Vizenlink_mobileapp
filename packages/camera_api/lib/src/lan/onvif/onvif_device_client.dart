@@ -5,6 +5,7 @@ import '../../camera_connection.dart';
 import '../../camera_result.dart';
 import '../insecure_camera_http_client.dart';
 import '../wsse_digest.dart';
+import 'soap_fault.dart';
 
 /// `onvif_types.h`'s `ONVIF_CONFIG_SCOPE_NAME_PREFIX`/`ONVIF_CONFIG_SCOPE_LOCATION_PREFIX`.
 const _kScopeNamePrefix = 'onvif://www.onvif.org/name/';
@@ -53,7 +54,9 @@ class DeviceIdentity {
 
   @override
   bool operator ==(Object other) =>
-      other is DeviceIdentity && other.name == name && other.location == location;
+      other is DeviceIdentity &&
+      other.name == name &&
+      other.location == location;
   @override
   int get hashCode => Object.hash(name, location);
 }
@@ -97,8 +100,16 @@ class DeviceDateTime {
       other.minute == minute &&
       other.second == second;
   @override
-  int get hashCode =>
-      Object.hash(timezone, daylightSavings, year, month, day, hour, minute, second);
+  int get hashCode => Object.hash(
+    timezone,
+    daylightSavings,
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+  );
 }
 
 /// `GetDeviceInformation`'s full field set — read-only, shown on `CameraInfoScreen`'s "Device
@@ -234,7 +245,10 @@ class OnvifDeviceClient {
         final xAddr = Uri.tryParse(xAddrEl.first.innerText.trim());
         if (xAddr == null) continue;
         entries.add(
-          OnvifServiceEntry(namespace: namespaceEl.first.innerText.trim(), xAddr: xAddr),
+          OnvifServiceEntry(
+            namespace: namespaceEl.first.innerText.trim(),
+            xAddr: xAddr,
+          ),
         );
       }
       return entries;
@@ -260,7 +274,9 @@ class OnvifDeviceClient {
         if (raw.startsWith(_kScopeNamePrefix)) {
           name = Uri.decodeComponent(raw.substring(_kScopeNamePrefix.length));
         } else if (raw.startsWith(_kScopeLocationPrefix)) {
-          location = Uri.decodeComponent(raw.substring(_kScopeLocationPrefix.length));
+          location = Uri.decodeComponent(
+            raw.substring(_kScopeLocationPrefix.length),
+          );
         }
       }
       return DeviceIdentity(name: name, location: location);
@@ -284,7 +300,11 @@ class OnvifDeviceClient {
     Duration timeout = const Duration(seconds: 10),
   }) => _setScope(_kScopeLocationPrefix, location, timeout);
 
-  Future<CameraResult<void>> _setScope(String prefix, String value, Duration timeout) async {
+  Future<CameraResult<void>> _setScope(
+    String prefix,
+    String value,
+    Duration timeout,
+  ) async {
     final scopeUri = '$prefix${Uri.encodeComponent(value)}';
     final bodyResult = await _post(
       '<tds:SetScopes xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
@@ -425,13 +445,19 @@ class OnvifDeviceClient {
       final response = await _http
           .post(
             connection.onvifDeviceEndpoint,
-            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
+            headers: const {
+              'Content-Type': 'application/soap+xml; charset=utf-8',
+            },
             body: envelope,
           )
           .timeout(timeout);
 
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
+      }
+      final faultReason = soapFaultReason(response.body);
+      if (faultReason != null) {
+        return CameraFailure(faultReason);
       }
       return CameraSuccess(response.body);
     } on Exception catch (e) {

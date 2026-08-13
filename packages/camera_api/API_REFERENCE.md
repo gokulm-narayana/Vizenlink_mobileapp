@@ -8,6 +8,13 @@ registry). Every method that talks to the network is asynchronous and returns a 
 [`CameraResult<T>`](#result-type) rather than throwing — see that section for the pattern every
 caller uses.
 
+This file is organized by **client class** (mechanical params/returns, no decision logic). If
+you know *which camera setting* you're implementing but not yet *which client* is correct for
+it — settings that sound alike or overlap across LAN/WAN (e.g. Day/Night mode vs. Night Vision
+Type), or which capability/support flag gates a given setting (e.g. `wdrSupported`,
+`hasMicrophone`, `wanCommandCapable` — there are over a dozen of these across the package, each
+gating a different client) — see [SETTINGS_API_GUIDE.md](SETTINGS_API_GUIDE.md) first.
+
 ## Folder layout
 
 ```

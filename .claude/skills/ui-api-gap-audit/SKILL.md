@@ -18,11 +18,13 @@ description: Cross-reference already-built UI screens against documented client/
    - ✅ **Wired** — calls a documented client-code method that's actually imported and used
    - ⚠️ **Client code exists, not wired** — a `docs/client_code/*.md` entry covers this screen's need, but the screen doesn't call it yet (this is an `integrate-client-code` job, not a "waiting on senior" job)
    - ❌ **No client code available** — nothing in `docs/client_code/` covers this screen's need at all; the UI is ahead of what's been shared
-5. Compile results into `docs/api_coverage_audit/gap_report.md`:
-   - Summary counts at top: total screens/elements checked, ✅ / ⚠️ / ❌ counts
-   - Table: Screen (file), Element/action, Status, Client code covering it (doc file or "—"), Notes
+5. Compile results into `docs/api_coverage_audit/gap_report.md`, in this order:
+   - Summary counts at top: total screens/elements checked, ✅ / ⚠️ / ❌ counts.
+   - **Quick Wins** section, immediately after the summary: every ⚠️ screen, one row each — Screen (file), Client code covering it (doc file), What's missing (the specific call/import not yet made), Est. effort (S/M/L, judged from how many elements on the screen are ⚠️ vs already ✅). Sort screens with the most already-wired elements (smallest remaining gap) first, since those are closest to done. This section exists so quick wins surface before scrolling through the full table.
+   - **Blocked (needs new client code)** section: every ❌ screen grouped together, noting there's nothing in `docs/client_code/` to integrate yet — these need a new file from the senior first, not integration work.
+   - Full detail table (as before): Screen (file), Element/action, Status, Client code covering it (doc file or "—"), Notes.
 6. This is read-only/analysis-only — do not wire anything in, write client-code docs, or modify any screen as part of running this skill.
-7. Report the path to the report and the summary counts. For ⚠️ items, mention that `/integrate-client-code` can close them now; for ❌ items, mention they need a new file from the senior first.
+7. Report the path to the report and the summary counts, leading with the Quick Wins list (screen + what's missing) since that's the actionable part. For ⚠️ items, mention that `/integrate-client-code` can close them now; for ❌ items, mention they need a new file from the senior first.
 
 ## Notes
 

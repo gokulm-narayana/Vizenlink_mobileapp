@@ -7,6 +7,7 @@ import '../../camera_connection.dart';
 import '../../camera_result.dart';
 import '../insecure_camera_http_client.dart';
 import 'onvif_device_client.dart';
+import 'soap_fault.dart';
 import '../wsse_digest.dart';
 
 const _kVideoSourceConfigToken = 'VideoSourceCfg_1';
@@ -27,6 +28,17 @@ const kOsdPositionLowerRight = 'LowerRight';
 /// values need a source of truth independent of whatever `GetOSDOptions` happens to report.
 const kOsdDefaultDateFormat = 'dd/MM/yyyy';
 const kOsdDefaultTimeFormat = 'hh:mm:ss tt';
+
+/// `onvif_consts.c`'s `onvif_const_colorspace_rgb`/`onvif_const_colorspace_ycbcr` — the *only*
+/// strings the firmware's `Colorspace` attribute parser (`onvif_parser.c`) recognizes via an
+/// exact `strcmp`. A plain `"RGB"` (what this client sent before) matches neither constant, so
+/// the parsed color's colorspace field is left unset and `prvIsSupportedColor` in
+/// `onvif_media_osd.c` can never match it against the camera's advertised `ColorspaceRange` —
+/// this is the actual cause of the `ter:InvalidArgVal`/"Unsupported font color" SOAP fault a real
+/// hardware test hit on `CreateOSD`/`SetOSD` for the DateAndTime slot (found by reading the
+/// firmware source directly after the app-side date/time-format fix alone didn't resolve it).
+const kOnvifColorspaceRgb = 'http://www.onvif.org/ver10/colorspace/RGB';
+const kOnvifColorspaceYCbCr = 'http://www.onvif.org/ver10/colorspace/YCbCr';
 
 /// One currently-configured OSD entry as reported by `GetOSDs` — either the `DateAndTime`
 /// (timestamp) slot or the `Plain` (Text OSD) slot. Only these two text-string types are
@@ -70,7 +82,12 @@ class OsdEntry {
 }
 
 class OsdColor {
-  const OsdColor({required this.x, required this.y, required this.z, required this.colorspace});
+  const OsdColor({
+    required this.x,
+    required this.y,
+    required this.z,
+    required this.colorspace,
+  });
   final double x;
   final double y;
   final double z;
@@ -173,8 +190,8 @@ class OsdOptions {
 /// real camera for this reason** — a higher-risk gap than this package's other clients.
 class OsdClient {
   OsdClient(this.connection, {http.Client? httpClient})
-      : _http = httpClient ?? createCameraHttpClient(),
-        _device = OnvifDeviceClient(connection, httpClient: httpClient);
+    : _http = httpClient ?? createCameraHttpClient(),
+      _device = OnvifDeviceClient(connection, httpClient: httpClient);
 
   final CameraConnection connection;
   final http.Client _http;
@@ -204,9 +221,13 @@ class OsdClient {
     final servicesResult = await _device.getServices(timeout: timeout);
     switch (servicesResult) {
       case CameraSuccess<List<OnvifServiceEntry>>(:final value):
-        final entry = value.where((e) => e.namespace == _kMedia2Namespace).firstOrNull;
+        final entry = value
+            .where((e) => e.namespace == _kMedia2Namespace)
+            .firstOrNull;
         if (entry == null) {
-          return const CameraFailure('Media2 service not offered by this camera');
+          return const CameraFailure(
+            'Media2 service not offered by this camera',
+          );
         }
         _endpointCacheByHost[connection.host] = entry.xAddr;
         return CameraSuccess(entry.xAddr);
@@ -234,19 +255,34 @@ class OsdClient {
         if (token == null || token.isEmpty) continue;
         final textStringEl = el.findAllElements('TextString', namespace: '*');
         if (textStringEl.isEmpty) continue;
-        final typeEl = textStringEl.first.findAllElements('Type', namespace: '*');
+        final typeEl = textStringEl.first.findAllElements(
+          'Type',
+          namespace: '*',
+        );
         if (typeEl.isEmpty) continue;
         final textType = typeEl.first.innerText.trim();
-        final plainEl = textStringEl.first.findAllElements('PlainText', namespace: '*');
-        final dateFormatEl = textStringEl.first.findAllElements('DateFormat', namespace: '*');
-        final timeFormatEl = textStringEl.first.findAllElements('TimeFormat', namespace: '*');
+        final plainEl = textStringEl.first.findAllElements(
+          'PlainText',
+          namespace: '*',
+        );
+        final dateFormatEl = textStringEl.first.findAllElements(
+          'DateFormat',
+          namespace: '*',
+        );
+        final timeFormatEl = textStringEl.first.findAllElements(
+          'TimeFormat',
+          namespace: '*',
+        );
 
         final positionEl = el.findAllElements('Position', namespace: '*');
         String? posType;
         double? posX;
         double? posY;
         if (positionEl.isNotEmpty) {
-          final posTypeEl = positionEl.first.findAllElements('Type', namespace: '*');
+          final posTypeEl = positionEl.first.findAllElements(
+            'Type',
+            namespace: '*',
+          );
           posType = posTypeEl.isEmpty ? null : posTypeEl.first.innerText.trim();
           final posEl = positionEl.first.findAllElements('Pos', namespace: '*');
           if (posEl.isNotEmpty) {
@@ -255,10 +291,16 @@ class OsdClient {
           }
         }
 
-        final fontColorEl = textStringEl.first.findAllElements('FontColor', namespace: '*');
+        final fontColorEl = textStringEl.first.findAllElements(
+          'FontColor',
+          namespace: '*',
+        );
         OsdColor? fontColor;
         if (fontColorEl.isNotEmpty) {
-          final colorEl = fontColorEl.first.findAllElements('Color', namespace: '*');
+          final colorEl = fontColorEl.first.findAllElements(
+            'Color',
+            namespace: '*',
+          );
           if (colorEl.isNotEmpty) {
             final x = double.tryParse(colorEl.first.getAttribute('X') ?? '');
             final y = double.tryParse(colorEl.first.getAttribute('Y') ?? '');
@@ -278,8 +320,12 @@ class OsdClient {
             posType: posType,
             posX: posX,
             posY: posY,
-            dateFormat: dateFormatEl.isEmpty ? null : dateFormatEl.first.innerText.trim(),
-            timeFormat: timeFormatEl.isEmpty ? null : timeFormatEl.first.innerText.trim(),
+            dateFormat: dateFormatEl.isEmpty
+                ? null
+                : dateFormatEl.first.innerText.trim(),
+            timeFormat: timeFormatEl.isEmpty
+                ? null
+                : timeFormatEl.first.innerText.trim(),
             fontColor: fontColor,
           ),
         );
@@ -435,7 +481,9 @@ class OsdClient {
   }
 
   String _positionXml(String posType, double posX, double posY) {
-    final posXml = posType == kOsdPositionCustom ? '<tt:Pos x="$posX" y="$posY"/>' : '';
+    final posXml = posType == kOsdPositionCustom
+        ? '<tt:Pos x="$posX" y="$posY"/>'
+        : '';
     return '<tt:Position><tt:Type>$posType</tt:Type>$posXml</tt:Position>';
   }
 
@@ -467,14 +515,21 @@ class OsdClient {
     final result = bodyResult.map((body) {
       final doc = XmlDocument.parse(body);
       final rangeEl = doc.findAllElements('FontSizeRange', namespace: '*');
-      final minEl = rangeEl.isEmpty ? null : rangeEl.first.findElements('Min', namespace: '*');
-      final maxEl = rangeEl.isEmpty ? null : rangeEl.first.findElements('Max', namespace: '*');
+      final minEl = rangeEl.isEmpty
+          ? null
+          : rangeEl.first.findElements('Min', namespace: '*');
+      final maxEl = rangeEl.isEmpty
+          ? null
+          : rangeEl.first.findElements('Max', namespace: '*');
 
       final fontColorEl = doc.findAllElements('FontColor', namespace: '*');
       final colors = <OsdColor>[];
       var rangeAvailable = false;
       if (fontColorEl.isNotEmpty) {
-        for (final listEl in fontColorEl.first.findAllElements('ColorList', namespace: '*')) {
+        for (final listEl in fontColorEl.first.findAllElements(
+          'ColorList',
+          namespace: '*',
+        )) {
           final x = double.tryParse(listEl.getAttribute('X') ?? '');
           final y = double.tryParse(listEl.getAttribute('Y') ?? '');
           final z = double.tryParse(listEl.getAttribute('Z') ?? '');
@@ -483,7 +538,9 @@ class OsdClient {
             colors.add(OsdColor(x: x, y: y, z: z, colorspace: cs));
           }
         }
-        rangeAvailable = fontColorEl.first.findAllElements('ColorspaceRange', namespace: '*').isNotEmpty;
+        rangeAvailable = fontColorEl.first
+            .findAllElements('ColorspaceRange', namespace: '*')
+            .isNotEmpty;
       }
 
       final positionTypes = doc
@@ -554,7 +611,8 @@ class OsdClient {
     }
 
     final digest = WsseDigest.generate(connection.password);
-    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope =
+        '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -576,13 +634,19 @@ class OsdClient {
       final response = await _http
           .post(
             endpoint,
-            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
+            headers: const {
+              'Content-Type': 'application/soap+xml; charset=utf-8',
+            },
             body: envelope,
           )
           .timeout(timeout);
 
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
+      }
+      final faultReason = soapFaultReason(response.body);
+      if (faultReason != null) {
+        return CameraFailure(faultReason);
       }
       return CameraSuccess(response.body);
     } on TimeoutException {

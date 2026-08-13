@@ -1,5 +1,9 @@
+import 'dart:async';
+
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
@@ -11,11 +15,28 @@ import '../../widgets/refresh_preview_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
-/// Video Mode: preview thumbnail plus Day/Auto/Night selection. Persisted
-/// through [HomesController] (see `updateCamera`) so it survives leaving and
-/// re-entering the screen, and so a future real CCTV stream can read it
-/// directly — it has no visible effect on the dummy preview video yet (see
-/// CLAUDE.md).
+/// `CameraVideoMode` <-> ONVIF `IrCutFilter` wire values (`ON` = day, `OFF` =
+/// night, `AUTO` = auto) — see `OnvifImagingClient.ImagingSettings
+/// .irCutFilterMode`'s doc.
+String _videoModeToIrCutFilter(CameraVideoMode mode) => switch (mode) {
+  CameraVideoMode.day => 'ON',
+  CameraVideoMode.night => 'OFF',
+  CameraVideoMode.auto => 'AUTO',
+};
+
+CameraVideoMode? _irCutFilterToVideoMode(String? wireValue) =>
+    switch (wireValue?.toUpperCase()) {
+      'ON' => CameraVideoMode.day,
+      'OFF' => CameraVideoMode.night,
+      'AUTO' => CameraVideoMode.auto,
+      _ => null,
+    };
+
+/// Video Mode: preview thumbnail plus Day/Auto/Night selection, backed by
+/// ONVIF's `IrCutFilter` setting (`OnvifImagingClient`) when this camera has
+/// a saved connection — falls back to local-only `HomesController` state
+/// (via `simulateCameraSave`) otherwise, same as before. WAN fallback
+/// (`WanImagingClient.getDayNightMode`/`setDayNightMode`) isn't wired up yet.
 class VideoModeScreen extends StatefulWidget {
   const VideoModeScreen({
     super.key,
@@ -33,11 +54,55 @@ class VideoModeScreen extends StatefulWidget {
 }
 
 class _VideoModeScreenState extends State<VideoModeScreen> {
-  late CameraVideoMode _mode = widget.camera.videoMode;
+  late CameraVideoMode _mode = _camera.videoMode;
   bool _isDirty = false;
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+
+  /// The camera's own supported `IrCutFilter` values (`OnvifImagingClient
+  /// .getImagingOptions`), fetched once a connection is available. Null
+  /// means "camera not verified yet" — show every tile rather than none,
+  /// same reasoning as `_dummyTimezones`'s fallback in camera_info_screen.
+  List<String>? _irCutFilterModes;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRealVideoMode();
+  }
+
+  Future<void> _loadRealVideoMode() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final client = OnvifImagingClient(connection);
+    final results = await Future.wait([
+      client.getImagingSettings(),
+      client.getImagingOptions(),
+    ]);
+    client.close();
+    if (!mounted) return;
+
+    final settingsResult = results[0] as CameraResult<ImagingSettings>;
+    final optionsResult = results[1] as CameraResult<ImagingOptions>;
+
+    setState(() {
+      if (settingsResult case CameraSuccess(:final value)) {
+        final mode = _irCutFilterToVideoMode(value.irCutFilterMode);
+        if (mode != null) _mode = mode;
+      }
+      if (optionsResult case CameraSuccess(:final value)) {
+        _irCutFilterModes = value.irCutFilterModes;
+      }
+    });
+
+    if (settingsResult case CameraSuccess()) {
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (camera) => camera.copyWith(videoMode: _mode),
+      );
+    }
+  }
 
   void _onModeChanged(CameraVideoMode? value) {
     if (value == null) return;
@@ -47,19 +112,62 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
     });
   }
 
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
+  /// actually shows up without leaving and re-entering this screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
   Future<void> _refreshPreview() async {
+    final connection = _camera.connection;
+    if (connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
     setState(() => _isRefreshing = true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final succeeded = await refreshCameraSnapshot(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
     if (!mounted) return;
     setState(() {
       _isRefreshing = false;
       _previewReloadKey++;
     });
+    if (!succeeded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to refresh preview')),
+      );
+    }
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    if (connection != null) {
+      final client = OnvifImagingClient(connection);
+      final result = await client.setImagingSettings(
+        ImagingSettings(irCutFilterMode: _videoModeToIrCutFilter(_mode)),
+      );
+      client.close();
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -71,6 +179,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Changes saved')));
+      if (connection != null) unawaited(_refreshPreview());
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to save changes. Try again.')),
@@ -116,7 +225,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
                   CameraPreviewThumbnail(
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('VIDMODE-003'),
-                    camera: widget.camera,
+                    camera: _camera,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(
@@ -130,32 +239,30 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
                 Row(
                   key: const Key('VIDMODE-004'),
                   children: [
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.wb_sunny,
-                        label: 'Day',
-                        selected: _mode == CameraVideoMode.day,
-                        onTap: () => _onModeChanged(CameraVideoMode.day),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.brightness_auto,
-                        label: 'Auto',
-                        selected: _mode == CameraVideoMode.auto,
-                        onTap: () => _onModeChanged(CameraVideoMode.auto),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.nightlight_round,
-                        label: 'Night',
-                        selected: _mode == CameraVideoMode.night,
-                        onTap: () => _onModeChanged(CameraVideoMode.night),
-                      ),
-                    ),
+                    for (final entry in [
+                      (CameraVideoMode.day, Icons.wb_sunny, 'Day'),
+                      (CameraVideoMode.auto, Icons.brightness_auto, 'Auto'),
+                      (CameraVideoMode.night, Icons.nightlight_round, 'Night'),
+                    ])
+                      // Only render a mode this camera's own Options response
+                      // actually reports — never a hardcoded fixed set, per
+                      // .claude/rules/mobile-app-screen-conventions.md. Shows
+                      // all three when unverified (no connection yet).
+                      if (_irCutFilterModes == null ||
+                          _irCutFilterModes!.contains(
+                            _videoModeToIrCutFilter(entry.$1),
+                          )) ...[
+                        Expanded(
+                          child: ModeTile(
+                            icon: entry.$2,
+                            label: entry.$3,
+                            selected: _mode == entry.$1,
+                            onTap: () => _onModeChanged(entry.$1),
+                          ),
+                        ),
+                        if (entry.$1 != CameraVideoMode.night)
+                          const SizedBox(width: 12),
+                      ],
                   ],
                 ),
               ],

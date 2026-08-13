@@ -1,5 +1,9 @@
+import 'dart:async';
+
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
@@ -11,10 +15,25 @@ import '../../widgets/refresh_preview_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
-/// Night Mode: preview thumbnail plus Infrared/Smart/Full Color selection.
-/// Persisted through [HomesController] (see `updateCamera`) so it survives
-/// leaving and re-entering the screen — see the note on `videoMode` in
-/// `lib/models/camera.dart`.
+/// `CameraNightMode` <-> `NightVisionType` (`grey` = Infrared, `color` = Full
+/// Color, `smart` = Smart).
+NightVisionType _nightModeToType(CameraNightMode mode) => switch (mode) {
+  CameraNightMode.infrared => NightVisionType.grey,
+  CameraNightMode.fullColor => NightVisionType.color,
+  CameraNightMode.smart => NightVisionType.smart,
+};
+
+CameraNightMode _typeToNightMode(NightVisionType type) => switch (type) {
+  NightVisionType.grey => CameraNightMode.infrared,
+  NightVisionType.color => CameraNightMode.fullColor,
+  NightVisionType.smart => CameraNightMode.smart,
+};
+
+/// Night Mode: preview thumbnail plus Infrared/Smart/Full Color selection,
+/// backed by `NightVisionClient` (`GetNightVisionType`/`SetNightVisionType`)
+/// when this camera has a saved connection — falls back to local-only
+/// `HomesController` state (via `simulateCameraSave`) otherwise, same as
+/// before. WAN fallback (`WanNightVisionClient`) isn't wired up yet.
 class NightModeScreen extends StatefulWidget {
   const NightModeScreen({
     super.key,
@@ -32,11 +51,50 @@ class NightModeScreen extends StatefulWidget {
 }
 
 class _NightModeScreenState extends State<NightModeScreen> {
-  late CameraNightMode _mode = widget.camera.nightMode;
+  late CameraNightMode _mode = _camera.nightMode;
   bool _isDirty = false;
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+
+  /// Hardware/firmware capability flags from the camera's own
+  /// `GetNightVisionType` response — null means "camera not verified yet",
+  /// in which case every tile shows (same fallback reasoning as
+  /// `_dummyTimezones` in camera_info_screen). Unlike Video Mode, no
+  /// separate Options call exists for this — the capability flags ride
+  /// along with the current-value response itself.
+  late bool? _colorCapable = _camera.nightVisionColorCapable;
+  late bool? _smartCapable = _camera.nightVisionSmartCapable;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRealNightMode();
+  }
+
+  Future<void> _loadRealNightMode() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final nuraeye = NuraeyeClient(connection);
+    final result = await NightVisionClient(nuraeye).getNightVisionType();
+    nuraeye.close();
+    if (!mounted) return;
+    if (result case CameraSuccess(:final value)) {
+      setState(() {
+        _mode = _typeToNightMode(value.type);
+        _colorCapable = value.colorCapable;
+        _smartCapable = value.smartCapable;
+      });
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (camera) => camera.copyWith(
+          nightMode: _typeToNightMode(value.type),
+          nightVisionColorCapable: value.colorCapable,
+          nightVisionSmartCapable: value.smartCapable,
+        ),
+      );
+    }
+  }
 
   void _onModeChanged(CameraNightMode? value) {
     if (value == null) return;
@@ -46,19 +104,62 @@ class _NightModeScreenState extends State<NightModeScreen> {
     });
   }
 
+  /// Looked up fresh from [HomesController] on every build (not
+  /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
+  /// actually shows up without leaving and re-entering this screen.
+  Camera get _camera {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        if (camera.id == widget.camera.id) return camera;
+      }
+    }
+    return widget.camera;
+  }
+
   Future<void> _refreshPreview() async {
+    final connection = _camera.connection;
+    if (connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
     setState(() => _isRefreshing = true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    final succeeded = await refreshCameraSnapshot(
+      homesController: widget.homesController,
+      cameraId: widget.camera.id,
+      connection: connection,
+    );
     if (!mounted) return;
     setState(() {
       _isRefreshing = false;
       _previewReloadKey++;
     });
+    if (!succeeded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to refresh preview')),
+      );
+    }
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    if (connection != null) {
+      final nuraeye = NuraeyeClient(connection);
+      final result = await NightVisionClient(
+        nuraeye,
+      ).setNightVisionType(_nightModeToType(_mode));
+      nuraeye.close();
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -70,6 +171,7 @@ class _NightModeScreenState extends State<NightModeScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Changes saved')));
+      if (connection != null) unawaited(_refreshPreview());
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to save changes. Try again.')),
@@ -115,7 +217,7 @@ class _NightModeScreenState extends State<NightModeScreen> {
                   CameraPreviewThumbnail(
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('NIGHT-005'),
-                    camera: widget.camera,
+                    camera: _camera,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(
@@ -129,32 +231,43 @@ class _NightModeScreenState extends State<NightModeScreen> {
                 Row(
                   key: const Key('NIGHT-006'),
                   children: [
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.nightlight,
-                        label: 'Infrared',
-                        selected: _mode == CameraNightMode.infrared,
-                        onTap: () => _onModeChanged(CameraNightMode.infrared),
+                    // Infrared (grey) is the baseline capability, always
+                    // shown. Smart/Full Color are gated on the camera's own
+                    // reported capability flags — never hardcoded — per
+                    // .claude/rules/mobile-app-screen-conventions.md. Shows
+                    // both when unverified (no connection yet, `null`).
+                    for (final entry in [
+                      (
+                        CameraNightMode.infrared,
+                        Icons.nightlight,
+                        'Infrared',
+                        true,
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.auto_awesome,
-                        label: 'Smart',
-                        selected: _mode == CameraNightMode.smart,
-                        onTap: () => _onModeChanged(CameraNightMode.smart),
+                      (
+                        CameraNightMode.smart,
+                        Icons.auto_awesome,
+                        'Smart',
+                        _smartCapable != false,
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ModeTile(
-                        icon: Icons.palette,
-                        label: 'Full Color',
-                        selected: _mode == CameraNightMode.fullColor,
-                        onTap: () => _onModeChanged(CameraNightMode.fullColor),
+                      (
+                        CameraNightMode.fullColor,
+                        Icons.palette,
+                        'Full Color',
+                        _colorCapable != false,
                       ),
-                    ),
+                    ])
+                      if (entry.$4) ...[
+                        Expanded(
+                          child: ModeTile(
+                            icon: entry.$2,
+                            label: entry.$3,
+                            selected: _mode == entry.$1,
+                            onTap: () => _onModeChanged(entry.$1),
+                          ),
+                        ),
+                        if (entry.$1 != CameraNightMode.fullColor)
+                          const SizedBox(width: 12),
+                      ],
                   ],
                 ),
               ],

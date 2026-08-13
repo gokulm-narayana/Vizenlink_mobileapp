@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/camera.dart';
 import '../models/zone.dart';
 import '../theme/app_colors.dart';
+import 'camera_thumbnail_image.dart';
 
 export '../models/zone.dart';
 
@@ -25,15 +26,10 @@ class CameraImage extends StatelessWidget {
       return _placeholder(colorScheme, isDark);
     }
 
-    return Image.network(
-      thumbnailUrl,
+    return CameraThumbnailImage(
+      thumbnailUrl: thumbnailUrl,
       fit: BoxFit.cover,
-      loadingBuilder: (context, child, progress) {
-        if (progress == null) return child;
-        return _placeholder(colorScheme, isDark);
-      },
-      errorBuilder: (context, error, stackTrace) =>
-          _placeholder(colorScheme, isDark),
+      placeholderBuilder: () => _placeholder(colorScheme, isDark),
     );
   }
 

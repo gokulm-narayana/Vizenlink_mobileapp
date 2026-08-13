@@ -9,8 +9,9 @@ Pure-Dart, `package:flutter`-free camera network layer (LAN ONVIF + proprietary 
 **Integration status:**
 - Core (`CameraConnection`, `CameraResult`) + `WsDiscoveryClient` wired into `scanned_devices_screen`/`scanning_popup` (real LAN discovery, replacing the old fake stub list). The setup form now also captures and persists `host`/`username`/`password` onto the `Camera` model (see `Camera.connection`), though the "Connect" step itself still simulates success rather than verifying credentials against the camera.
 - `OnvifDeviceClient` (`getDeviceInformation`, `getNetworkInterfaceInfo`) + `CapabilitiesClient` wired into `camera_info_screen`'s new "Sync from camera" button (CAMINFO-032) — LAN only. Populates `Camera.manufacturer/model/firmwareVersion/serialNumber/hardwareId/macAddress/ipAddress/wanLiveViewCapable`, and mirrors the serial number into `Camera.thingName` (per `OnvifDeviceClient.getSerialNumber`'s doc: same string, needed for WAN). `WanDeviceIdentityClient` (the WAN counterpart) is not wired up yet — flagged as follow-up.
+- `NetworkInfoClient` (`getWifiSsid`, `getWifiSignalStrength`, `setupWifi`) + `OnvifDeviceClient.getNetworkInterfaceInfo` (for the wired/wireless check) wired into `wifi_config_screen` — LAN only, no WAN counterpart exists for this client. Replaced the screen's earlier fake nearby-network-scan UI entirely, since the client has no scan capability — see [wifi_config_screen.md](../screens/camera_settings/wifi_config_screen.md) for the shape that replaced it. `getSupportedTimezones` was already wired into `camera_info_screen`'s timezone picker separately.
 
-Every other client class below is still unintegrated — this doc's screen mapping is the plan for follow-up passes.
+The screen mapping below predates most of the integration work above and elsewhere in the app (night mode, imaging, video mode, video encoder, privacy mode, on-screen display, and audio screens are also wired up by now) — treat it as "which screen a class belongs to," not "still unintegrated." `NetworkInfoClient` is marked integrated (✅) as of the bullet above; the rest haven't been re-audited against current code.
 
 ## Core (used by everything)
 
@@ -34,7 +35,7 @@ Every other client class below is still unintegrated — this doc's screen mappi
 | `PrivacyModeClient` (nuraeye), `WanPrivacyModeClient` | LAN + WAN | `privacy_mode_screen` |
 | `MirrorFlipClient` (nuraeye), `WanMirrorFlipClient` | LAN + WAN | `video_mode_screen` or `video_display_screen` (orientation) — confirm which with user |
 | `AudioCapabilityClient`, `SpeakerVolumeClient` (onvif), `AudioVolumeClient` (nuraeye), `WanAudioVolumeClient`, `WanSpeakerVolumeClient` | LAN + WAN | `audio_screen` |
-| `NetworkInfoClient`, `rest_network_connectivity_client` | LAN | `wifi_config_screen` |
+| `NetworkInfoClient` ✅, `rest_network_connectivity_client` | LAN | `wifi_config_screen` |
 | `SnapshotClient`, `WanPreviewSnapshotClient` | LAN + WAN | `camera_live_screen`, `camera_preview_thumbnail.dart` widget |
 | `WebRtcUriClient`, `CloudStreamingClient` (nuraeye) | LAN | `camera_live_screen` (live stream URI) |
 | `WanLiveViewClient` / `AwsWanLiveViewClient`, `KvsPlaybackClient` | WAN | `camera_live_screen` (WAN playback path) |
