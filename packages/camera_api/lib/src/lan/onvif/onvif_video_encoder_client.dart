@@ -5,8 +5,8 @@ import '../../camera_connection.dart';
 import '../../camera_result.dart';
 import '../insecure_camera_http_client.dart';
 import 'onvif_device_client.dart';
-import 'soap_fault.dart';
 import '../wsse_digest.dart';
+import 'soap_fault.dart';
 
 /// `FR-MOB-099`/`FR-NE-100`: this feature is deliberately scoped to the **high-resolution
 /// profile only** (Stream 0, "VideoEncoderCfg_1", per direct user request) — distinct from the
@@ -27,8 +27,7 @@ class IntRange {
   final int max;
 
   @override
-  bool operator ==(Object other) =>
-      other is IntRange && other.min == min && other.max == max;
+  bool operator ==(Object other) => other is IntRange && other.min == min && other.max == max;
 
   @override
   int get hashCode => Object.hash(min, max);
@@ -204,9 +203,7 @@ class VideoEncoderSettingsOptions {
 
   final List<EncodingOptions> encodings;
 
-  List<String> get availableEncodings => [
-    for (final e in encodings) e.encoding,
-  ];
+  List<String> get availableEncodings => [for (final e in encodings) e.encoding];
 
   EncodingOptions? forEncoding(String encoding) {
     for (final e in encodings) {
@@ -237,8 +234,7 @@ class OnvifVideoEncoderClient {
   /// `_optionsCacheByHost` (added 2026-08-10). The full response already covers every encoding
   /// in one fetch (`VideoEncoderSettingsOptions.encodings`), so caching it whole is safe even
   /// though the UI only shows one encoding's bounds at a time.
-  static final Map<String, VideoEncoderSettingsOptions> _optionsCacheByHost =
-      {};
+  static final Map<String, VideoEncoderSettingsOptions> _optionsCacheByHost = {};
 
   Future<CameraResult<Uri>> _resolveMedia2Endpoint(Duration timeout) async {
     final cached = _endpointCacheByHost[connection.host];
@@ -247,13 +243,9 @@ class OnvifVideoEncoderClient {
     final servicesResult = await _device.getServices(timeout: timeout);
     switch (servicesResult) {
       case CameraSuccess<List<OnvifServiceEntry>>(:final value):
-        final entry = value
-            .where((e) => e.namespace == _kMedia2Namespace)
-            .firstOrNull;
+        final entry = value.where((e) => e.namespace == _kMedia2Namespace).firstOrNull;
         if (entry == null) {
-          return const CameraFailure(
-            'Media2 service not offered by this camera',
-          );
+          return const CameraFailure('Media2 service not offered by this camera');
         }
         _endpointCacheByHost[connection.host] = entry.xAddr;
         return CameraSuccess(entry.xAddr);
@@ -277,9 +269,7 @@ class OnvifVideoEncoderClient {
       final doc = XmlDocument.parse(body);
       final configEl = doc.findAllElements('Configurations', namespace: '*');
       if (configEl.isEmpty) {
-        throw const FormatException(
-          'GetVideoEncoderConfigurations response has no Configurations',
-        );
+        throw const FormatException('GetVideoEncoderConfigurations response has no Configurations');
       }
       final el = configEl.first;
       String? text(String tag) {
@@ -288,9 +278,7 @@ class OnvifVideoEncoderClient {
       }
 
       final rateControlEl = el.findAllElements('RateControl', namespace: '*');
-      final cbr =
-          rateControlEl.isNotEmpty &&
-          rateControlEl.first.getAttribute('ConstantBitRate') == 'true';
+      final cbr = rateControlEl.isNotEmpty && rateControlEl.first.getAttribute('ConstantBitRate') == 'true';
 
       return VideoEncoderSettings(
         bitrate: int.tryParse(text('BitrateLimit') ?? '') ?? 0,
@@ -338,8 +326,7 @@ class OnvifVideoEncoderClient {
   /// Cached (process-lifetime, per host — see `_optionsCacheByHost`) after the first successful
   /// fetch — pass `forceRefresh: true` to bypass the cache (a manual, explicit user action; no
   /// normal load/reload should ever do this).
-  Future<CameraResult<VideoEncoderSettingsOptions>>
-  getVideoEncoderSettingsOptions({
+  Future<CameraResult<VideoEncoderSettingsOptions>> getVideoEncoderSettingsOptions({
     Duration timeout = const Duration(seconds: 10),
     bool forceRefresh = false,
   }) async {
@@ -382,10 +369,7 @@ class OnvifVideoEncoderClient {
         // onvif_media2.c's prvGenerateGetVideoEncoderConfigurationOptionsResponse.
         final govParts = (opt.getAttribute('GovLengthRange') ?? '').split(' ');
         final govLengthRange = govParts.length == 2
-            ? IntRange(
-                int.tryParse(govParts[0]) ?? 1,
-                int.tryParse(govParts[1]) ?? 60,
-              )
+            ? IntRange(int.tryParse(govParts[0]) ?? 1, int.tryParse(govParts[1]) ?? 60)
             : const IntRange(1, 60);
 
         final frameRateInts = (opt.getAttribute('FrameRatesSupported') ?? '')
@@ -407,21 +391,12 @@ class OnvifVideoEncoderClient {
             .toList();
 
         final resolutions = <Resolution>[];
-        for (final resEl in opt.findAllElements(
-          'ResolutionsAvailable',
-          namespace: '*',
-        )) {
+        for (final resEl in opt.findAllElements('ResolutionsAvailable', namespace: '*')) {
           final widthEl = resEl.findAllElements('Width', namespace: '*');
           final heightEl = resEl.findAllElements('Height', namespace: '*');
-          final width = widthEl.isEmpty
-              ? null
-              : int.tryParse(widthEl.first.innerText.trim());
-          final height = heightEl.isEmpty
-              ? null
-              : int.tryParse(heightEl.first.innerText.trim());
-          if (width != null && height != null) {
-            resolutions.add((width: width, height: height));
-          }
+          final width = widthEl.isEmpty ? null : int.tryParse(widthEl.first.innerText.trim());
+          final height = heightEl.isEmpty ? null : int.tryParse(heightEl.first.innerText.trim());
+          if (width != null && height != null) resolutions.add((width: width, height: height));
         }
 
         encodings.add(
@@ -439,9 +414,7 @@ class OnvifVideoEncoderClient {
       }
 
       if (encodings.isEmpty) {
-        throw const FormatException(
-          'GetVideoEncoderConfigurationOptions response has no Options',
-        );
+        throw const FormatException('GetVideoEncoderConfigurationOptions response has no Options');
       }
       return VideoEncoderSettingsOptions(encodings: encodings);
     });
@@ -464,8 +437,7 @@ class OnvifVideoEncoderClient {
     }
 
     final digest = WsseDigest.generate(connection.password);
-    final envelope =
-        '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -487,9 +459,7 @@ class OnvifVideoEncoderClient {
       final response = await _http
           .post(
             endpoint,
-            headers: const {
-              'Content-Type': 'application/soap+xml; charset=utf-8',
-            },
+            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
             body: envelope,
           )
           .timeout(timeout);
@@ -497,10 +467,10 @@ class OnvifVideoEncoderClient {
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
       }
+
       final faultReason = soapFaultReason(response.body);
-      if (faultReason != null) {
-        return CameraFailure(faultReason);
-      }
+      if (faultReason != null) return CameraFailure(faultReason);
+
       return CameraSuccess(response.body);
     } on Exception catch (e) {
       return CameraFailure(e.toString());

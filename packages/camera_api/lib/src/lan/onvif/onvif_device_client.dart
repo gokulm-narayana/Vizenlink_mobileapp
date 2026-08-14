@@ -3,6 +3,7 @@ import 'package:xml/xml.dart';
 
 import '../../camera_connection.dart';
 import '../../camera_result.dart';
+import '../../device_reset_types.dart';
 import '../insecure_camera_http_client.dart';
 import '../wsse_digest.dart';
 import 'soap_fault.dart';
@@ -54,9 +55,7 @@ class DeviceIdentity {
 
   @override
   bool operator ==(Object other) =>
-      other is DeviceIdentity &&
-      other.name == name &&
-      other.location == location;
+      other is DeviceIdentity && other.name == name && other.location == location;
   @override
   int get hashCode => Object.hash(name, location);
 }
@@ -100,16 +99,8 @@ class DeviceDateTime {
       other.minute == minute &&
       other.second == second;
   @override
-  int get hashCode => Object.hash(
-    timezone,
-    daylightSavings,
-    year,
-    month,
-    day,
-    hour,
-    minute,
-    second,
-  );
+  int get hashCode =>
+      Object.hash(timezone, daylightSavings, year, month, day, hour, minute, second);
 }
 
 /// `GetDeviceInformation`'s full field set — read-only, shown on `CameraInfoScreen`'s "Device
@@ -245,10 +236,7 @@ class OnvifDeviceClient {
         final xAddr = Uri.tryParse(xAddrEl.first.innerText.trim());
         if (xAddr == null) continue;
         entries.add(
-          OnvifServiceEntry(
-            namespace: namespaceEl.first.innerText.trim(),
-            xAddr: xAddr,
-          ),
+          OnvifServiceEntry(namespace: namespaceEl.first.innerText.trim(), xAddr: xAddr),
         );
       }
       return entries;
@@ -274,9 +262,7 @@ class OnvifDeviceClient {
         if (raw.startsWith(_kScopeNamePrefix)) {
           name = Uri.decodeComponent(raw.substring(_kScopeNamePrefix.length));
         } else if (raw.startsWith(_kScopeLocationPrefix)) {
-          location = Uri.decodeComponent(
-            raw.substring(_kScopeLocationPrefix.length),
-          );
+          location = Uri.decodeComponent(raw.substring(_kScopeLocationPrefix.length));
         }
       }
       return DeviceIdentity(name: name, location: location);
@@ -300,11 +286,7 @@ class OnvifDeviceClient {
     Duration timeout = const Duration(seconds: 10),
   }) => _setScope(_kScopeLocationPrefix, location, timeout);
 
-  Future<CameraResult<void>> _setScope(
-    String prefix,
-    String value,
-    Duration timeout,
-  ) async {
+  Future<CameraResult<void>> _setScope(String prefix, String value, Duration timeout) async {
     final scopeUri = '$prefix${Uri.encodeComponent(value)}';
     final bodyResult = await _post(
       '<tds:SetScopes xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
@@ -414,6 +396,41 @@ class OnvifDeviceClient {
     return bodyResult.map((_) {});
   }
 
+  /// Reboots the camera (`SystemReboot`, `FR-CF-112`) — `onvif_device.c` responds with a
+  /// `tt:Message` (typically `"Rebooting in 5 seconds"`) and calls `bsp_rebootAsync()`
+  /// **before** the response is even generated, so this call succeeding does not mean the
+  /// device is back yet — the caller should expect a real connectivity gap of several seconds.
+  /// No confirmation/undo: the caller owns any "are you sure?" prompt before invoking this.
+  Future<CameraResult<String>> reboot({Duration timeout = const Duration(seconds: 10)}) async {
+    final bodyResult = await _post(
+      '<tds:SystemReboot xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+      timeout,
+    );
+    return bodyResult.map((body) {
+      final doc = XmlDocument.parse(body);
+      final el = doc.findAllElements('Message', namespace: '*');
+      return el.isEmpty ? '' : el.first.innerText.trim();
+    });
+  }
+
+  /// Resets the camera to factory defaults (`SetSystemFactoryDefault`, `FR-CF-111`) — see
+  /// [FactoryResetMode]'s doc for the Soft/Hard distinction. Response is empty on success; the
+  /// camera reboots automatically afterward (`bsp_rebootAsync()`), same connectivity-gap caveat
+  /// as [reboot]. **[FactoryResetMode.hard] wipes WiFi credentials** — the caller must warn the
+  /// user this camera will need full re-provisioning/re-onboarding, not just a reconnect.
+  Future<CameraResult<void>> factoryReset(
+    FactoryResetMode mode, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final bodyResult = await _post(
+      '<tds:SetSystemFactoryDefault xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+      '<tds:FactoryDefault>${mode.wireValue}</tds:FactoryDefault>'
+      '</tds:SetSystemFactoryDefault>',
+      timeout,
+    );
+    return bodyResult.map((_) {});
+  }
+
   String _escape(String text) => text
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
@@ -445,9 +462,7 @@ class OnvifDeviceClient {
       final response = await _http
           .post(
             connection.onvifDeviceEndpoint,
-            headers: const {
-              'Content-Type': 'application/soap+xml; charset=utf-8',
-            },
+            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
             body: envelope,
           )
           .timeout(timeout);
@@ -455,10 +470,10 @@ class OnvifDeviceClient {
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
       }
+
       final faultReason = soapFaultReason(response.body);
-      if (faultReason != null) {
-        return CameraFailure(faultReason);
-      }
+      if (faultReason != null) return CameraFailure(faultReason);
+
       return CameraSuccess(response.body);
     } on Exception catch (e) {
       return CameraFailure(e.toString());

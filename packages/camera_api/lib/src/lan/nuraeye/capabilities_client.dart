@@ -12,7 +12,12 @@ import 'nuraeye_client.dart';
 /// `true` while the latter is `false`. Both also require this specific device to actually have
 /// real AWS IoT credentials provisioned, not just build-time support.
 class CameraCapabilities {
-  const CameraCapabilities({required this.wanCommandCapable, required this.wanLiveViewCapable});
+  const CameraCapabilities({
+    required this.wanCommandCapable,
+    required this.wanLiveViewCapable,
+    required this.supportedEventTypes,
+    required this.supportedEventDeterrenceOptions,
+  });
 
   /// Whether this device can receive AWS IoT/MQTT commands at all (deterrence, settings sync,
   /// WAN control) — independent of KVS. Not yet consumed anywhere in the app (no WAN command
@@ -21,6 +26,25 @@ class CameraCapabilities {
   final bool wanCommandCapable;
 
   final bool wanLiveViewCapable;
+
+  /// `FR-CF-143`/`FR-NE-111`: the alert event strings this specific camera build actually
+  /// generates (e.g. `"VideoModeChanged"`, `"PrivacyModeChanged"`, `"PersonDetected"`) — the
+  /// same identifiers used as the alert JSON's own `"event"` field and as
+  /// `EventPreferencesClient`'s enable/disable keys. `EventSettingsScreen` builds its toggle
+  /// list from this list only, never a hardcoded one, so a future firmware build that adds a
+  /// real alert type needs no app update to show it. Empty on firmware too old to report it
+  /// (missing/wrong-typed field is not an error — treated as "no alert types known").
+  final List<String> supportedEventTypes;
+
+  /// `FR-CF-144`/`FR-NE-112`: for each detection-type event this build supports auto-response
+  /// actions on (only `"PersonDetected"` today), the response actions eligible for it — a
+  /// subset of `siren`/`spotlight`/`warning`/`mobile_alert`, already intersected with this SKU's
+  /// hardware capability. State-change event types (`VideoModeChanged`/`PrivacyModeChanged`)
+  /// never appear as keys here, even though they appear in [supportedEventTypes] — deterrence
+  /// response actions are deliberately scoped to detection events only. `EventSettingsScreen`
+  /// builds its response-action multi-select from this map only, never a hardcoded action list.
+  /// Empty on firmware too old to report it.
+  final Map<String, List<String>> supportedEventDeterrenceOptions;
 }
 
 /// Dispatches over both LAN and WAN on the firmware side (`FR-NE-092`, matching the
@@ -48,10 +72,25 @@ class CapabilitiesClient {
               'GetCapabilities response missing wan_command_capable/wan_live_view_capable: $value',
             );
           }
+          final rawEventTypes = value['supported_event_types'];
+          final supportedEventTypes = rawEventTypes is List
+              ? rawEventTypes.whereType<String>().toList()
+              : const <String>[];
+          final rawDeterrenceOptions = value['supported_event_deterrence_options'];
+          final supportedEventDeterrenceOptions = rawDeterrenceOptions is Map
+              ? rawDeterrenceOptions.map(
+                  (key, actions) => MapEntry(
+                    key.toString(),
+                    actions is List ? actions.whereType<String>().toList() : const <String>[],
+                  ),
+                )
+              : const <String, List<String>>{};
           return CameraSuccess<CameraCapabilities>(
             CameraCapabilities(
               wanCommandCapable: wanCommandCapable,
               wanLiveViewCapable: wanLiveViewCapable,
+              supportedEventTypes: supportedEventTypes,
+              supportedEventDeterrenceOptions: supportedEventDeterrenceOptions,
             ),
           );
         }(),

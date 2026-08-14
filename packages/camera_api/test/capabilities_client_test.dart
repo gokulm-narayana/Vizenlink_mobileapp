@@ -5,7 +5,7 @@ import 'rest_mock_helpers.dart';
 
 void main() {
   // NuraeyeClient caches session tokens and GetCapabilities responses per host for the process
-  // lifetime (`.claude/rules/mobile-app.md`'s caching convention) — clear between tests so one
+  // lifetime (`.claude/rules/mobile-app-screen-conventions.md`'s caching convention) — clear between tests so one
   // test's mocked response can't leak into the next via that static cache.
   setUp(NuraeyeClient.debugClearCaches);
 

@@ -66,7 +66,7 @@ class NuraeyeClient {
   static final Map<String, _Session> _sessionByHost = {};
 
   /// `GetCapabilities` is a fixed build/unit property, not per-request state — cached the same
-  /// way `.claude/rules/mobile-app.md`'s "Caching capability/service-discovery responses"
+  /// way `.claude/rules/mobile-app-screen-conventions.md`'s "Caching capability/service-discovery responses"
   /// convention caches any other options/capability response. Also lets [_getNightVisionType]
   /// merge in `night_vision_color_capable`/`night_vision_smart_capable` without paying a second
   /// round trip on every call.
@@ -170,6 +170,23 @@ class NuraeyeClient {
         return _get('/nuraeye/video/mirror-flip', timeout);
       case 'SetMirrorFlip':
         return _post('/nuraeye/video/mirror-flip', {'mode': p['mode']}, timeout);
+      case 'GetAntiFlickerMode':
+        return _get('/nuraeye/video/anti-flicker', timeout);
+      case 'SetAntiFlickerMode':
+        return _post('/nuraeye/video/anti-flicker', {'mode': p['mode']}, timeout);
+      case 'GetEventPreferences':
+        return _get('/nuraeye/events/preferences', timeout);
+      case 'SetEventPreferences':
+        // Partial update — p is the caller's {event_string: bool, ...} map, passed straight
+        // through as the POST body (unlike every other Set* case above, there's no fixed field
+        // name to project it onto; the keys themselves are the camera's own alert type strings).
+        return _post('/nuraeye/events/preferences', p, timeout);
+      case 'GetEventResponseActions':
+        return _get('/nuraeye/events/response-actions', timeout);
+      case 'SetEventResponseActions':
+        // Partial update — p is the caller's {event_string: [action, ...], ...} map, passed
+        // straight through as the POST body, same shape convention as SetEventPreferences.
+        return _post('/nuraeye/events/response-actions', p, timeout);
       case 'GetWebRtcUri':
         return _post('/nuraeye/webrtc-uri', {'profile_token': p['profile_token']}, timeout);
       case 'GetImageDefaults':
@@ -413,6 +430,34 @@ class NuraeyeClient {
       rest.RestFailure(:final reason) => CameraFailure<bool>(reason),
       rest.RestTimeout() => const CameraTimeout<bool>(),
     };
+  }
+
+  /// Retrying variant of [areYouNuraeyeDevice] for **first-contact discovery/onboarding only**
+  /// — added 2026-08-15 per direct user report and a live Python check confirming the root
+  /// cause: a phone's *first* HTTPS request over a given WiFi connection can be slow (WiFi radio
+  /// waking from power-save, cold TLS handshake against the camera's self-signed cert), which
+  /// [areYouNuraeyeDevice]'s single-attempt default was intermittently losing to even for a
+  /// genuine camera — confirmed to answer in ~0.4s, 10/10, once the connection isn't cold.
+  /// Mirrors `probeCloudSnapshotsSupported`'s existing retry shape (`camera_settings_cache.dart`).
+  ///
+  /// **Deliberately not folded into [areYouNuraeyeDevice] itself** — `WebRtcUriClient
+  /// .checkReachable()` relies on that method staying a fast, single-shot probe (it only runs
+  /// *after* live-view's own retries are already exhausted, specifically to fail over to WAN
+  /// quickly, not to keep retrying over LAN).
+  Future<CameraResult<bool>> areYouNuraeyeDeviceWithRetry({
+    int attempts = 3,
+    Duration attemptTimeout = const Duration(seconds: 8),
+    Duration retryDelay = const Duration(seconds: 1),
+  }) async {
+    CameraResult<bool> last = const CameraTimeout<bool>();
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      last = await areYouNuraeyeDevice(timeout: attemptTimeout);
+      if (last is CameraSuccess<bool> && last.value) return last;
+      if (attempt < attempts - 1) {
+        await Future<void>.delayed(retryDelay);
+      }
+    }
+    return last;
   }
 
   void close() => _http.close();

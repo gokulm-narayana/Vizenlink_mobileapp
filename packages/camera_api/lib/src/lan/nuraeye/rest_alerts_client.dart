@@ -11,6 +11,16 @@ class RestAlertsClient {
 
   final NuraeyeRestClient _client;
 
+  /// Per-event-type enable/disable state
+  Future<RestResult<void>> getEventPreferences() {
+    return _client.get('/nuraeye/events/preferences');
+  }
+
+  /// Selected automatic response actions per detection event type
+  Future<RestResult<void>> getEventResponseActions() {
+    return _client.get('/nuraeye/events/response-actions');
+  }
+
   /// Read one detection rule's alert choices (read counterpart to POST /nuraeye/alert-rules)
   Future<RestResult<QueryAlertRuleResponse>> queryAlertRule({required String rule}) {
     final body = <String, dynamic>{
@@ -26,6 +36,16 @@ class RestAlertsClient {
       'buzzer_activation': buzzerActivation,
     };
     return _client.post('/nuraeye/alert-rules', body);
+  }
+
+  /// Partial update — only keys present in the body change
+  Future<RestResult<void>> setEventPreferences() {
+    return _client.post('/nuraeye/events/preferences', const <String, dynamic>{});
+  }
+
+  /// Partial update — each key's array fully replaces that event type's action set
+  Future<RestResult<void>> setEventResponseActions() {
+    return _client.post('/nuraeye/events/response-actions', const <String, dynamic>{});
   }
 }
 

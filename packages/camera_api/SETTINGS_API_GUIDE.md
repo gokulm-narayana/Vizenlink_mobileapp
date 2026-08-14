@@ -167,6 +167,20 @@ endpoint but exists only as unused reserve API surface, see
 
 **WAN:** `WanMirrorFlipClient` — same `MirrorFlipMode` enum, same method names.
 
+## Anti-Flicker / Power-Line Frequency
+
+**Concept:** eliminates video banding/flicker caused by artificial (mains-powered) lighting —
+`50Hz`/`60Hz`/`Auto`. This is a NuraEye-only setting; there is no ONVIF-standard element for it
+on any camera, not just this firmware — checked against the live `ImagingSettings20` schema and
+confirmed no such field exists anywhere in it, including its Extension chain (see
+`kb/raw/2026-08-12-feature-antiflicker-mode.md`). Same situation as [Mirror/Flip](#mirrorflip)
+above — don't look for or add an ONVIF Options call for it.
+
+**LAN:** `AntiFlickerClient.getAntiFlickerMode()`/`.setAntiFlickerMode(mode)` — REST-only, no
+legacy `/nuraeye` JSON-RPC action exists for this setting (built REST-only from day one).
+
+**WAN:** `WanAntiFlickerClient` — same `AntiFlickerMode` enum, same method names.
+
 ## Privacy Mode
 
 **Concept:** a device-wide capture state — `none` (normal), `zone` (blank out configured mask
@@ -288,6 +302,130 @@ ONVIF/WAN setter. On either transport, **the caller must update its own stored
 `CameraConnection.password` after a successful `setUserPassword`** — the client that made the
 call keeps using the old password it was constructed with.
 
+## Device Reboot / Factory Reset
+
+**Concept:** rebooting the camera on demand (ONVIF `SystemReboot`), and resetting it to factory
+defaults at one of two levels (ONVIF `SetSystemFactoryDefault`):
+- **Soft** — erases camera settings (ONVIF user config: imaging, masks, OSD, camera name/
+  location, etc.) only. Network config (WiFi credentials, DHCP preferred IP) is preserved, so
+  the device stays reachable at its existing address after it reboots.
+- **Hard** — erases camera settings **and** network config. The device re-enters AP
+  provisioning mode on reboot and must be fully re-onboarded (WiFi credentials re-entered,
+  discovery/manual add repeated) before it's reachable again.
+
+Unlike most entries in this guide, both actions are **real, standard ONVIF Device service
+actions** with a full LAN path — this isn't a NuraEye-only setting. The WAN command set exists
+purely because ONVIF SOAP has no WAN transport in this stack at all (same reasoning as
+[Device Identity](#device-identity-name--location--time-zone--password)'s WAN mirror), not
+because the setting itself needed inventing.
+
+**Not to be confused with:** [Image Defaults](#image-defaults-factory-reset-values) — that's a
+read-only *ISP value* lookup for one "Reset to Default" slider control, not a device-wide reset.
+
+**LAN:** `OnvifDeviceClient` — `reboot()` (returns the camera's `tt:Message`, typically
+`"Rebooting in 5 seconds"`), `factoryReset(FactoryResetMode mode)`.
+
+**WAN:** `WanDeviceIdentityClient` — `reboot()`, `factoryReset(FactoryResetMode mode)`, same
+signatures as the LAN client.
+
+**Notes:** a success response from either method does **not** mean the device is back yet — both
+actions trigger `bsp_rebootAsync()` (~5s async delay before the actual reset), so callers must
+expect a real connectivity gap afterward, not just an instant confirm. Neither method has an
+Options/capability query — there's nothing to bound, both take a fixed enum or no params at all.
+**UI: `_DeviceManagementCard` in `camera_info_screen.dart`** (`FR-MOB-103`) — a "Device
+Management" card with two rows, each behind its own confirmation flow: Reboot shows one
+plain-language confirmation dialog; Factory Reset first asks the user to pick Soft or Hard (a
+`SimpleDialog` with per-mode explanatory subtitles), then shows a second, destructive-styled
+confirmation whose wording matches whichever mode was picked. On a successful Hard reset the
+screen pops itself — the network config the app just used to reach the camera no longer exists,
+so nothing else on the screen can succeed until it's re-onboarded; Soft reset and Reboot instead
+show a result dialog and leave the user on the screen, since the camera stays reachable at the
+same address. A Hard reset issued over WAN is also the one path that severs the app's own
+ability to reach the camera again over WAN, since it wipes the WiFi credentials that WAN
+connectivity itself was reached through — recovery requires re-onboarding on LAN.
+
+## Event Preferences
+
+**Concept:** whether the camera generates a given event *type* at all, device-wide
+(`FR-CF-143`, `FR-NE-111`) — a per-camera on/off switch per event type
+(`"VideoModeChanged"`/`"PrivacyModeChanged"`/`"PersonDetected"` today), not a per-detection-rule
+setting.
+
+**Not to be confused with:** the per-analytics-rule `mobile_notifications`/`buzzer_activation`
+flags reachable via `NuraeyeClient.call('...alert-rules...')` (no dedicated `camera_api` client
+exists for those yet) — that's a different, pre-existing concept: what *action* a specific
+detection *rule* triggers when it fires, not whether an event *type* is generated at all. A
+"mute" request from a user is almost always this section, not that one. (Both are slated to be
+superseded by `FR-CF-144`/`FR-NE-112`'s generalized per-event response-action set once built —
+not yet implemented, see that FR's `Planned` status.)
+
+**A real, device-side suppression, not a client-side mute.** Disabling a type here stops the
+camera from generating it at the source (`EventMgr_Send()`), on **every** delivery path it has
+— this app's own MQTT feed, and ONVIF PullPoint (third-party NVR/VMS clients too), per direct
+user decision. There is deliberately no separate "client-side mute" concept layered on top of
+this: an earlier draft of this feature considered one (log the event, but suppress only this
+app's own push notification), but that was dropped as redundant once `FR-CF-144`'s `mobile_alert`
+response action was scoped — an event with `mobile_alert` unselected already means "log it,
+don't push a notification for it," with no additional toggle needed.
+
+**LAN:** `EventPreferencesClient` — `getEventPreferences()`, `setEventPreferences(Map<String,
+bool> changes)` (partial update — only the keys present in `changes` change).
+
+**WAN:** `WanEventPreferencesClient` — same method names and partial-update semantics.
+
+**Notes:** the list of event types to show toggles for comes from
+`CapabilitiesClient.getCapabilities().supportedEventTypes`
+([Capabilities](#capabilities-discovery-not-a-setting)), never a hardcoded list — a future
+firmware build that adds a real producer for e.g. tamper detection needs zero `camera_api`
+changes, the new type just appears in that array. An unrecognized key in `setEventPreferences`
+is a `CameraFailure` (the camera rejects the whole request with `HTTP 400` rather than applying
+a partial subset) — don't send a key that isn't currently in `supportedEventTypes`.
+
+## Response Actions (Deterrence-on-Event)
+
+**Concept:** for **detection-type events only** (`"PersonDetected"` today — never state-change
+events like `"VideoModeChanged"`/`"PrivacyModeChanged"`), which automatic response actions
+(`siren`, `spotlight`, `warning`, `mobile_alert`) fire when that event triggers
+(`FR-CF-144`, `FR-NE-112`). A per-event-type multi-select, not a single choice — an event can
+have zero, one, or several response actions selected at once.
+
+**Not to be confused with:**
+- `EventPreferencesClient` (above) — that controls whether the event is generated **at all**;
+  this controls what happens *in addition* once an already-enabled detection event fires. An
+  event with every response action unselected still generates normally (still logged, still
+  delivered to alert history) — it just doesn't trigger anything extra.
+- The per-detection-rule `mobile_notifications`/`buzzer_activation` toggles
+  (`NuraeyeClient.call('...alert-rules...')`) — a narrower, pre-existing concept this
+  generalizes for the event types it covers.
+- The manual, on-demand `ActivateDeterrence`/`DeactivateDeterrence`/`GetDeterrenceStatus`
+  actions (no dedicated `camera_api` client yet, reachable via `NuraeyeClient.call()` directly)
+  — those are a human pressing a button to fire an action right now for a chosen duration; this
+  is the camera auto-firing an action because a detection event just happened, with a
+  firmware-chosen duration.
+
+**`mobile_alert` has no device-side effect at all.** Selecting/unselecting it never changes
+whether the camera delivers the event — that's `EventPreferencesClient`'s job alone, and stays
+true regardless of this setting. It exists purely so the app can read, locally, whether an
+incoming alert for a given event type should also surface a system push notification. If a
+future need arises for "log this event, but never push a notification for it," this is already
+that mechanism — there's no separate client-side mute concept layered on top of it.
+
+**LAN:** `EventResponseActionsClient` — `getEventResponseActions()`,
+`setEventResponseActions(Map<String, List<String>> changes)` (partial update — only the event
+types present in `changes` change; each key's array fully **replaces** that event type's action
+set, not additive).
+
+**WAN:** `WanEventResponseActionsClient` — same method names and partial-update semantics.
+
+**Notes:** the map of event types to response-action choices comes from
+`CapabilitiesClient.getCapabilities().supportedEventDeterrenceOptions`
+([Capabilities](#capabilities-discovery-not-a-setting)), never a hardcoded list — and it's
+already the intersection of this SKU's hardware capability (no `siren` option offered on a
+build without a buzzer) with which event types are even eligible for a response action at all
+(state-change events are simply absent as keys, not present with an empty array). Sending an
+action not present in that event type's eligible list is a `CameraFailure` (`HTTP 400`, whole
+request rejected).
+
 ## Audio — Mic Gain / Recording Toggle / Test Tone
 
 **Concept:** microphone input gain level, whether the mic is actively capturing at all (distinct
@@ -394,16 +532,23 @@ complete inventory; the per-setting sections above each note their own gate inli
 here if you're not sure whether a flag you're about to ignore is load-bearing.
 
 **LAN:**
-- `CapabilitiesClient.getCapabilities()` → `wanCommandCapable`/`wanLiveViewCapable` only (the
-  hand-written client, two fields — see the WAN paragraph below).
+- `CapabilitiesClient.getCapabilities()` → `wanCommandCapable`/`wanLiveViewCapable`/
+  `supportedEventTypes`/`supportedEventDeterrenceOptions` (the hand-written client, four fields
+  — see the WAN paragraph below for the first two, [Event Preferences](#event-preferences) for
+  the third, and [Response Actions](#response-actions-deterrence-on-event) for the fourth).
 - The generated `RestCapabilitiesClient.getCapabilities()` (`/nuraeye/capabilities`) returns a
-  **broader** response, `GetCapabilitiesResponse`, with the same two fields plus
+  **broader** response, `GetCapabilitiesResponse`, with the same fields plus
   `sirenCapable`/`spotlightCapable`/`warningCapable` (deterrence actions — buzzer/spotlight/voice
   alert) and `localStorageCapable` (SD card), plus REST-surface duplicates of night-vision
   capability (`nightVisionColorCapable`/`nightVisionSmartCapable`, see below). **Nothing in the
-  app currently calls this client** — if you're wiring up deterrence (siren/spotlight/warning) or
-  local-storage controls, this is the flag you need and it isn't being checked anywhere yet;
-  don't assume an equivalent check already exists elsewhere.
+  app currently calls this client** — if you're wiring up local-storage controls, this is the
+  flag you need and it isn't being checked anywhere yet; don't assume an equivalent check
+  already exists elsewhere (the deterrence flags this comment used to point at are now also
+  covered by the hand-written client's `supportedEventDeterrenceOptions`, already wired into
+  `EventSettingsScreen`). **Not yet regenerated for `supported_event_types`/
+  `supported_event_deterrence_options`** (added to the OpenAPI spec 2026-08-13) — `tools/
+  generate_dart_rest_client.py` needs a re-run before this generated model picks them up; the
+  hand-written `CapabilitiesClient` above is unaffected and already has both.
 - `Media2CapabilitiesClient.getServiceCapabilities()` → `osdSupported` (gates
   [OSD](#osd-on-screen-display)) / `maskSupported` (gates
   [Privacy Masks](#privacy-masks)) — whether the Media2 service advertises each feature at all,
@@ -419,6 +564,30 @@ here if you're not sure whether a flag you're about to ignore is load-bearing.
 **WAN:** none of these have a WAN path — capability discovery is inherently a LAN-first,
 onboarding-time operation (see `prefetchAndCache` in
 [.claude/rules/mobile-app-screen-conventions.md](../../../.claude/rules/mobile-app-screen-conventions.md)).
+
+### Being signed in — the prerequisite above every other WAN gate
+
+**Every `Wan*Client` call requires the user to be authenticated, full stop — this is checked
+before `wanCommandCapable`, before any Options flag, before anything else in this guide.** It's
+easy to miss because it isn't a capability flag you read from a response; it's a precondition
+enforced inside `IotCommandClient` itself: if `WanAuth.idTokenProvider()` (wired to
+`auth_api`'s `AuthController` — see that package's `API_REFERENCE.md`) returns `null`, every
+`Wan*Client` method throws `StateError('IotCommandClient called while unauthenticated')`
+internally. That exception **is** caught and converted to a normal `CameraFailure` by every
+`Wan*Client` wrapper — so it stays within this package's `CameraResult` contract and won't crash
+a caller — but the failure text will be the raw `StateError` message (e.g.
+`"StateError: IotCommandClient called while unauthenticated"`), not a friendly explanation, and
+nothing about it distinguishes "not signed in" from any other failure unless the caller
+recognizes that specific text.
+
+**Practical effect:** gate any screen that calls a `Wan*Client` on `auth_api`'s
+`AuthController.instance.status == AuthStatus.authenticated` first (or simply don't offer a
+WAN-path control before sign-in completes — this app's own `AuthGate` already ensures no
+camera-facing screen is reachable at all while unauthenticated, so in practice this mostly
+matters for background/best-effort callers like `alerts_api`'s `CameraAlertsHub.ensureRunning()`,
+which explicitly catches this failure and treats it as "nothing to sync yet" rather than
+surfacing it — see that package's own docs). Don't rely on parsing `CameraFailure.reason`'s text
+to detect this case in product code; check auth status up front instead.
 
 ### `wanCommandCapable` / `wanLiveViewCapable`
 

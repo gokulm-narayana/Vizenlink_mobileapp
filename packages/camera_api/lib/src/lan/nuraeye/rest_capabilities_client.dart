@@ -26,8 +26,10 @@ class GetCapabilitiesResponse {
   final bool? localStorageCapable;
   final bool? nightVisionColorCapable;
   final bool? nightVisionSmartCapable;
+  final List<String>? supportedEventTypes;
+  final dynamic supportedEventDeterrenceOptions;
 
-  const GetCapabilitiesResponse({this.wanCommandCapable, this.wanLiveViewCapable, this.sirenCapable, this.spotlightCapable, this.warningCapable, this.localStorageCapable, this.nightVisionColorCapable, this.nightVisionSmartCapable});
+  const GetCapabilitiesResponse({this.wanCommandCapable, this.wanLiveViewCapable, this.sirenCapable, this.spotlightCapable, this.warningCapable, this.localStorageCapable, this.nightVisionColorCapable, this.nightVisionSmartCapable, this.supportedEventTypes, this.supportedEventDeterrenceOptions});
 
   factory GetCapabilitiesResponse.fromJson(Map<String, dynamic> json) => GetCapabilitiesResponse(
         wanCommandCapable: json['wan_command_capable'] as bool?,
@@ -38,6 +40,8 @@ class GetCapabilitiesResponse {
         localStorageCapable: json['local_storage_capable'] as bool?,
         nightVisionColorCapable: json['night_vision_color_capable'] as bool?,
         nightVisionSmartCapable: json['night_vision_smart_capable'] as bool?,
+        supportedEventTypes: json['supported_event_types'] as List<String>?,
+        supportedEventDeterrenceOptions: json['supported_event_deterrence_options'] as dynamic,
       );
 }
 

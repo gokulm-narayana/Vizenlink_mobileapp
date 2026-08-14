@@ -59,6 +59,13 @@ class IotCommandClient {
   /// source) — distinct from [getImageSettings], which returns the *currently-applied* values.
   static const getImageDefaults = 16;
 
+  /// `FR-NE-078` (NF12): audio recording on/off — implemented and hardware-verified in firmware
+  /// since 2026-07-28 (`AUD-MQTT-01/02/03`, `TEST.md` §5.44), but never wired into the app —
+  /// `WanAudioVolumeClient` incorrectly documented this as "LAN-only, no WAN mirror" until this
+  /// gap was found 2026-08-11.
+  static const setAudioRecording = 17;
+  static const getAudioRecording = 18;
+
   /// `FR-NE-085`/`FR-NE-086` (NF14): speaker volume / microphone gain — implemented and
   /// hardware-verified in firmware since 2026-07-28 but never wired into the app until now
   /// (`AudioSettingsScreen` was LAN-only). Plain 0-100 percentages, no ONVIF/camera-capability
@@ -104,7 +111,7 @@ class IotCommandClient {
   static const getVideoEncoderSettingsOptions = 38;
 
   /// Options-parity audit (`kb/raw/2026-08-05-code-options-parity-rule-audit.md`),
-  /// `.claude/rules/mobile-app.md` § "LAN/WAN transport selection for settings screens" item 6.
+  /// `.claude/rules/mobile-app-screen-conventions.md` § "LAN/WAN transport selection for settings screens" item 6.
   static const getStreamQualityOptions = 39;
   static const getImagingSettingsOptions = 40;
   static const getMaskConfigs = 41;
@@ -119,6 +126,34 @@ class IotCommandClient {
   /// `FR-NE-108`: end-to-end-encrypted, non-persisted WAN reference-snapshot preview — distinct
   /// from the persisted cloud-snapshot mechanism (`FR-NE-061`). See `WanPreviewSnapshotClient`.
   static const getPreviewSnapshot = 53;
+
+  /// `FR-NE-109`: anti-flicker/power-line-frequency mode — no ONVIF-standard element (checked
+  /// against the live schema), NuraEye-only on both transports, same shape as
+  /// `getMirrorFlip`/`setMirrorFlip` above.
+  static const getAntiFlickerMode = 54;
+  static const setAntiFlickerMode = 55;
+
+  /// `FR-NE-110`: `SystemReboot`/`SetSystemFactoryDefault` are real, standard ONVIF Device
+  /// service actions with a full LAN path (`OnvifDeviceClient.reboot`/`factoryReset`) — these
+  /// exist purely because ONVIF SOAP has no WAN transport in this stack, same reasoning as
+  /// `setCameraName`/`getDeviceIdentity` above. See `WanDeviceIdentityClient.reboot`/
+  /// `factoryReset`.
+  static const reboot = 56;
+  static const factoryReset = 57;
+
+  /// `FR-CF-143`/`FR-NE-111`: per-event-type enable/disable — WAN mirror of the LAN
+  /// `GetEventPreferences`/`SetEventPreferences` REST resource. No WAN "supported types"
+  /// command — that list is a LAN-only `GetCapabilities` field, per the established
+  /// Options/capability-reads-are-LAN-only convention. See `WanEventPreferencesClient`.
+  static const getEventPreferences = 58;
+  static const setEventPreferences = 59;
+
+  /// `FR-CF-144`/`FR-NE-112`: per-detection-event response-action selection — WAN mirror of the
+  /// LAN `GetEventResponseActions`/`SetEventResponseActions` REST resource. No WAN "supported
+  /// deterrence options" command — that map is a LAN-only `GetCapabilities` field
+  /// (`supportedEventDeterrenceOptions`), same convention. See `WanEventResponseActionsClient`.
+  static const getEventResponseActions = 60;
+  static const setEventResponseActions = 61;
 
   /// [isRetry] is internal — set by the one-shot retry below, never pass it explicitly.
   ///

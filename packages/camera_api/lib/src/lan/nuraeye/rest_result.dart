@@ -23,6 +23,12 @@ sealed class RestResult<T> {
 class RestSuccess<T> extends RestResult<T> {
   const RestSuccess(this.value);
   final T value;
+
+  // Real gap found 2026-08-13 (camera_result.dart's CameraSuccess/Failure/Timeout had the same
+  // one): with no toString() override, every '...: $result'-style debug log silently printed
+  // "Instance of 'RestFailure<T>'" instead of the actual reason.
+  @override
+  String toString() => 'RestSuccess<$T>($value)';
 }
 
 /// A request the camera actively rejected (non-2xx HTTP status with a decodable ErrorResponse
@@ -31,9 +37,15 @@ class RestFailure<T> extends RestResult<T> {
   const RestFailure(this.reason, {this.statusCode});
   final String reason;
   final int? statusCode;
+
+  @override
+  String toString() => 'RestFailure<$T>($reason, statusCode: $statusCode)';
 }
 
 /// No response arrived within the call's bounded timeout.
 class RestTimeout<T> extends RestResult<T> {
   const RestTimeout();
+
+  @override
+  String toString() => 'RestTimeout<$T>()';
 }

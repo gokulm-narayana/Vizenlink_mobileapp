@@ -63,7 +63,9 @@ class WsDiscoveryClient {
     return results.values.toList(growable: false);
   }
 
-  /// Unicast subnet sweep, per `SCN-718` — only run when [scanMulticast] finds nothing. Mirrors
+  /// Unicast subnet sweep, per `SCN-718` — run unconditionally alongside [scanMulticast] and
+  /// merged with its results (not gated on multicast finding nothing; multicast on WiFi can fail
+  /// partially, see `discovery_screen.dart`'s doc comment). Mirrors
   /// `WSDiscoveryScanner.startScanUnicast()`'s single-shared-socket send+receive pattern and
   /// timing (15s overall cap, 5s straggler wait after the last probe is sent).
   Future<List<WsDiscoveryCandidate>> scanUnicast({

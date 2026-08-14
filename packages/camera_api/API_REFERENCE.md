@@ -11,9 +11,11 @@ caller uses.
 This file is organized by **client class** (mechanical params/returns, no decision logic). If
 you know *which camera setting* you're implementing but not yet *which client* is correct for
 it — settings that sound alike or overlap across LAN/WAN (e.g. Day/Night mode vs. Night Vision
-Type), or which capability/support flag gates a given setting (e.g. `wdrSupported`,
+Type), which capability/support flag gates a given setting (e.g. `wdrSupported`,
 `hasMicrophone`, `wanCommandCapable` — there are over a dozen of these across the package, each
-gating a different client) — see [SETTINGS_API_GUIDE.md](SETTINGS_API_GUIDE.md) first.
+gating a different client), or why a `Wan*Client` call is failing (every WAN call requires the
+user to be signed in via `auth_api`, checked before any capability flag) — see
+[SETTINGS_API_GUIDE.md](SETTINGS_API_GUIDE.md) first.
 
 ## Folder layout
 
@@ -24,8 +26,10 @@ lib/
     camera_connection.dart     — CameraConnection (identifies/authenticates one camera)
     camera_result.dart         — CameraResult / CameraSuccess / CameraFailure / CameraTimeout
     mirror_flip_types.dart     — shared MirrorFlipMode enum (LAN + WAN pair)
+    anti_flicker_types.dart    — shared AntiFlickerMode enum (LAN + WAN pair)
     night_vision_types.dart    — shared NightVisionType/NightVisionStatus/NightVisionSource
     privacy_mode_types.dart    — shared PrivacyMode enum (LAN + WAN pair)
+    device_reset_types.dart    — shared FactoryResetMode enum (LAN + WAN pair)
     util/
       onvif_rect_coordinates.dart  — pixel <-> ONVIF-normalized-polygon math (masks/OSD)
     lan/
@@ -40,12 +44,16 @@ lib/
         audio_capability_client.dart
         media2_capabilities_client.dart
         speaker_volume_client.dart
+        soap_fault.dart             — shared <Fault> detection, used by every client's _post()
       nuraeye/                      — the proprietary /nuraeye/* REST API
         nuraeye_client.dart         — core dispatcher (hand-written, everything else calls through it)
         audio_volume_client.dart
+        event_preferences_client.dart
+        event_response_actions_client.dart
         capabilities_client.dart
         cloud_streaming_client.dart
         mirror_flip_client.dart
+        anti_flicker_client.dart
         network_info_client.dart
         night_vision_client.dart
         privacy_mode_client.dart
@@ -68,6 +76,9 @@ lib/
       wan_imaging_client.dart
       wan_mask_client.dart
       wan_mirror_flip_client.dart
+      wan_anti_flicker_client.dart
+      wan_event_preferences_client.dart
+      wan_event_response_actions_client.dart
       wan_night_vision_client.dart
       wan_osd_client.dart
       wan_preview_snapshot_client.dart
@@ -99,9 +110,12 @@ network as the camera.
   - [Hand-written clients](#hand-written-clients)
     - [NuraeyeClient](#nuraeyeclient)
     - [AudioVolumeClient](#audiovolumeclient)
+    - [EventPreferencesClient](#eventpreferencesclient)
+    - [EventResponseActionsClient](#eventresponseactionsclient)
     - [CapabilitiesClient](#capabilitiesclient)
     - [CloudStreamingLanClient](#cloudstreaminglanclient)
     - [MirrorFlipClient](#mirrorflipclient)
+    - [AntiFlickerClient](#antiflickerclient)
     - [NetworkInfoClient](#networkinfoclient)
     - [NightVisionClient](#nightvisionclient)
     - [PrivacyModeClient](#privacymodeclient)
@@ -122,6 +136,9 @@ network as the camera.
   - [WanImagingClient](#wanimagingclient)
   - [WanMaskClient](#wanmaskclient)
   - [WanMirrorFlipClient](#wanmirrorflipclient)
+  - [WanAntiFlickerClient](#wanantiflickerclient)
+  - [WanEventPreferencesClient](#waneventpreferencesclient)
+  - [WanEventResponseActionsClient](#waneventresponseactionsclient)
   - [WanNightVisionClient](#wannightvisionclient)
   - [WanOsdClient](#wanosdclient)
   - [WanPrivacyModeClient](#wanprivacymodeclient)
@@ -225,12 +242,22 @@ All requests go through `insecure_camera_http_client.dart`'s `createCameraHttpCl
 trusts the camera's self-signed certificate and preserves outgoing HTTP header case (the
 camera's embedded server matches header names case-sensitively).
 
+**Every client's `_post()` checks the response body for a SOAP `<Fault>` element via
+`soap_fault.dart`'s `soapFaultReason()`, in addition to the HTTP status code.** This camera's
+firmware doesn't always return a non-200 status for a fault — Media2 validation errors (e.g.
+`SetOSD` rejecting an out-of-range color via `ter:InvalidArgVal`) come back as `HTTP 200` with a
+`<s:Fault>` body, which an HTTP-status-only check would silently treat as success. Any new ONVIF
+client added to this section must call `soapFaultReason(response.body)` the same way, right
+after the HTTP-status check and before parsing the expected success shape.
+
 ### OnvifDeviceClient
 
 `lan/onvif/onvif_device_client.dart` — `GetDeviceInformation`, `GetServices` (real ONVIF
 service-discovery — other clients resolve their Media2 endpoint through this rather than a
 hardcoded path), the device-identity trio (`GetScopes`/`SetScopes`, `GetSystemDateAndTime`/
-`SetSystemDateAndTime`), and account-password change.
+`SetSystemDateAndTime`), account-password change, and reboot/factory-reset (`SystemReboot`/
+`SetSystemFactoryDefault` — see `WanDeviceIdentityClient` for the WAN mirrors, since ONVIF SOAP
+itself has no WAN transport).
 
 ```dart
 OnvifDeviceClient(CameraConnection connection, {http.Client? httpClient})
@@ -248,6 +275,8 @@ OnvifDeviceClient(CameraConnection connection, {http.Client? httpClient})
 | `getSystemDateAndTime` | `{Duration timeout}` | `CameraResult<DeviceDateTime>` | Camera's UTC clock + POSIX-style time zone string. |
 | `setTimeZone` | `String tz, {Duration timeout}` | `CameraResult<void>` | Changes only the time zone — internally re-reads the current clock first and echoes it back, since the firmware requires a full Manual date/time on every `SetSystemDateAndTime` call. |
 | `setUserPassword` | `String username, String newPassword, {Duration timeout}` | `CameraResult<void>` | Changes the camera's single local device account password (shared by ONVIF + NuraEye). **Caller must update its own stored `CameraConnection.password` on success** — this client keeps using the password it was constructed with. |
+| `reboot` | `{Duration timeout}` | `CameraResult<String>` | Reboots the camera (`SystemReboot`). Returns the camera's `tt:Message` (typically `"Rebooting in 5 seconds"`). Success does **not** mean the device is back yet — expect a real connectivity gap of several seconds. |
+| `factoryReset` | `FactoryResetMode mode, {Duration timeout}` | `CameraResult<void>` | Resets to factory defaults (`SetSystemFactoryDefault`). See [`FactoryResetMode`](#shared-types) for the Soft/Hard distinction — `hard` wipes WiFi credentials, forcing re-onboarding. **The camera reboots automatically afterward** (`bsp_rebootAsync()`) — same connectivity-gap caveat as `reboot` above, success does not mean the device is back yet. |
 | `close` | — | `void` | Closes the underlying HTTP client. |
 
 Constants: `kMaxDeviceNameLength`/`kMaxDeviceLocationLength` = 32, `kMaxDevicePasswordLength` =
@@ -351,7 +380,10 @@ all three ONVIF mask types work.
 ### AudioCapabilityClient
 
 `lan/onvif/audio_capability_client.dart` — audio hardware **presence** check (not
-configuration), used to gate the two-way-talk control.
+configuration), used to gate the two-way-talk control. **Media2** (`GetAudioSourceConfigurations`/
+`GetAudioOutputConfigurations` with a fixed `ConfigurationToken`) — migrated off Media v1's
+`GetAudioSources`/`GetAudioOutputs` 2026-08-12 for consistency with every other ONVIF client in
+this package.
 
 ```dart
 AudioCapabilityClient(CameraConnection connection, {http.Client? httpClient})
@@ -359,8 +391,9 @@ AudioCapabilityClient(CameraConnection connection, {http.Client? httpClient})
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getAudioCapability` | `{Duration timeout}` | `CameraResult<AudioCapability>` | `hasSpeaker` (`GetAudioOutputs` non-empty) and `hasMicrophone` (`GetAudioSources` non-empty). |
-| `close` | — | `void` | Closes the HTTP client. |
+| `getAudioCapability` | `{Duration timeout}` | `CameraResult<AudioCapability>` | `hasSpeaker` (`GetAudioOutputConfigurations` non-empty) and `hasMicrophone` (`GetAudioSourceConfigurations` non-empty). |
+| `close` | — | `void` | Closes the HTTP client and internal `OnvifDeviceClient`. |
+| `debugClearCaches` (static) | — | `void` | Test-only: clears the endpoint cache. |
 
 ### Media2CapabilitiesClient
 
@@ -421,7 +454,8 @@ NuraeyeClient(CameraConnection connection, {http.Client? httpClient})
 | Method | Params | Returns | Description |
 |---|---|---|---|
 | `call` | `String action, {Map<String, dynamic>? params, Duration timeout}` | `CameraResult<Map<String, dynamic>>` | Dispatches one legacy NuraEye action (e.g. `"GetWiFiInfo"`, `"SetNightVisionType"`) to its REST equivalent. Returns the parsed `output` map. |
-| `areYouNuraeyeDevice` | `{Duration timeout}` | `CameraResult<bool>` | `POST /nuraeye/identity` challenge-response device-genuineness check, using a fixed challenge password (not the connection's real credentials) — locally recomputes and compares the expected reply digest. Unauthenticated; the cheapest round trip in this API. |
+| `areYouNuraeyeDevice` | `{Duration timeout}` | `CameraResult<bool>` | `POST /nuraeye/identity` challenge-response device-genuineness check, using a fixed challenge password (not the connection's real credentials) — locally recomputes and compares the expected reply digest. Unauthenticated; the cheapest round trip in this API. Single-shot — used as-is by `WebRtcUriClient.checkReachable()`, which deliberately wants a fast, non-retrying probe. |
+| `areYouNuraeyeDeviceWithRetry` | `{int attempts = 3, Duration attemptTimeout = 8s, Duration retryDelay = 1s}` | `CameraResult<bool>` | Retrying variant for first-contact discovery/onboarding only (`DiscoveryScreen`'s candidate filter, `AddCameraCredentialsScreen`'s manual-entry check) — added 2026-08-15 after a real-device report and a live Python check confirmed a genuine camera can lose to `areYouNuraeyeDevice`'s single 5s attempt on a phone's *first* HTTPS request over a given WiFi connection (cold TLS handshake/radio wake-up), despite answering in ~0.4s once the connection is warm. Stops retrying as soon as one attempt succeeds; returns the last result once every attempt is exhausted. |
 | `close` | — | `void` | Closes the HTTP client. |
 | `debugClearCaches` (static) | — | `void` | Test-only: clears session/capabilities/in-flight-login caches. |
 | `clearSessionFor` (static) | `String host` | `void` | Drops the cached bearer session for `host` — call after a password change or when a camera is removed from the app, so a stale session can't mask a wrong re-entered password on a re-add. |
@@ -482,7 +516,46 @@ CapabilitiesClient(NuraeyeClient nuraeye)
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support) and `wanLiveViewCapable` (additionally requires KVS build support) — both also require this specific device to have real AWS credentials provisioned, not just build-time support. |
+| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support), `wanLiveViewCapable` (additionally requires KVS build support — both also require this specific device to have real AWS credentials provisioned, not just build-time support), `supportedEventTypes` (`FR-CF-143`/`FR-NE-111` — the alert event strings this build actually generates; empty on firmware too old to report it), and `supportedEventDeterrenceOptions` (`FR-CF-144`/`FR-NE-112` — per detection event type, which response actions are eligible for it; only detection-type events appear as keys, empty map on firmware too old to report it). |
+
+#### EventPreferencesClient
+
+`lan/nuraeye/event_preferences_client.dart` — `GetEventPreferences`/`SetEventPreferences`
+(`FR-CF-143`, `FR-NE-111`) — see `WanEventPreferencesClient` for the WAN mirror.
+
+```dart
+EventPreferencesClient(NuraeyeClient nuraeye)
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getEventPreferences` | `{Duration timeout}` | `CameraResult<Map<String, bool>>` | Current enabled/disabled state, keyed by the same strings `CapabilitiesClient`'s `supportedEventTypes` reports. |
+| `setEventPreferences` | `Map<String, bool> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — only the keys present in `changes` change; every other type's state is left untouched. An unrecognized key is a `CameraFailure` (camera returns `HTTP 400`, whole request rejected, no partial application). |
+
+**Disabling a type is a real, device-side change** — the camera suppresses it at the source
+(`EventMgr_Send()`), on every delivery path it has, including ONVIF PullPoint — not a
+client-side filter, not scoped to this app's own feed.
+
+#### EventResponseActionsClient
+
+`lan/nuraeye/event_response_actions_client.dart` — `GetEventResponseActions`/
+`SetEventResponseActions` (`FR-CF-144`, `FR-NE-112`) — see `WanEventResponseActionsClient` for
+the WAN mirror.
+
+```dart
+EventResponseActionsClient(NuraeyeClient nuraeye)
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getEventResponseActions` | `{Duration timeout}` | `CameraResult<Map<String, List<String>>>` | Current selected response actions per detection event type, keyed by the same strings `CapabilitiesClient`'s `supportedEventDeterrenceOptions` reports. |
+| `setEventResponseActions` | `Map<String, List<String>> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — only the event types present in `changes` change; each key's array fully **replaces** that event type's selected action set (not additive). An unrecognized event type key, or an action not eligible for that type, is a `CameraFailure` (camera returns `HTTP 400`, whole request rejected, no partial application). |
+
+**Not to be confused with `EventPreferencesClient`** — that controls whether an event type is
+generated at all; this controls what happens *in addition* when an already-enabled detection
+event fires. `siren`/`spotlight`/`warning` are real physical device actions the camera
+auto-triggers; `mobile_alert` has no device-side effect at all — this app reads it locally to
+decide whether to show a push notification, never as a device-side gate.
 
 #### CloudStreamingLanClient
 
@@ -514,6 +587,25 @@ MirrorFlipClient(NuraeyeClient nuraeye)
 
 See `wan/wan_mirror_flip_client.dart`'s `WanMirrorFlipClient` for the WAN counterpart (same
 `MirrorFlipMode` enum).
+
+#### AntiFlickerClient
+
+`lan/nuraeye/anti_flicker_client.dart` — LAN transport for power-line frequency / anti-flicker
+mode. No ONVIF-standard element exists for this setting (checked against the live
+`ImagingSettings20` schema — see `kb/raw/2026-08-12-feature-antiflicker-mode.md`), same
+situation as `MirrorFlipClient` above.
+
+```dart
+AntiFlickerClient(NuraeyeClient nuraeye)
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getAntiFlickerMode` | `{Duration timeout}` | `CameraResult<AntiFlickerMode>` | Current mode (`hz50`/`hz60`/`auto`). |
+| `setAntiFlickerMode` | `AntiFlickerMode mode, {Duration timeout}` | `CameraResult<void>` | Sets mode. |
+
+See `wan/wan_anti_flicker_client.dart`'s `WanAntiFlickerClient` for the WAN counterpart (same
+`AntiFlickerMode` enum).
 
 #### NetworkInfoClient
 
@@ -719,7 +811,7 @@ KvsPlaybackClient({http.Client? client, String? Function()? idTokenProvider})
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getPlaybackUrl` | `String streamName` | `Future<String>` | Returns the HLS streaming session URL. Throws on failure (401 bad/expired token, 403 stream outside this fleet, 502 KVS lookup failed — e.g. `StartCloudStreaming` was never sent first). **Not yet cloud-verified** — no Lambda deployed at time of writing. |
+| `getPlaybackUrl` | `String streamName` | `Future<String>` | Returns the HLS streaming session URL. Throws on failure (401 bad/expired token, 403 stream outside this fleet, 502 KVS lookup failed — e.g. `StartCloudStreaming` was never sent first). **Cloud/hardware-verified** — the "not yet deployed" note here was stale by 2026-08-13; see `STREAMING_GUIDE.md` for the full sequence this fits into and `design/FR-mobile-app.md`'s `FR-MOB-031` for the verification history. |
 
 ### WanLiveViewClient / AwsWanLiveViewClient
 
@@ -746,12 +838,18 @@ class AwsWanLiveViewClient implements WanLiveViewClient {
 | `getCloudStreamingStatus` | Returns `active`/`idle`/`degraded`/`notCompiled` (`StreamStatus` enum). Retries a couple of times on a transient `idle` result right after starting, since the substream can legitimately still be spinning up. |
 | `resolvePlaybackUri` | Resolves a playable URI once streaming is confirmed active, via `KvsPlaybackClient`. |
 
-**Not yet hardware/cloud-verified.**
+**Hardware/cloud-verified** (corrected 2026-08-13 — was stale). See
+[STREAMING_GUIDE.md](STREAMING_GUIDE.md) for the full WAN sequence this class implements, and
+its "Reconnect and failure semantics" section for a known, unresolved gap in how the app
+recovers from a camera-initiated KVS producer restart mid-session.
 
 ### WanAudioVolumeClient
 
-`wan/wan_audio_volume_client.dart` — WAN counterpart to `AudioVolumeClient`'s mic-gain/test-sound
-half (recording on/off has no WAN mirror; stays LAN-only).
+`wan/wan_audio_volume_client.dart` — WAN counterpart to `AudioVolumeClient`'s mic-gain,
+recording-toggle, and test-sound half. **Recording on/off (`isAudioRecordingEnabled`/
+`setAudioRecordingEnabled`) was previously undocumented as WAN-capable and unwired in the app
+— the firmware command (`FR-NE-078`) had been `Implemented` and hardware-verified since
+2026-07-28; wired into this client and `LiveViewScreen` 2026-08-11.**
 
 ```dart
 WanAudioVolumeClient(String thingName, {IotCommandClient? iotCommandClient})
@@ -761,6 +859,8 @@ WanAudioVolumeClient(String thingName, {IotCommandClient? iotCommandClient})
 |---|---|---|---|
 | `getMicGain` | `{Duration timeout}` | `CameraResult<int>` | Current mic gain. |
 | `setMicGain` | `int gain, {Duration timeout}` | `CameraResult<void>` | Sets mic gain. |
+| `isAudioRecordingEnabled` | `{Duration timeout}` | `CameraResult<bool>` | Whether the mic is actively capturing at all. |
+| `setAudioRecordingEnabled` | `bool enabled, {Duration timeout}` | `CameraResult<void>` | Toggles mic recording. |
 | `playTestSound` | `{Duration timeout}` | `CameraResult<void>` | Plays the speaker test tone. |
 | `stopTestSound` | `{Duration timeout}` | `CameraResult<void>` | Stops it. |
 | `isTestSoundPlaying` | `{Duration timeout}` | `CameraResult<bool>` | Whether the test tone is still playing. |
@@ -783,8 +883,8 @@ WanSpeakerVolumeClient(String thingName, {IotCommandClient? iotCommandClient})
 ### WanDeviceIdentityClient
 
 `wan/wan_device_identity_client.dart` — WAN counterpart to `OnvifDeviceClient`'s name/location/
-time-zone/password setters. Not a formal shared interface with `OnvifDeviceClient`, but
-structurally matching signatures so a call site can pick either.
+time-zone/password setters, plus reboot/factory-reset. Not a formal shared interface with
+`OnvifDeviceClient`, but structurally matching signatures so a call site can pick either.
 
 ```dart
 WanDeviceIdentityClient(String thingName, {IotCommandClient? iotCommandClient})
@@ -797,6 +897,8 @@ WanDeviceIdentityClient(String thingName, {IotCommandClient? iotCommandClient})
 | `setDeviceLocation` | `String location, {Duration timeout}` | `CameraResult<void>` | Sets location. |
 | `setTimeZone` | `String tz, {Duration timeout}` | `CameraResult<void>` | Sets time zone. |
 | `setUserPassword` | `String username, String newPassword, {Duration timeout}` | `CameraResult<void>` | Same single-account-slot semantics as the LAN client — **caller must update `CameraConnection.password` on success.** |
+| `reboot` | `{Duration timeout}` | `CameraResult<void>` | WAN mirror of `OnvifDeviceClient.reboot` — no WAN transport exists for ONVIF SOAP, so this is the only way a WAN-only client can reboot the camera. |
+| `factoryReset` | `FactoryResetMode mode, {Duration timeout}` | `CameraResult<void>` | WAN mirror of `OnvifDeviceClient.factoryReset` — **the camera reboots automatically afterward**, same as the LAN client. **A Hard reset issued over WAN wipes the WiFi credentials that WAN connectivity itself depends on** — the one path that reliably severs the app's own ability to reach this camera again until it's re-onboarded on LAN; warn the user accordingly. |
 
 ### WanImageQualityClient
 
@@ -867,6 +969,50 @@ WanMirrorFlipClient(String thingName, {IotCommandClient? iotCommandClient})
 |---|---|---|---|
 | `getMirrorFlip` | `{Duration timeout}` | `CameraResult<MirrorFlipMode>` | Current mode. |
 | `setMirrorFlip` | `MirrorFlipMode mode, {Duration timeout}` | `CameraResult<void>` | Sets mode. |
+
+### WanAntiFlickerClient
+
+`wan/wan_anti_flicker_client.dart` — WAN counterpart to `AntiFlickerClient`. Same
+`AntiFlickerMode` enum as LAN.
+
+```dart
+WanAntiFlickerClient(String thingName, {IotCommandClient? iotCommandClient})
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getAntiFlickerMode` | `{Duration timeout}` | `CameraResult<AntiFlickerMode>` | Current mode. |
+| `setAntiFlickerMode` | `AntiFlickerMode mode, {Duration timeout}` | `CameraResult<void>` | Sets mode. |
+
+### WanEventPreferencesClient
+
+`wan/wan_event_preferences_client.dart` — WAN counterpart to `EventPreferencesClient`. Same
+wire vocabulary and partial-update semantics as LAN. No WAN "supported types" command — see
+`CapabilitiesClient.supportedEventTypes`, LAN-only.
+
+```dart
+WanEventPreferencesClient(String thingName, {IotCommandClient? iotCommandClient})
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getEventPreferences` | `{Duration timeout}` | `CameraResult<Map<String, bool>>` | Current enabled/disabled state. |
+| `setEventPreferences` | `Map<String, bool> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — same semantics as the LAN client. |
+
+### WanEventResponseActionsClient
+
+`wan/wan_event_response_actions_client.dart` — WAN counterpart to `EventResponseActionsClient`.
+Same wire vocabulary and partial-update semantics as LAN. No WAN "supported deterrence options"
+command — see `CapabilitiesClient.supportedEventDeterrenceOptions`, LAN-only.
+
+```dart
+WanEventResponseActionsClient(String thingName, {IotCommandClient? iotCommandClient})
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getEventResponseActions` | `{Duration timeout}` | `CameraResult<Map<String, List<String>>>` | Current selected response actions per detection event type. |
+| `setEventResponseActions` | `Map<String, List<String>> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — same semantics as the LAN client. |
 
 ### WanNightVisionClient
 
@@ -959,6 +1105,9 @@ and a WAN client pair share them:
 - **`mirror_flip_types.dart`** — `enum MirrorFlipMode { off, mirror, flip, both }` plus
   `MirrorFlipModeWire` extension (`.wireValue` getter, `.fromWire(String)` static parser). Shared
   by `MirrorFlipClient`/`WanMirrorFlipClient`.
+- **`anti_flicker_types.dart`** — `enum AntiFlickerMode { hz50, hz60, auto }` plus
+  `AntiFlickerModeWire` extension (`.wireValue` getter, `.fromWire(String)` static parser).
+  Shared by `AntiFlickerClient`/`WanAntiFlickerClient`.
 - **`night_vision_types.dart`** — `enum NightVisionType { grey, color, smart }`,
   `NightVisionTypeWire` extension, `NightVisionStatus` (value-equality class: `type`,
   `colorCapable`, `smartCapable`, `subState`), and the `NightVisionSource` abstract interface
@@ -966,6 +1115,14 @@ and a WAN client pair share them:
   implement — lets UI code hold either behind one reference type.
 - **`privacy_mode_types.dart`** — `enum PrivacyMode { none, zone, full }` plus `PrivacyModeWire`
   extension. Shared by `PrivacyModeClient`/`WanPrivacyModeClient`.
+- **`device_reset_types.dart`** — `enum FactoryResetMode { soft, hard }` plus
+  `FactoryResetModeWire` extension (`.wireValue` getter — `"Soft"`/`"Hard"`, the literal ONVIF
+  `FactoryDefault` type values). **Soft** erases camera settings only, network config preserved
+  (device stays reachable); **Hard** also erases network config, forcing the device back into AP
+  provisioning mode. Shared by `OnvifDeviceClient.factoryReset`/
+  `WanDeviceIdentityClient.factoryReset`. Unlike the other shared types above, this is a real
+  ONVIF-standard type, not a NuraEye-only one — it lives here only because both a LAN and WAN
+  client need it.
 - **`util/onvif_rect_coordinates.dart`** — pixel-space ↔ ONVIF-normalized-coordinate conversion,
   used by the mask editor and OSD position drag:
   - `OnvifPoint(x, y)` — a single ONVIF point, each axis in `[-1, 1]`, Y increasing upward.
@@ -1034,8 +1191,11 @@ WAN client is used:
 
 ```dart
 void configureWan() {
-  WanAuth.idTokenProvider = () => currentCognitoIdToken; // your own auth state
-  WanAuth.kvsPlaybackLambdaUrl = 'https://<lambda-function-url>';
+  WanAuth.idTokenProvider = () => currentCognitoIdToken; // your own auth state — see auth_api
+  // This project's real, live deployed relay (VizenLinkKvsPlaybackProxy, confirmed live
+  // 2026-08-12) — not a placeholder. Overridable via --dart-define=KVS_PLAYBACK_LAMBDA_URL=...
+  // if this Lambda is ever redeployed at a new Function URL.
+  WanAuth.kvsPlaybackLambdaUrl = 'https://jxce73jfkwoouhcmxvhsoysxxq0gavso.lambda-url.ap-south-1.on.aws/';
 }
 
 Future<void> readMirrorFlipOverWan(String thingName) async {

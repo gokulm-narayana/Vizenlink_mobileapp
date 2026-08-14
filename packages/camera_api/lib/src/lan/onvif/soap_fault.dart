@@ -1,13 +1,15 @@
 import 'package:xml/xml.dart';
 
-/// Some ONVIF actions come back as HTTP 200 even when the SOAP body itself is
-/// a `<Fault>` (e.g. an authorization or invalid-argument rejection) — the
-/// HTTP status alone isn't a reliable success signal for this firmware.
-/// Every ONVIF client's `_post` should check this on top of the status code
-/// before returning `CameraSuccess`. Returns the fault's human-readable
-/// reason text, or null if the body isn't a fault (the overwhelmingly common
-/// case, so this is checked after the happy path rather than parsed
-/// unconditionally).
+/// Returns the SOAP fault reason text if [body] contains a `<Fault>` element, `null` otherwise.
+///
+/// **Why this exists:** every ONVIF client here used to only check the HTTP status code before
+/// treating a response as success — but this firmware doesn't always return a non-200 status for
+/// a SOAP fault. Media2 validation errors (e.g. `SetOSD` rejecting an out-of-range color via
+/// `ter:InvalidArgVal`) come back as `HTTP 200` with a `<s:Fault>` body, which was silently
+/// parsed as if it were the real response, hiding a real rejection from the caller. Every
+/// `_post()`-style method must call this on the raw response body, after the HTTP-status check
+/// and before attempting to parse the expected success shape — a robust SOAP client can never
+/// rely on HTTP status alone to detect a fault.
 String? soapFaultReason(String body) {
   try {
     final doc = XmlDocument.parse(body);

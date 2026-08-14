@@ -17,10 +17,7 @@ const _media2Namespace = 'http://www.onvif.org/ver20/media/wsdl';
 /// both attributes are already implemented and wired to real values in this firmware, so this is
 /// a genuine capability check, not a guess.
 class Media2Capabilities {
-  const Media2Capabilities({
-    required this.osdSupported,
-    required this.maskSupported,
-  });
+  const Media2Capabilities({required this.osdSupported, required this.maskSupported});
   final bool osdSupported;
   final bool maskSupported;
 }
@@ -48,9 +45,7 @@ class Media2CapabilitiesClient {
     final Uri media2XAddr;
     switch (servicesResult) {
       case CameraSuccess<List<OnvifServiceEntry>>(:final value):
-        final entry = value
-            .where((e) => e.namespace == _media2Namespace)
-            .firstOrNull;
+        final entry = value.where((e) => e.namespace == _media2Namespace).firstOrNull;
         if (entry == null) {
           // Media2 isn't offered by this device at all — not an error, just unsupported.
           return const CameraSuccess(
@@ -90,9 +85,7 @@ class Media2CapabilitiesClient {
       final response = await _http
           .post(
             media2XAddr,
-            headers: const {
-              'Content-Type': 'application/soap+xml; charset=utf-8',
-            },
+            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
             body: envelope,
           )
           .timeout(timeout);
@@ -100,26 +93,20 @@ class Media2CapabilitiesClient {
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
       }
+
       final faultReason = soapFaultReason(response.body);
-      if (faultReason != null) {
-        return CameraFailure(faultReason);
-      }
+      if (faultReason != null) return CameraFailure(faultReason);
 
       final doc = XmlDocument.parse(response.body);
       final el = doc.findAllElements('Capabilities', namespace: '*');
       if (el.isEmpty) {
-        return const CameraFailure(
-          'GetServiceCapabilitiesResponse missing Capabilities element',
-        );
+        return const CameraFailure('GetServiceCapabilitiesResponse missing Capabilities element');
       }
       final attrs = el.first.attributes;
       final osd = attrs.where((a) => a.localName == 'OSD').firstOrNull?.value;
       final mask = attrs.where((a) => a.localName == 'Mask').firstOrNull?.value;
       return CameraSuccess(
-        Media2Capabilities(
-          osdSupported: osd == 'true',
-          maskSupported: mask == 'true',
-        ),
+        Media2Capabilities(osdSupported: osd == 'true', maskSupported: mask == 'true'),
       );
     } on Exception catch (e) {
       return CameraFailure(e.toString());

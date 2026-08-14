@@ -85,7 +85,7 @@ class ImagingSettings {
 /// Supported value range for one float-valued imaging setting. Value equality (not the default
 /// identity equality) matters here: `_ImageQualityState`-style records carrying a `FloatRange`
 /// field rely on `==` to compare `pending` vs. `applied` for the settings screen's dirty-check —
-/// see `.claude/rules/mobile-app.md`'s "Settings/control screen UX conventions" point 5.
+/// see `.claude/rules/mobile-app-screen-conventions.md`'s "Settings/control screen UX conventions" point 5.
 class FloatRange {
   const FloatRange(this.min, this.max);
   final double min;
@@ -129,7 +129,7 @@ class ImagingOptions {
   /// `tt:IrCutFilterModes` values the camera actually supports (typically `['AUTO', 'ON',
   /// 'OFF']`) — the Day/Night mode control's choice list (`FR-MOB-064/065`). The UI must build
   /// its choice chips from this list, never a hardcoded `['AUTO', 'ON', 'OFF']` — see
-  /// `.claude/rules/mobile-app.md` § "LAN/WAN transport selection for settings screens" item 6.
+  /// `.claude/rules/mobile-app-screen-conventions.md` § "LAN/WAN transport selection for settings screens" item 6.
   final List<String> irCutFilterModes;
 
   /// `tt:WhiteBalance/tt:Mode` values the camera actually supports (typically `['AUTO',
@@ -152,7 +152,7 @@ class ImagingOptions {
 /// only" note; the same gap applies here).
 class OnvifImagingClient {
   OnvifImagingClient(this.connection, {http.Client? httpClient})
-    : _http = httpClient ?? createCameraHttpClient();
+      : _http = httpClient ?? createCameraHttpClient();
 
   final CameraConnection connection;
   final http.Client _http;
@@ -202,9 +202,7 @@ class OnvifImagingClient {
         exposureGain = _findDoubleIn(exposureEl.first, 'Gain');
       }
       final wbEl = doc.findAllElements('WhiteBalance', namespace: '*');
-      final whiteBalanceMode = wbEl.isNotEmpty
-          ? _findTextIn(wbEl.first, 'Mode')
-          : null;
+      final whiteBalanceMode = wbEl.isNotEmpty ? _findTextIn(wbEl.first, 'Mode') : null;
 
       return ImagingSettings(
         brightness: f('Brightness'),
@@ -264,9 +262,9 @@ class OnvifImagingClient {
       final whiteBalanceModes = wbEl.isEmpty
           ? const <String>[]
           : wbEl.first
-                .findAllElements('Mode', namespace: '*')
-                .map((e) => e.innerText.trim())
-                .toList();
+              .findAllElements('Mode', namespace: '*')
+              .map((e) => e.innerText.trim())
+              .toList();
 
       final exposureEl = doc.findAllElements('Exposure', namespace: '*');
       var exposureModes = const <String>[];
@@ -277,10 +275,7 @@ class OnvifImagingClient {
             .findAllElements('Mode', namespace: '*')
             .map((e) => e.innerText.trim())
             .toList();
-        final timeEl = exposureEl.first.findAllElements(
-          'ExposureTime',
-          namespace: '*',
-        );
+        final timeEl = exposureEl.first.findAllElements('ExposureTime', namespace: '*');
         if (timeEl.isNotEmpty) {
           final min = _findDoubleIn(timeEl.first, 'Min');
           final max = _findDoubleIn(timeEl.first, 'Max');
@@ -331,9 +326,7 @@ class OnvifImagingClient {
       buf.write('<tt:Brightness>${settings.brightness}</tt:Brightness>');
     }
     if (settings.colorSaturation != null) {
-      buf.write(
-        '<tt:ColorSaturation>${settings.colorSaturation}</tt:ColorSaturation>',
-      );
+      buf.write('<tt:ColorSaturation>${settings.colorSaturation}</tt:ColorSaturation>');
     }
     if (settings.contrast != null) {
       buf.write('<tt:Contrast>${settings.contrast}</tt:Contrast>');
@@ -351,16 +344,12 @@ class OnvifImagingClient {
       }
       buf.write('</tt:WideDynamicRange>');
     } else if (settings.wdrLevel != null) {
-      buf.write(
-        '<tt:WideDynamicRange><tt:Level>${settings.wdrLevel}</tt:Level></tt:WideDynamicRange>',
-      );
+      buf.write('<tt:WideDynamicRange><tt:Level>${settings.wdrLevel}</tt:Level></tt:WideDynamicRange>');
     }
     if (settings.exposureMode != null) {
       buf.write('<tt:Exposure><tt:Mode>${settings.exposureMode}</tt:Mode>');
       if (settings.exposureTime != null) {
-        buf.write(
-          '<tt:ExposureTime>${settings.exposureTime}</tt:ExposureTime>',
-        );
+        buf.write('<tt:ExposureTime>${settings.exposureTime}</tt:ExposureTime>');
       }
       if (settings.exposureGain != null) {
         buf.write('<tt:Gain>${settings.exposureGain}</tt:Gain>');
@@ -368,9 +357,7 @@ class OnvifImagingClient {
       buf.write('</tt:Exposure>');
     }
     if (settings.whiteBalanceMode != null) {
-      buf.write(
-        '<tt:WhiteBalance><tt:Mode>${settings.whiteBalanceMode}</tt:Mode></tt:WhiteBalance>',
-      );
+      buf.write('<tt:WhiteBalance><tt:Mode>${settings.whiteBalanceMode}</tt:Mode></tt:WhiteBalance>');
     }
 
     final bodyResult = await _post(
@@ -387,8 +374,7 @@ class OnvifImagingClient {
 
   Future<CameraResult<String>> _post(String bodyXml, Duration timeout) async {
     final digest = WsseDigest.generate(connection.password);
-    final envelope =
-        '<?xml version="1.0" encoding="UTF-8"?>'
+    final envelope = '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
         '<s:Header>'
         '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
@@ -410,9 +396,7 @@ class OnvifImagingClient {
       final response = await _http
           .post(
             connection.onvifImagingEndpoint,
-            headers: const {
-              'Content-Type': 'application/soap+xml; charset=utf-8',
-            },
+            headers: const {'Content-Type': 'application/soap+xml; charset=utf-8'},
             body: envelope,
           )
           .timeout(timeout);
@@ -420,10 +404,10 @@ class OnvifImagingClient {
       if (response.statusCode != 200) {
         return CameraFailure('HTTP ${response.statusCode}: ${response.body}');
       }
+
       final faultReason = soapFaultReason(response.body);
-      if (faultReason != null) {
-        return CameraFailure(faultReason);
-      }
+      if (faultReason != null) return CameraFailure(faultReason);
+
       return CameraSuccess(response.body);
     } on Exception catch (e) {
       return CameraFailure(e.toString());

@@ -31,7 +31,7 @@ class NetworkInfoClient {
   final NuraeyeClient _nuraeye;
 
   /// Process-lifetime, host-keyed cache for [getSupportedTimezones] — see
-  /// `.claude/rules/mobile-app.md`'s "Caching capability/service-discovery responses" convention
+  /// `.claude/rules/mobile-app-screen-conventions.md`'s "Caching capability/service-discovery responses" convention
   /// (`mask_client.dart`'s `_optionsCacheByHost` is the reference pattern). The list is a
   /// compile-time-fixed camera capability, not per-request state, so it never needs re-fetching
   /// within an app session. `prefetchAndCache` (`camera_settings_cache.dart`) warms this at

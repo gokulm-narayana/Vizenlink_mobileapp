@@ -6,7 +6,7 @@ import 'package:camera_api/camera_api.dart';
 /// `GetImagingSettingsOptions` (command `40`, added for the 2026-08-05 options-parity audit,
 /// `kb/raw/2026-08-05-code-options-parity-rule-audit.md`) for the choice list/support flag those
 /// two Set commands need so the WAN-path UI is never hardcoded — see
-/// `.claude/rules/mobile-app.md` § "LAN/WAN transport selection for settings screens" item 6.
+/// `.claude/rules/mobile-app-screen-conventions.md` § "LAN/WAN transport selection for settings screens" item 6.
 ///
 /// Mirror/Flip and ISP image quality are intentionally out of scope here — Mirror/Flip is a
 /// NuraEye-only fixed enum with no ONVIF Options concept (see `GetImagingSettingsOptions`'s own

@@ -20,10 +20,15 @@
 ///     one-for-one where a WAN counterpart exists.
 library;
 
+export 'src/anti_flicker_types.dart';
 export 'src/camera_connection.dart';
 export 'src/camera_result.dart';
+export 'src/device_reset_types.dart';
 export 'src/lan/discovery/ws_discovery_client.dart';
 export 'src/lan/insecure_camera_http_client.dart';
+export 'src/lan/nuraeye/event_preferences_client.dart';
+export 'src/lan/nuraeye/event_response_actions_client.dart';
+export 'src/lan/nuraeye/anti_flicker_client.dart';
 export 'src/lan/nuraeye/audio_volume_client.dart';
 export 'src/lan/nuraeye/capabilities_client.dart';
 export 'src/lan/nuraeye/cloud_streaming_client.dart';
@@ -71,6 +76,9 @@ export 'src/wan/wan_image_quality_client.dart';
 export 'src/wan/wan_imaging_client.dart';
 export 'src/wan/wan_live_view_client.dart';
 export 'src/wan/wan_mask_client.dart';
+export 'src/wan/wan_event_preferences_client.dart';
+export 'src/wan/wan_event_response_actions_client.dart';
+export 'src/wan/wan_anti_flicker_client.dart';
 export 'src/wan/wan_mirror_flip_client.dart';
 export 'src/wan/wan_night_vision_client.dart';
 export 'src/wan/wan_osd_client.dart';

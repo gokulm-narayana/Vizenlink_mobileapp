@@ -74,6 +74,24 @@ class WanDeviceIdentityClient {
     'new_password': newPassword,
   });
 
+  /// `FR-NE-110`: WAN mirror of `OnvifDeviceClient.reboot` (`SystemReboot`) — no WAN transport
+  /// exists for ONVIF SOAP at all, so this calls the identical `bsp_rebootAsync()` over MQTT
+  /// instead. Same connectivity-gap caveat as the LAN method: a success response does not mean
+  /// the device is back yet.
+  Future<CameraResult<void>> reboot({Duration timeout = const Duration(seconds: 15)}) =>
+      _send(IotCommandClient.reboot, const {});
+
+  /// `FR-NE-110`: WAN mirror of `OnvifDeviceClient.factoryReset` (`SetSystemFactoryDefault`) —
+  /// see [FactoryResetMode]'s doc for the Soft/Hard distinction. **[FactoryResetMode.hard] wipes
+  /// WiFi credentials** — the caller must warn the user this camera will need full
+  /// re-provisioning/re-onboarding, not just a reconnect. Note the WAN transport itself depends
+  /// on that same network config, so a Hard reset issued over WAN is the one path that reliably
+  /// severs the app's own ability to reach this camera again until it's re-onboarded on LAN.
+  Future<CameraResult<void>> factoryReset(
+    FactoryResetMode mode, {
+    Duration timeout = const Duration(seconds: 15),
+  }) => _send(IotCommandClient.factoryReset, {'mode': mode.wireValue});
+
   Future<CameraResult<void>> _send(int command, Map<String, dynamic> params) async {
     try {
       final output = await _iot.sendCommandWithResponse(command, params: params);

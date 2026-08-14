@@ -8,6 +8,13 @@ sealed class CameraResult<T> {
 class CameraSuccess<T> extends CameraResult<T> {
   const CameraSuccess(this.value);
   final T value;
+
+  // Real gap found 2026-08-13: none of these three classes overrode toString(), so every
+  // existing `'...: $result'`-style debug/log interpolation across the app (discovery_screen.dart,
+  // add_camera_credentials_screen.dart, etc.) silently printed "Instance of 'CameraFailure<bool>'"
+  // instead of the actual reason — the exact information those log lines existed to capture.
+  @override
+  String toString() => 'CameraSuccess<$T>($value)';
 }
 
 /// A request the camera actively rejected or failed to service (HTTP error, SOAP Fault,
@@ -16,6 +23,9 @@ class CameraSuccess<T> extends CameraResult<T> {
 class CameraFailure<T> extends CameraResult<T> {
   const CameraFailure(this.reason);
   final String reason;
+
+  @override
+  String toString() => 'CameraFailure<$T>($reason)';
 }
 
 /// No response arrived within the call's bounded timeout. Kept distinct from [CameraFailure]
@@ -24,4 +34,7 @@ class CameraFailure<T> extends CameraResult<T> {
 /// retry an explicit rejection the same way.
 class CameraTimeout<T> extends CameraResult<T> {
   const CameraTimeout();
+
+  @override
+  String toString() => 'CameraTimeout<$T>()';
 }
