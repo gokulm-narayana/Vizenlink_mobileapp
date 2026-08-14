@@ -57,20 +57,25 @@ class _IntrusionDetectionScreenState extends State<IntrusionDetectionScreen> {
 
   void _addZone() {
     if (_zones.length >= maxDrawableZones) return;
-    final id = _nextZoneId++;
     final offset = 0.03 * (_zones.length % 4);
+    _addZoneAt(
+      Rect.fromLTWH(
+        0.1 + offset,
+        0.1 + offset,
+        defaultZoneSize.dx,
+        defaultZoneSize.dy,
+      ),
+    );
+  }
+
+  /// Shared by [_addZone] (INTRUDE-007's fixed default position) and
+  /// [ZoneDrawSurface]'s draw-directly-on-the-preview gesture (INTRUDE-014),
+  /// which computes its own [rect] from where the user drew.
+  void _addZoneAt(Rect rect) {
+    if (_zones.length >= maxDrawableZones) return;
+    final id = _nextZoneId++;
     _markDirty(() {
-      _zones.add(
-        DrawableZone(
-          id: id,
-          rect: Rect.fromLTWH(
-            0.1 + offset,
-            0.1 + offset,
-            defaultZoneSize.dx,
-            defaultZoneSize.dy,
-          ),
-        ),
-      );
+      _zones.add(DrawableZone(id: id, rect: rect));
       _selectedZoneId = id;
     });
   }
@@ -216,6 +221,7 @@ class _IntrusionDetectionScreenState extends State<IntrusionDetectionScreen> {
                     selectedZoneId: _selectedZoneId,
                     onZoneSelected: _selectZone,
                     onZoneRectChanged: _updateZoneRect,
+                    onZoneDrawn: _addZoneAt,
                   ),
                   const SizedBox(height: 8),
                   Align(
@@ -291,8 +297,9 @@ class _IntrusionDetectionScreenState extends State<IntrusionDetectionScreen> {
                   Padding(
                     padding: const EdgeInsets.symmetric(vertical: 8),
                     child: Text(
-                      'No trigger zones yet. Tap "Add zone" to mark a region '
-                      'that triggers intrusion detection.',
+                      'No trigger zones yet. Tap "Add zone", or drag '
+                      'directly on the preview above, to mark a region that '
+                      'triggers intrusion detection.',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   )
@@ -356,6 +363,7 @@ class _IntrusionPreview extends StatelessWidget {
     required this.selectedZoneId,
     required this.onZoneSelected,
     required this.onZoneRectChanged,
+    required this.onZoneDrawn,
   });
 
   final Key settingsKey;
@@ -364,6 +372,7 @@ class _IntrusionPreview extends StatelessWidget {
   final int? selectedZoneId;
   final ValueChanged<int> onZoneSelected;
   final void Function(int id, Rect rect) onZoneRectChanged;
+  final ValueChanged<Rect> onZoneDrawn;
 
   @override
   Widget build(BuildContext context) {
@@ -385,6 +394,12 @@ class _IntrusionPreview extends StatelessWidget {
                     return Stack(
                       clipBehavior: Clip.hardEdge,
                       children: [
+                        ZoneDrawSurface(
+                          key: const Key('INTRUDE-014'),
+                          areaSize: areaSize,
+                          enabled: zones.length < maxDrawableZones,
+                          onZoneDrawn: onZoneDrawn,
+                        ),
                         for (final zone in zones)
                           ZoneOverlay(
                             key: ValueKey(zone.id),

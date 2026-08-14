@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../models/camera.dart';
@@ -12,15 +14,24 @@ export '../models/zone.dart';
 /// top. Extracted so preview screens that draw over the camera image don't
 /// each reimplement the placeholder/loading/error states.
 class CameraImage extends StatelessWidget {
-  const CameraImage({super.key, required this.camera});
+  const CameraImage({super.key, required this.camera, this.overrideBytes});
 
   final Camera camera;
+
+  /// See `CameraPreviewThumbnail.overrideBytes`'s doc — same
+  /// never-persisted transient-frame contract.
+  final Uint8List? overrideBytes;
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bytes = overrideBytes;
     final thumbnailUrl = camera.thumbnailUrl;
+
+    if (bytes != null) {
+      return Image.memory(bytes, fit: BoxFit.cover, gaplessPlayback: true);
+    }
 
     if (thumbnailUrl == null) {
       return _placeholder(colorScheme, isDark);
@@ -197,6 +208,149 @@ class ZoneOverlay extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Lets the user draw a new zone directly on the preview — drag a rough
+/// rectangle, or tap for a default-size zone centered on the tap — as an
+/// alternative to a fixed-position "Add zone" button. Reports the drawn
+/// area as a fractional (0-1) [Rect] via [onZoneDrawn] once the gesture
+/// ends; doesn't render or own any zone state itself. Place this
+/// *underneath* existing [ZoneOverlay]s in a `Stack` (earlier in its
+/// `children`) so a drag starting on an existing zone still moves/resizes
+/// that zone instead of starting a new draw — Flutter hit-tests overlapping
+/// `Stack` children in reverse paint order, so later (visually on-top)
+/// children get first refusal.
+class ZoneDrawSurface extends StatefulWidget {
+  const ZoneDrawSurface({
+    super.key,
+    required this.areaSize,
+    required this.enabled,
+    required this.onZoneDrawn,
+  });
+
+  final Size areaSize;
+  final bool enabled;
+  final ValueChanged<Rect> onZoneDrawn;
+
+  @override
+  State<ZoneDrawSurface> createState() => _ZoneDrawSurfaceState();
+}
+
+class _ZoneDrawSurfaceState extends State<ZoneDrawSurface> {
+  final _points = <Offset>[];
+
+  Rect? _boundingPixelRect() {
+    if (_points.isEmpty) return null;
+    var minX = _points.first.dx;
+    var maxX = minX;
+    var minY = _points.first.dy;
+    var maxY = minY;
+    for (final point in _points) {
+      if (point.dx < minX) minX = point.dx;
+      if (point.dx > maxX) maxX = point.dx;
+      if (point.dy < minY) minY = point.dy;
+      if (point.dy > maxY) maxY = point.dy;
+    }
+    return Rect.fromLTRB(minX, minY, maxX, maxY);
+  }
+
+  /// Converts a pixel-space rect (within [widget.areaSize]) into the
+  /// fractional (0-1) rect a [DrawableZone] expects, floored to the same
+  /// [minZoneWidth]/[minZoneHeight] `ZoneOverlay` itself enforces on resize,
+  /// and kept fully within bounds.
+  Rect _toFractional(Rect pixelRect) {
+    final areaSize = widget.areaSize;
+    if (areaSize.width == 0 || areaSize.height == 0) {
+      return Rect.fromLTWH(0.1, 0.1, defaultZoneSize.dx, defaultZoneSize.dy);
+    }
+    final minWidth = minZoneWidth * areaSize.width;
+    final minHeight = minZoneHeight * areaSize.height;
+    final width = (pixelRect.width < minWidth ? minWidth : pixelRect.width)
+        .clamp(0.0, areaSize.width);
+    final height = (pixelRect.height < minHeight ? minHeight : pixelRect.height)
+        .clamp(0.0, areaSize.height);
+    final center = pixelRect.center;
+    final left = (center.dx - width / 2).clamp(0.0, areaSize.width - width);
+    final top = (center.dy - height / 2).clamp(0.0, areaSize.height - height);
+    return Rect.fromLTWH(
+      left / areaSize.width,
+      top / areaSize.height,
+      width / areaSize.width,
+      height / areaSize.height,
+    );
+  }
+
+  void _finishDrag() {
+    final rect = _boundingPixelRect();
+    setState(() => _points.clear());
+    if (rect == null || rect.width < 4 || rect.height < 4) return;
+    widget.onZoneDrawn(_toFractional(rect));
+  }
+
+  void _placeTapZone(Offset center) {
+    final areaSize = widget.areaSize;
+    widget.onZoneDrawn(
+      _toFractional(
+        Rect.fromCenter(
+          center: center,
+          width: defaultZoneSize.dx * areaSize.width,
+          height: defaultZoneSize.dy * areaSize.height,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.enabled) return const SizedBox.shrink();
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onPanStart: (details) => setState(
+        () => _points
+          ..clear()
+          ..add(details.localPosition),
+      ),
+      onPanUpdate: (details) =>
+          setState(() => _points.add(details.localPosition)),
+      onPanEnd: (_) => _finishDrag(),
+      onTapUp: (details) => _placeTapZone(details.localPosition),
+      child: CustomPaint(
+        painter: _points.length > 1
+            ? _ZoneDrawPreviewPainter(points: _points)
+            : null,
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+/// Thin live-preview line while the user is mid-drag on a [ZoneDrawSurface]
+/// — purely transient feedback, replaced by the real [ZoneOverlay] once the
+/// gesture ends and [ZoneDrawSurface.onZoneDrawn] fires.
+class _ZoneDrawPreviewPainter extends CustomPainter {
+  const _ZoneDrawPreviewPainter({required this.points});
+
+  final List<Offset> points;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.length < 2) return;
+    final paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final path = Path()..moveTo(points.first.dx, points.first.dy);
+    for (final point in points.skip(1)) {
+      path.lineTo(point.dx, point.dy);
+    }
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ZoneDrawPreviewPainter oldDelegate) =>
+      oldDelegate.points != points;
 }
 
 enum _ZoneCorner { topLeft, topRight, bottomLeft, bottomRight }

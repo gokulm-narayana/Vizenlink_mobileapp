@@ -15,6 +15,7 @@
 | INTRUDE-005 | Intrusion detection toggle | SwitchListTile | defaults off |
 | INTRUDE-006 | Sensitivity slider | Slider | 0–100, default 50; disabled when INTRUDE-005 is off |
 | INTRUDE-007 | Add zone button | TextButton.icon | adds a new zone at a cascading default position/size; disabled once 8 zones exist; newly added zone becomes selected |
+| INTRUDE-014 | Draw-new-zone surface | `ZoneDrawSurface` (shared widget, `lib/widgets/drawable_zone.dart`), overlaid on INTRUDE-003 underneath the existing `ZoneOverlay`s | alternative to INTRUDE-007: drag a rough rectangle directly on the preview (thin white line while dragging), or tap once for a default-size zone centered on the tap — either way it becomes a real zone (same `_addZoneAt` path INTRUDE-007 uses) the instant the gesture ends, immediately selected and draggable/resizable like any other zone. Sits *below* the `ZoneOverlay`s in the `Stack` so dragging an existing zone still moves/resizes it rather than starting a new draw. Disabled once 8 zones exist, same as INTRUDE-007 |
 | INTRUDE-008 | Zone list | Column of rows ("Zone N" + delete icon), only shown when zones exist | tapping a row selects that zone (highlights it on the preview and in the list); each row's trailing delete icon removes just that zone |
 | INTRUDE-009 | Delete selected zone button | OutlinedButton.icon | disabled unless a zone is selected; removes the selected zone |
 | INTRUDE-010 | Clear all zones button | OutlinedButton.icon | disabled when there are no zones; removes every zone at once |
@@ -22,6 +23,6 @@
 | INTRUDE-012 | Discard button (in INTRUDE-011) | TextButton | discards the change and leaves |
 | INTRUDE-013 | Save button (in INTRUDE-011) | FilledButton | saves via `_save()` before leaving |
 
-Zones use the shared `DrawableZone` model and `ZoneOverlay`/`ZoneListTile` widgets (`lib/widgets/drawable_zone.dart`), the same mechanics as [privacy_mode_screen.md](../video_display/privacy_mode_screen.md)'s privacy zones — stored as fractional `Rect` bounds (0–1) of the preview area, capped at 8 (`maxDrawableZones`).
+Zones use the shared `DrawableZone` model and `ZoneOverlay`/`ZoneListTile`/`ZoneDrawSurface` widgets (`lib/widgets/drawable_zone.dart`), the same mechanics as [privacy_mode_screen.md](../video_display/privacy_mode_screen.md)'s privacy zones — stored as fractional `Rect` bounds (0–1) of the preview area, capped at 8 (`maxDrawableZones`).
 
 On successful save, values are now persisted through `HomesController.updateCamera` (not just cosmetically shown as saved) — reopening this screen reflects whatever was last saved, and once a real CCTV stream is wired up (see CLAUDE.md), it can read these `Camera` fields directly with no further plumbing needed.
