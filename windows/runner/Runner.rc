@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.onchiptech" "\0"
-            VALUE "FileDescription", "mobilecctvapp" "\0"
+            VALUE "FileDescription", "VizenLink" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "mobilecctvapp" "\0"
+            VALUE "InternalName", "vizenlink" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.onchiptech. All rights reserved." "\0"
-            VALUE "OriginalFilename", "mobilecctvapp.exe" "\0"
-            VALUE "ProductName", "mobilecctvapp" "\0"
+            VALUE "OriginalFilename", "vizenlink.exe" "\0"
+            VALUE "ProductName", "VizenLink" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

@@ -17,8 +17,19 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <!-- Needed for reliable UDP multicast reception during WS-Discovery
+         camera scanning (packages/camera_api's WsDiscoveryClient.
+         scanMulticast) — without it, the Wi-Fi radio's power-saving filter
+         can silently drop incoming multicast packets. Declaring this alone
+         doesn't acquire the lock at runtime (that needs WifiManager.
+         MulticastLock via a platform channel, which this pure-Dart package
+         doesn't do yet) but is required before anything can. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <!-- Needed by flutter_webrtc's getUserMedia for two-way talk (LiveViewController.startTalk)
+         — captures the phone's mic to send to the camera's speaker. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <application
-        android:label="mobilecctvapp"
+        android:label="VizenLink"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

@@ -1,11 +1,11 @@
 {
-    "name": "mobilecctvapp",
-    "short_name": "mobilecctvapp",
+    "name": "VizenLink",
+    "short_name": "VizenLink",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
+    "background_color": "#ffffff",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "VizenLink mobile app for viewing and managing CCTV camera feeds.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

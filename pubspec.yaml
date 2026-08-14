@@ -1,5 +1,5 @@
 name: mobilecctvapp
-description: "A new Flutter project."
+description: "VizenLink mobile app for viewing and managing CCTV camera feeds."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -47,8 +47,15 @@ dependencies:
   connectivity_plus: ^7.0.0
   wifi_scan: ^0.4.1+2
   http: ^1.2.0
+  flutter_multicast_lock: ^1.2.1
   camera_api:
     path: packages/camera_api
+  auth_api:
+    path: packages/auth_api
+  alerts_api:
+    path: packages/alerts_api
+  flutter_webrtc: ^1.6.0
+  pointycastle: ^3.9.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -60,9 +67,27 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
   flutter_native_splash: ^2.4.6
+  flutter_launcher_icons: ^0.14.3
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/branding/app_icon.png"
+  remove_alpha_ios: true
+  macos:
+    generate: true
+    image_path: "assets/branding/app_icon.png"
+  web:
+    generate: true
+    image_path: "assets/branding/app_icon.png"
+    background_color: "#ffffff"
+    theme_color: "#0175C2"
+  windows:
+    generate: true
+    image_path: "assets/branding/app_icon.png"
 
 flutter_native_splash:
   android: false
@@ -90,6 +115,7 @@ flutter:
     - assets/branding/logo.png
     - assets/branding/vizenlink_light.png
     - assets/branding/vizenlink_dark.png
+    - assets/branding/app_icon.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
