@@ -30,6 +30,13 @@ const _unassignedRoomLabel = 'Unassigned';
 /// just sits on this screen without manually hitting Refresh anywhere.
 const _thumbnailRefreshInterval = Duration(minutes: 5);
 
+/// How often the Dashboard checks whether each camera is still reachable —
+/// deliberately much tighter than [_thumbnailRefreshInterval] since this
+/// only pings (see [pingCameraReachability]) rather than fetching a full
+/// snapshot image, so a camera going offline while the user is sitting on
+/// this screen shows up within seconds instead of up to 5 minutes later.
+const _reachabilityCheckInterval = Duration(seconds: 15);
+
 enum _CollectionLayout { grid, list }
 
 class DashboardScreen extends StatefulWidget {
@@ -60,6 +67,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   bool _isReorderMode = false;
   bool _isFabExpanded = true;
   Timer? _thumbnailRefreshTimer;
+  Timer? _reachabilityCheckTimer;
 
   @override
   void initState() {
@@ -74,6 +82,10 @@ class _DashboardScreenState extends State<DashboardScreen>
       _thumbnailRefreshInterval,
       (_) => _refreshAllThumbnails(),
     );
+    _reachabilityCheckTimer = Timer.periodic(
+      _reachabilityCheckInterval,
+      (_) => _checkAllReachability(),
+    );
   }
 
   @override
@@ -81,6 +93,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     widget.homesController.removeListener(_onHomesChanged);
     _collectionTabController.dispose();
     _thumbnailRefreshTimer?.cancel();
+    _reachabilityCheckTimer?.cancel();
     super.dispose();
   }
 
@@ -97,6 +110,26 @@ class _DashboardScreenState extends State<DashboardScreen>
         if (connection == null) continue;
         unawaited(
           refreshCameraSnapshot(
+            homesController: widget.homesController,
+            cameraId: camera.id,
+            connection: connection,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Cheap online/offline check for every camera (across every home) with a
+  /// saved connection — see [_reachabilityCheckInterval]'s doc comment for
+  /// why this is separate from [_refreshAllThumbnails]. Fire-and-forget,
+  /// same reasoning as that method.
+  void _checkAllReachability() {
+    for (final home in widget.homesController.value.homes) {
+      for (final camera in home.cameras) {
+        final connection = camera.connection;
+        if (connection == null) continue;
+        unawaited(
+          pingCameraReachability(
             homesController: widget.homesController,
             cameraId: camera.id,
             connection: connection,

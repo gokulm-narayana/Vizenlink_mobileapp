@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -67,8 +68,14 @@ Rect _polygonToZoneRect(List<OnvifPoint> polygon) {
 /// what's on the camera: new zones get `createMask`, edited zones get
 /// `setMask` by their server-assigned token, removed zones get
 /// `deleteMask`). Falls back to local-only `HomesController` state
-/// (`simulateCameraSave`) for a camera with no saved connection yet. WAN
-/// fallback (`WanPrivacyModeClient`/`WanMaskClient`) isn't wired up yet.
+/// (`simulateCameraSave`) for a camera with no saved connection yet. LAN is
+/// always tried first for both load and save; a WAN retry
+/// (`WanPrivacyModeClient`/`WanMaskClient`) only kicks in when the LAN call
+/// itself fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// Per that same convention, WAN mask *Options* are never fetched on a
+/// normal load — only current-value reads (mode, masks) get a WAN
+/// fallback there.
 class PrivacyModeScreen extends StatefulWidget {
   const PrivacyModeScreen({
     super.key,
@@ -98,6 +105,13 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+
+  /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
+  /// fails — never persisted (see `fetchWanPreviewSnapshot`'s doc), just
+  /// held here for as long as this screen is open. Cleared once a LAN
+  /// refresh succeeds again, so the persisted (and now fresher) thumbnail
+  /// takes back over.
+  Uint8List? _wanPreviewBytes;
 
   /// Server-assigned mask token for each zone that already exists on the
   /// camera — a zone id with no entry here is new (never saved), so Save
@@ -133,11 +147,24 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     ]);
     nuraeye.close();
     maskClient.close();
-    if (!mounted) return;
 
-    final modeResult = results[0] as CameraResult<PrivacyMode>;
-    final masksResult = results[1] as CameraResult<List<MaskEntry>>;
+    var modeResult = results[0] as CameraResult<PrivacyMode>;
+    var masksResult = results[1] as CameraResult<List<MaskEntry>>;
     final optionsResult = results[2] as CameraResult<MaskOptions>;
+
+    // Options are LAN-only on a normal load (see this class's doc comment)
+    // — only the current-value reads (mode, masks) fall back to WAN here.
+    final thingName = connection.thingName;
+    if (thingName != null) {
+      final wanMaskClient = WanMaskClient(thingName);
+      if (modeResult is! CameraSuccess) {
+        modeResult = await WanPrivacyModeClient(thingName).getPrivacyMode();
+      }
+      if (masksResult is! CameraSuccess) {
+        masksResult = await wanMaskClient.getMasks();
+      }
+    }
+    if (!mounted) return;
 
     setState(() {
       if (modeResult case CameraSuccess(:final value)) {
@@ -178,20 +205,25 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
 
   void _addZone() {
     if (_zones.length >= _maxZones) return;
-    final id = _nextZoneId++;
     final offset = 0.03 * (_zones.length % 4);
+    _addZoneAt(
+      Rect.fromLTWH(
+        0.1 + offset,
+        0.1 + offset,
+        defaultZoneSize.dx,
+        defaultZoneSize.dy,
+      ),
+    );
+  }
+
+  /// Shared by [_addZone] (PRIV-006's fixed default position) and
+  /// [ZoneDrawSurface]'s draw-directly-on-the-preview gesture (PRIV-014),
+  /// which computes its own [rect] from where the user drew.
+  void _addZoneAt(Rect rect) {
+    if (_zones.length >= _maxZones) return;
+    final id = _nextZoneId++;
     _markDirty(() {
-      _zones.add(
-        DrawableZone(
-          id: id,
-          rect: Rect.fromLTWH(
-            0.1 + offset,
-            0.1 + offset,
-            defaultZoneSize.dx,
-            defaultZoneSize.dy,
-          ),
-        ),
-      );
+      _zones.add(DrawableZone(id: id, rect: rect));
       _selectedZoneId = id;
     });
   }
@@ -258,11 +290,27 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention. The last-shown preview (whether the persisted
+    // thumbnail or a previous WAN frame) stays on screen until this
+    // resolves, not blanked out mid-refresh.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -275,13 +323,23 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
 
     final bool succeeded;
     if (connection != null) {
+      final thingName = connection.thingName;
+
       final nuraeye = NuraeyeClient(connection);
-      final modeResult = await PrivacyModeClient(
+      var modeResult = await PrivacyModeClient(
         nuraeye,
       ).setPrivacyMode(_toWirePrivacyMode(_mode));
       nuraeye.close();
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      if (modeResult is! CameraSuccess && thingName != null) {
+        modeResult = await WanPrivacyModeClient(
+          thingName,
+        ).setPrivacyMode(_toWirePrivacyMode(_mode));
+      }
 
       final maskClient = MaskClient(connection);
+      final wanMaskClient = thingName != null ? WanMaskClient(thingName) : null;
       // ONVIF masks have no bulk-update call — diff the zone list against
       // what's already on the camera (tracked in _maskTokenByZoneId).
       final maskType = _maskOptions != null && _maskOptions!.types.isNotEmpty
@@ -299,7 +357,10 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
           .toList();
       for (final id in removedZoneIds) {
         final token = _maskTokenByZoneId[id]!;
-        final result = await maskClient.deleteMask(token);
+        var result = await maskClient.deleteMask(token);
+        if (result is! CameraSuccess && wanMaskClient != null) {
+          result = await wanMaskClient.deleteMask(token);
+        }
         if (result is CameraSuccess) {
           _maskTokenByZoneId.remove(id);
         } else {
@@ -311,21 +372,40 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
         final polygon = _zoneToPolygon(zone.rect);
         final existingToken = _maskTokenByZoneId[zone.id];
         if (existingToken != null) {
-          final result = await maskClient.setMask(
+          var result = await maskClient.setMask(
             token: existingToken,
             polygon: polygon,
             enabled: true,
             type: maskType,
             color: maskColor,
           );
+          if (result is! CameraSuccess && wanMaskClient != null) {
+            result = await wanMaskClient.setMask(
+              token: existingToken,
+              polygon: polygon,
+              enabled: true,
+              type: maskType,
+              color: maskColor,
+            );
+          }
           if (result is! CameraSuccess) masksOk = false;
         } else {
-          final result = await maskClient.createMask(
+          var result = await maskClient.createMask(
             polygon: polygon,
             enabled: true,
             type: maskType,
             color: maskColor,
           );
+          // WAN's setMask (not a separate createMask) handles creation too
+          // — an empty/omitted token creates a new mask, per its own doc.
+          if (result is! CameraSuccess && wanMaskClient != null) {
+            result = await wanMaskClient.setMask(
+              polygon: polygon,
+              enabled: true,
+              type: maskType,
+              color: maskColor,
+            );
+          }
           if (result case CameraSuccess(:final value)) {
             _maskTokenByZoneId[zone.id] = value;
           } else {
@@ -399,11 +479,14 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('PRIV-004'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                     mode: _mode,
                     zones: _zones,
+                    maxZones: _maxZones,
                     selectedZoneId: _selectedZoneId,
                     onZoneSelected: _selectZone,
                     onZoneRectChanged: _updateZoneRect,
+                    onZoneDrawn: _addZoneAt,
                   ),
                   const SizedBox(height: 8),
                   Align(
@@ -501,8 +584,8 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 8),
                       child: Text(
-                        'No privacy zones yet. Tap "Add zone" to mask a '
-                        'region of the preview.',
+                        'No privacy zones yet. Tap "Add zone", or drag '
+                        'directly on the preview above, to mask a region.',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     )
@@ -563,20 +646,29 @@ class _PrivacyPreview extends StatelessWidget {
     super.key,
     required this.settingsKey,
     required this.camera,
+    this.overrideBytes,
     required this.mode,
     required this.zones,
+    required this.maxZones,
     required this.selectedZoneId,
     required this.onZoneSelected,
     required this.onZoneRectChanged,
+    required this.onZoneDrawn,
   });
 
   final Key settingsKey;
   final Camera camera;
+
+  /// See `CameraPreviewThumbnail.overrideBytes`'s doc — same
+  /// never-persisted transient-frame contract.
+  final Uint8List? overrideBytes;
   final CameraPrivacyMode mode;
   final List<DrawableZone> zones;
+  final int maxZones;
   final int? selectedZoneId;
   final ValueChanged<int> onZoneSelected;
   final void Function(int id, Rect rect) onZoneRectChanged;
+  final ValueChanged<Rect> onZoneDrawn;
 
   @override
   Widget build(BuildContext context) {
@@ -590,7 +682,7 @@ class _PrivacyPreview extends StatelessWidget {
           child: Stack(
             key: settingsKey,
             children: [
-              CameraImage(camera: camera),
+              CameraImage(camera: camera, overrideBytes: overrideBytes),
               if (mode == CameraPrivacyMode.full)
                 const Positioned.fill(child: _FullBlackoutOverlay())
               else
@@ -601,6 +693,14 @@ class _PrivacyPreview extends StatelessWidget {
                       return Stack(
                         clipBehavior: Clip.hardEdge,
                         children: [
+                          ZoneDrawSurface(
+                            key: const Key('PRIV-014'),
+                            areaSize: areaSize,
+                            enabled:
+                                mode == CameraPrivacyMode.zone &&
+                                zones.length < maxZones,
+                            onZoneDrawn: onZoneDrawn,
+                          ),
                           for (final zone in zones)
                             ZoneOverlay(
                               key: ValueKey(zone.id),

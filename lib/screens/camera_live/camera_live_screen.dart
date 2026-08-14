@@ -2,18 +2,22 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:camera_api/camera_api.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:gal/gal.dart';
 import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../app_state/homes_controller.dart';
+import '../../app_state/live_view_controller.dart';
+import '../../app_state/route_observer.dart';
 import '../../models/camera.dart';
 import '../../theme/app_colors.dart';
 import '../../widgets/camera_thumbnail_image.dart';
@@ -22,7 +26,20 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/live_status_badges.dart';
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/settings_save_button.dart' show simulateCameraSave;
 import '../camera_settings/camera_settings_screen.dart';
+import 'ai_mode_screen.dart';
+
+/// `CameraVideoMode` <-> ONVIF `IrCutFilter` wire values — mirrors
+/// `video_mode_screen.dart`'s private mapping of the same name (Dart
+/// privacy means it can't be imported directly; this is the only other
+/// place in the app that sets this field, so a small local copy is
+/// simpler than threading a shared helper file just for this one mapping).
+String _videoModeToIrCutFilter(CameraVideoMode mode) => switch (mode) {
+  CameraVideoMode.day => 'ON',
+  CameraVideoMode.night => 'OFF',
+  CameraVideoMode.auto => 'AUTO',
+};
 
 const _recordingLimit = Duration(minutes: 5);
 const _continuePromptCountdown = Duration(seconds: 5);
@@ -53,18 +70,30 @@ class CameraLiveScreen extends StatefulWidget {
 }
 
 class _CameraLiveScreenState extends State<CameraLiveScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver, RouteAware {
   late final TabController _tabController;
   late final VideoPlayerController _videoController;
   final _videoBoundaryKey = GlobalKey();
+
+  /// Real LAN WebRTC live-view session — null when this camera has no saved
+  /// connection yet (falls back to the dummy asset, same convention as
+  /// every other camera-settings screen). WAN fallback isn't wired up here
+  /// yet — LAN only for now.
+  LiveViewController? _liveViewController;
   bool _isMuted = false;
-  bool _isTalking = false;
   bool _isSpotlightOn = false;
+  bool _isPrivacyShortcutBusy = false;
+  bool _isVideoModeShortcutBusy = false;
 
   bool _isRecording = false;
   DateTime? _recordingStartedAt;
   Timer? _recordingTicker;
   Duration _recordingElapsed = Duration.zero;
+
+  /// Set only when the current recording is real (backed by
+  /// [LiveViewController.startRecording]) — null means the dummy-asset trim
+  /// fallback is in effect instead. See [_toggleRecording]/[_stopRecording].
+  String? _liveRecordingPath;
 
   List<ConnectivityResult> _connectivity = [ConnectivityResult.none];
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -77,6 +106,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tabController = TabController(length: 2, vsync: this)
       ..addListener(() {
         if (!_tabController.indexIsChanging) setState(() {});
@@ -88,7 +118,203 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
         setState(() {});
         _videoController.play();
       });
+    final connection = widget.camera.connection;
+    if (connection != null) {
+      _liveViewController = LiveViewController(connection)
+        ..addListener(_onLiveViewChanged)
+        ..connect();
+      unawaited(_pollSignalStrength());
+      _signalPollTimer = Timer.periodic(
+        _signalPollInterval,
+        (_) => unawaited(_pollSignalStrength()),
+      );
+      unawaited(_loadRealBitrate());
+    }
     _initConnectivity();
+  }
+
+  /// Real configured encoder bitrate (LIVE-029's badge) — a stable
+  /// configuration fact from Video Encoder settings, not a live
+  /// measurement, so a one-time fetch on screen open is enough (unlike
+  /// signal strength/bitrate telemetry, this doesn't change mid-session
+  /// unless the user visits Video Encoder settings and changes it, which
+  /// already persists a fresh value through `HomesController` itself).
+  /// Previously `Camera.bitrateKbps` only ever got a real value if the user
+  /// had specifically opened Video Encoder settings before — this screen
+  /// showed a permanently-stale/default number otherwise.
+  Future<void> _loadRealBitrate() async {
+    final connection = widget.camera.connection;
+    if (connection == null) return;
+    final client = OnvifVideoEncoderClient(connection);
+    var result = await client.getVideoEncoderSettings();
+    client.close();
+
+    final thingName = connection.thingName;
+    if (result is! CameraSuccess && thingName != null) {
+      result = await WanVideoEncoderClient(thingName).getVideoEncoderSettings();
+    }
+    if (!mounted) return;
+    if (result case CameraSuccess(:final value)) {
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (current) => current.copyWith(bitrateKbps: value.bitrate.toDouble()),
+      );
+    }
+  }
+
+  /// Real LAN reachability probe (`NetworkInfoClient.getWifiSignalStrength`
+  /// — same call `wifi_config_screen.dart` already uses) — LIVE-030's
+  /// signal bars used to always read `Camera.signalStrength`'s permanent
+  /// default of 0 since nothing ever wrote a real value into it. Persisted
+  /// via `HomesController.updateCamera` (unlike the fast-changing bitrate
+  /// reading, RSSI genuinely is a "current camera state" fact worth keeping
+  /// around, same as `pingCameraReachability`'s `isOnline`).
+  static const _signalPollInterval = Duration(seconds: 20);
+  Timer? _signalPollTimer;
+
+  Future<void> _pollSignalStrength() async {
+    final connection = widget.camera.connection;
+    if (connection == null) return;
+    final client = NetworkInfoClient(connection);
+    final result = await client.getWifiSignalStrength();
+    client.close();
+    if (!mounted) return;
+    if (result case CameraSuccess(:final value)) {
+      final bars = barsForRssi(value.rssi);
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (current) => current.copyWith(signalStrength: bars),
+      );
+    }
+  }
+
+  /// Backgrounding the app doesn't dispose this screen — the widget tree
+  /// stays alive, so without this the LAN peer connection / WAN cloud
+  /// stream just keeps running with nobody watching (a real complaint: the
+  /// camera kept streaming after the phone app was closed/backgrounded).
+  /// [paused] covers both "home button pressed" and, on Android, the
+  /// process being backgrounded ahead of a possible kill — there's no
+  /// reliable further callback once the OS actually terminates the process,
+  /// so this is the last point a graceful stop can be sent. Reconnects on
+  /// [resumed] only if the session was actually torn down here (not if it
+  /// simply failed/was already stopped for an unrelated reason) and the
+  /// screen is still on the Live tab.
+  bool _stoppedForBackground = false;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final controller = _liveViewController;
+    if (controller == null) return;
+    switch (state) {
+      case AppLifecycleState.paused:
+        if (controller.status == LiveViewStatus.connected ||
+            controller.status == LiveViewStatus.connecting ||
+            controller.status == LiveViewStatus.reconnecting) {
+          _stoppedForBackground = true;
+          unawaited(controller.stop());
+        }
+      case AppLifecycleState.resumed:
+        if (_stoppedForBackground) {
+          _stoppedForBackground = false;
+          if (_tabController.index == 0) controller.connect();
+        }
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        break;
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    routeObserver.subscribe(this, ModalRoute.of(context)! as PageRoute);
+  }
+
+  /// `context.push`-ing to a sub-screen (e.g. Camera Settings) leaves this
+  /// screen mounted underneath the new route, same underlying issue as the
+  /// backgrounding fix above — the session doesn't know it's not visible
+  /// anymore unless something tells it. A real complaint: the stream/audio
+  /// kept running while browsing screens pushed on top of Live view.
+  /// [didPushNext] fires when this route gets covered; [didPopNext] fires
+  /// when it's back on top. Shares [_stoppedForBackground]'s reasoning for
+  /// only reconnecting what this screen itself paused.
+  bool _stoppedForNavigation = false;
+
+  @override
+  void didPushNext() {
+    final controller = _liveViewController;
+    if (controller == null) return;
+    if (controller.status == LiveViewStatus.connected ||
+        controller.status == LiveViewStatus.connecting ||
+        controller.status == LiveViewStatus.reconnecting) {
+      _stoppedForNavigation = true;
+      unawaited(controller.stop());
+    }
+  }
+
+  @override
+  void didPopNext() {
+    final controller = _liveViewController;
+    if (controller == null) return;
+    if (_stoppedForNavigation) {
+      _stoppedForNavigation = false;
+      if (_tabController.index == 0) controller.connect();
+    }
+  }
+
+  /// Shifts LIVE-007/LIVE-008 up so they don't sit underneath the talk
+  /// status bar (TALK-001) when it's showing at the very bottom edge.
+  double get _cornerButtonBottomInset =>
+      (_liveViewController?.talkStatus ?? TalkStatus.idle) == TalkStatus.idle
+      ? 8
+      : 56;
+
+  /// Rebuilds on any [LiveViewController] change (connection status, talk
+  /// status) — coarse-grained, matching this screen's existing setState
+  /// style, but cheap since this screen's build is small relative to a
+  /// video frame render. Deferred to a microtask: [LiveViewController] can
+  /// call `notifyListeners()` from a native platform-channel callback that
+  /// sometimes lands mid-build, and calling `setState` synchronously in
+  /// that case throws ("setState() or markNeedsBuild() called during
+  /// build" — hit on real hardware 2026-08-14). A microtask runs just after
+  /// the current build finishes instead.
+  void _onLiveViewChanged() {
+    _syncCameraOnlineStatus();
+    Future.microtask(() {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// The live-view connection attempt *is* a reachability check — a failed
+  /// signaling call means the camera genuinely didn't respond, same as the
+  /// LAN pings `camera_sync.dart` uses for the dashboard's offline badge.
+  /// Without this, `Camera.isOnline` only gets updated by the dashboard's
+  /// own 5-minute timer, so a camera that dies mid-stream would still show
+  /// "online" everywhere else in the app for up to 5 minutes even though
+  /// this screen already knows it's not reachable. Only writes when the
+  /// derived online value actually changed, so this doesn't fire on every
+  /// unrelated controller notification (talk status, reconnecting, etc).
+  void _syncCameraOnlineStatus() {
+    final controller = _liveViewController;
+    if (controller == null) return;
+    final bool? online = switch (controller.status) {
+      LiveViewStatus.connected => true,
+      LiveViewStatus.failed => false,
+      LiveViewStatus.connecting ||
+      LiveViewStatus.reconnecting ||
+      LiveViewStatus.stopped => null,
+    };
+    if (online == null) return;
+    final current = _currentCamera(widget.homesController.value);
+    if (current.isOnline == online) return;
+    widget.homesController.updateCamera(
+      current.id,
+      (camera) => camera.copyWith(
+        isOnline: online,
+        lastSeen: online ? DateTime.now() : null,
+      ),
+    );
   }
 
   Future<void> _initConnectivity() async {
@@ -155,11 +381,17 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    routeObserver.unsubscribe(this);
     _recordingTicker?.cancel();
     _cellularReminderTicker?.cancel();
+    _signalPollTimer?.cancel();
     _connectivitySubscription?.cancel();
     _tabController.dispose();
     _videoController.dispose();
+    _liveViewController?.removeListener(_onLiveViewChanged);
+    _liveViewController?.stop();
+    _liveViewController?.dispose();
     super.dispose();
   }
 
@@ -167,20 +399,45 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
     setState(() {
       _isMuted = !_isMuted;
       _videoController.setVolume(_isMuted ? 0 : 1);
+      _liveViewController?.setAudioEnabled(!_isMuted);
+      // WAN playback is a plain VideoPlayerController, not a WebRTC track —
+      // setAudioEnabled (above) only affects the LAN renderer's tracks.
+      _liveViewController?.wanVideoController?.setVolume(_isMuted ? 0 : 1);
     });
+  }
+
+  /// Captures the current on-screen video frame as PNG bytes, without
+  /// saving it anywhere — shared by [_takeSnapshot] (LIVE-009, saves to the
+  /// gallery) and AI Mode's frozen-frame entry/retake (LIVE-043/AIMODE-006).
+  /// Prefers a real capture straight from the remote WebRTC video track
+  /// (`LiveViewController.captureSnapshot`) when the Live tab is showing a
+  /// connected real feed — a `RenderRepaintBoundary` screenshot of the
+  /// platform-view/texture-backed `RTCVideoView` isn't reliable. Falls back
+  /// to the boundary screenshot for the Playback tab, or any camera with no
+  /// real connection.
+  Future<Uint8List?> _captureFrame() async {
+    final liveViewController = _liveViewController;
+    if (_tabController.index == 0 &&
+        liveViewController != null &&
+        liveViewController.status == LiveViewStatus.connected) {
+      final liveFrame = await liveViewController.captureSnapshot();
+      if (liveFrame != null) return liveFrame;
+    }
+    final boundary =
+        _videoBoundaryKey.currentContext?.findRenderObject()
+            as RenderRepaintBoundary?;
+    if (boundary == null) return null;
+    final image = await boundary.toImage(pixelRatio: 2);
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    return byteData?.buffer.asUint8List();
   }
 
   Future<void> _takeSnapshot() async {
     try {
-      final boundary =
-          _videoBoundaryKey.currentContext?.findRenderObject()
-              as RenderRepaintBoundary?;
-      if (boundary == null) return;
-      final image = await boundary.toImage(pixelRatio: 2);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData == null) return;
+      final bytes = await _captureFrame();
+      if (bytes == null) return;
       await Gal.putImageBytes(
-        byteData.buffer.asUint8List(),
+        bytes,
         name: 'cctv_snapshot_${DateTime.now().millisecondsSinceEpoch}',
       );
       if (!mounted) return;
@@ -195,13 +452,67 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
     }
   }
 
-  void _toggleRecording() {
+  /// rootNavigator: true — same reasoning as [_openFullscreen]: this screen
+  /// lives inside a StatefulShellRoute branch with its own nested Navigator,
+  /// so pushing on the branch Navigator alone would keep MainShell's bottom
+  /// nav bar visible underneath AI Mode instead of it taking over the
+  /// screen. Not a go_router route for the same reason fullscreen isn't —
+  /// it's a modal takeover of this screen, not an independently
+  /// deep-linkable destination.
+  Future<void> _openAiMode(Camera camera) async {
+    final frame = await _captureFrame();
+    if (!mounted || frame == null) return;
+    await Navigator.of(context, rootNavigator: true).push(
+      MaterialPageRoute(
+        builder: (_) => AiModeScreen(
+          args: AiModeLaunchArgs(
+            camera: camera,
+            initialFrame: frame,
+            captureFrame: _captureFrame,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleRecording() async {
     if (_isRecording) {
-      _stopRecording(save: true);
+      await _stopRecording(save: true);
       return;
     }
+
+    final liveViewController = _liveViewController;
+    // No native frame-capture path exists for WAN's plain HLS playback the
+    // way LiveViewController.startRecording has for a real WebRTC track —
+    // falling through to the dummy-asset trim below would silently save a
+    // fake recording instead, which is worse than not recording at all.
+    if (_tabController.index == 0 &&
+        liveViewController != null &&
+        liveViewController.status == LiveViewStatus.connected &&
+        liveViewController.transport == LiveViewTransport.wan) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Recording isn\'t available on a remote connection'),
+        ),
+      );
+      return;
+    }
+    String? liveRecordingPath;
+    if (_tabController.index == 0 &&
+        liveViewController != null &&
+        liveViewController.status == LiveViewStatus.connected) {
+      final tempDir = await getTemporaryDirectory();
+      final path =
+          '${tempDir.path}/cctv_live_${DateTime.now().millisecondsSinceEpoch}.mp4';
+      if (await liveViewController.startRecording(path)) {
+        liveRecordingPath = path;
+      }
+    }
+    if (!mounted) return;
+
     setState(() {
       _isRecording = true;
+      _liveRecordingPath = liveRecordingPath;
       _recordingStartedAt = DateTime.now();
       _recordingElapsed = Duration.zero;
     });
@@ -249,39 +560,54 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   Future<void> _stopRecording({required bool save}) async {
     _recordingTicker?.cancel();
     final recordedDuration = _recordingElapsed;
+    final liveRecordingPath = _liveRecordingPath;
     setState(() {
       _isRecording = false;
       _recordingStartedAt = null;
       _recordingElapsed = Duration.zero;
+      _liveRecordingPath = null;
     });
-    if (!save) return;
+
+    if (liveRecordingPath != null) {
+      await _liveViewController?.stopRecording();
+    }
+    if (!save || !mounted) return;
 
     try {
-      // No real capturable stream yet — trim a copy of the dummy asset
-      // down to how long the user actually recorded, as a stand-in for
-      // "what was recorded" (see CLAUDE.md: no CCTV protocol chosen yet).
-      final bytes = await DefaultAssetBundle.of(context).load(_dummyVideoAsset);
-      final tempDir = await getTemporaryDirectory();
-      final stamp = DateTime.now().millisecondsSinceEpoch;
-      final sourceFile = File('${tempDir.path}/cctv_source_$stamp.mp4');
-      await sourceFile.writeAsBytes(bytes.buffer.asUint8List());
+      if (liveRecordingPath != null) {
+        // Real recording, captured straight from the remote WebRTC video
+        // track by LiveViewController — see this file's top-level LAN
+        // live-view doc.
+        await Gal.putVideo(liveRecordingPath);
+      } else {
+        // No real connection for this camera (or the Playback tab was
+        // active) — trim a copy of the dummy asset down to how long the
+        // user actually recorded, as a stand-in for "what was recorded".
+        final bytes = await DefaultAssetBundle.of(
+          context,
+        ).load(_dummyVideoAsset);
+        final tempDir = await getTemporaryDirectory();
+        final stamp = DateTime.now().millisecondsSinceEpoch;
+        final sourceFile = File('${tempDir.path}/cctv_source_$stamp.mp4');
+        await sourceFile.writeAsBytes(bytes.buffer.asUint8List());
 
-      final trimmedFile = File('${tempDir.path}/cctv_recording_$stamp.mp4');
-      final clampedSeconds = recordedDuration.inSeconds.clamp(
-        1,
-        _recordingLimit.inSeconds,
-      );
-      final session = await FFmpegKit.execute(
-        '-y -i "${sourceFile.path}" -t $clampedSeconds -c copy '
-        '"${trimmedFile.path}"',
-      );
-      final returnCode = await session.getReturnCode();
-      await sourceFile.delete();
-      if (!ReturnCode.isSuccess(returnCode)) {
-        throw Exception('ffmpeg trim failed');
+        final trimmedFile = File('${tempDir.path}/cctv_recording_$stamp.mp4');
+        final clampedSeconds = recordedDuration.inSeconds.clamp(
+          1,
+          _recordingLimit.inSeconds,
+        );
+        final session = await FFmpegKit.execute(
+          '-y -i "${sourceFile.path}" -t $clampedSeconds -c copy '
+          '"${trimmedFile.path}"',
+        );
+        final returnCode = await session.getReturnCode();
+        await sourceFile.delete();
+        if (!ReturnCode.isSuccess(returnCode)) {
+          throw Exception('ffmpeg trim failed');
+        }
+
+        await Gal.putVideo(trimmedFile.path);
       }
-
-      await Gal.putVideo(trimmedFile.path);
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
@@ -307,6 +633,8 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
       MaterialPageRoute(
         builder: (_) => _FullscreenVideo(
           controller: _videoController,
+          liveViewController: _liveViewController,
+          showLiveView: _tabController.index == 0,
           isMuted: _isMuted,
           onMuteChanged: (muted) => setState(() => _isMuted = muted),
         ),
@@ -316,6 +644,149 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
     ]);
+  }
+
+  /// Toggles two-way talk (LIVE-011) in place, on the same screen — the
+  /// live video keeps playing throughout; a status bar overlaid at the
+  /// bottom of the video (TALK-001) shows connecting/talking/busy/error and
+  /// carries the speakerphone/End controls, per `TWO_WAY_TALK_GUIDE.md`
+  /// §5's call-style contract (distinct states, not just a spinner-or-not
+  /// toggle; every exit path funnels through one teardown). Starting
+  /// requires a real, already-connected LAN session — talk is LAN-only
+  /// (§1) and reuses that exact connection rather than opening a new one.
+  Future<void> _toggleTalk() async {
+    final liveViewController = _liveViewController;
+    if (liveViewController == null) return;
+
+    if (liveViewController.talkStatus == TalkStatus.idle) {
+      if (liveViewController.status != LiveViewStatus.connected) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Connect to the camera to talk')),
+        );
+        return;
+      }
+      if (liveViewController.transport == LiveViewTransport.wan) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Talk isn\'t available on a remote connection'),
+          ),
+        );
+        return;
+      }
+      await liveViewController.startTalk();
+      return;
+    }
+
+    await liveViewController.endTalk();
+    // Ending a talk session that actually connected tears down the whole
+    // WebRTC connection, not just the talk leg (TWO_WAY_TALK_GUIDE.md §3) —
+    // reconnect for live view to keep playing.
+    if (mounted && liveViewController.status == LiveViewStatus.stopped) {
+      liveViewController.connect();
+    }
+  }
+
+  /// Quick Privacy Mode shortcut (LIVE-041) — toggles Off<->Full only, same
+  /// as tapping the Off/Full tiles on `privacy_mode_screen.dart` (PRIV-002)
+  /// but applied immediately, no draft/Apply step, matching Mute/Fullscreen's
+  /// existing instant-apply pattern on this screen. If the camera is
+  /// currently in Zone mode, this turns it Off rather than jumping to Full —
+  /// zone configuration itself is left untouched for later, only reachable
+  /// from the full Privacy Mode settings screen. Trusts the cached `Camera`
+  /// model for the current mode shown (same as every other shortcut here)
+  /// rather than re-fetching live on every screen open.
+  Future<void> _togglePrivacyShortcut(Camera camera) async {
+    final newMode = camera.privacyMode == CameraPrivacyMode.off
+        ? CameraPrivacyMode.full
+        : CameraPrivacyMode.off;
+    setState(() => _isPrivacyShortcutBusy = true);
+
+    final connection = camera.connection;
+    final bool succeeded;
+    if (connection != null) {
+      final wireMode = newMode == CameraPrivacyMode.full
+          ? PrivacyMode.full
+          : PrivacyMode.none;
+      final nuraeye = NuraeyeClient(connection);
+      var result = await PrivacyModeClient(nuraeye).setPrivacyMode(wireMode);
+      nuraeye.close();
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        result = await WanPrivacyModeClient(thingName).setPrivacyMode(wireMode);
+      }
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
+    if (!mounted) return;
+    setState(() => _isPrivacyShortcutBusy = false);
+    if (succeeded) {
+      widget.homesController.updateCamera(
+        camera.id,
+        (current) => current.copyWith(privacyMode: newMode),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Failed to update privacy mode. Try again.'),
+        ),
+      );
+    }
+  }
+
+  /// Quick Video Mode shortcut (LIVE-042) — cycles Day -> Auto -> Night ->
+  /// Day on each tap, applied immediately (same instant-apply reasoning as
+  /// [_togglePrivacyShortcut]). Doesn't gate on the camera's reported
+  /// `IrCutFilter` capability list the way `video_mode_screen.dart` does
+  /// (VIDMODE-004) — this shortcut always offers all three; a camera that
+  /// doesn't support one will surface that as a failed Set instead.
+  Future<void> _cycleVideoModeShortcut(Camera camera) async {
+    const order = [
+      CameraVideoMode.day,
+      CameraVideoMode.auto,
+      CameraVideoMode.night,
+    ];
+    final next = order[(order.indexOf(camera.videoMode) + 1) % order.length];
+    setState(() => _isVideoModeShortcutBusy = true);
+
+    final connection = camera.connection;
+    final bool succeeded;
+    if (connection != null) {
+      final client = OnvifImagingClient(connection);
+      var result = await client.setImagingSettings(
+        ImagingSettings(irCutFilterMode: _videoModeToIrCutFilter(next)),
+      );
+      client.close();
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        result = await WanImagingClient(
+          thingName,
+        ).setDayNightMode(_videoModeToIrCutFilter(next));
+      }
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
+    if (!mounted) return;
+    setState(() => _isVideoModeShortcutBusy = false);
+    if (succeeded) {
+      widget.homesController.updateCamera(
+        camera.id,
+        (current) => current.copyWith(videoMode: next),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Failed to update video mode. Try again.'),
+        ),
+      );
+    }
   }
 
   /// The up-to-date [Camera], reflecting settings changes made elsewhere
@@ -376,7 +847,10 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
         osdPositioned(
           camera.bitrateOsdPosition,
           stackIndex: stackIndices[i++],
-          child: const BitrateBadge(key: Key('LIVE-029')),
+          child: BitrateBadge(
+            key: const Key('LIVE-029'),
+            configuredKbps: camera.bitrateKbps,
+          ),
         ),
       if (camera.signalStrengthOsdEnabled)
         osdPositioned(
@@ -385,7 +859,14 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
           child: SignalStrengthBadge(
             key: const Key('LIVE-030'),
             signalStrength: camera.signalStrength,
-            networkSpeedKbps: camera.networkSpeedKbps,
+            // Prefers the live-measured stream bitrate (real
+            // RTCPeerConnection.getStats() reading) over the persisted
+            // Camera.networkSpeedKbps, which only reflects whatever was
+            // last measured — avoids re-persisting a value that changes
+            // every couple of seconds into shared HomesController state.
+            networkSpeedKbps:
+                _liveViewController?.measuredBitrateKbps ??
+                camera.networkSpeedKbps,
           ),
         ),
     ];
@@ -451,7 +932,16 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        _connectivity.contains(ConnectivityResult.wifi)
+                        // Real measured throughput (same
+                        // RTCPeerConnection.getStats() reading LIVE-030
+                        // uses) appended when available — the actual rate
+                        // data is currently arriving at, on whichever
+                        // network the phone is on, not just which network
+                        // type it is. No measurement exists yet on WAN or
+                        // before the first two stats samples land.
+                        _liveViewController?.measuredBitrateKbps != null
+                            ? '${_connectivity.contains(ConnectivityResult.wifi) ? 'Wi-Fi' : 'Mobile data'} · ${formatBitrate(_liveViewController!.measuredBitrateKbps!)}'
+                            : _connectivity.contains(ConnectivityResult.wifi)
                             ? 'Wi-Fi'
                             : 'Mobile data',
                         style: Theme.of(context).textTheme.bodySmall,
@@ -480,7 +970,11 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                     if (camera.isOnline)
                       RepaintBoundary(
                         key: _videoBoundaryKey,
-                        child: _VideoSurface(controller: _videoController),
+                        child: _HeroVideo(
+                          videoController: _videoController,
+                          liveViewController: _liveViewController,
+                          showLiveView: _tabController.index == 0,
+                        ),
                       )
                     else
                       Positioned.fill(child: _OfflineThumbnail(camera: camera)),
@@ -494,7 +988,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                     ..._buildOsdTags(camera),
                     Positioned(
                       left: 8,
-                      bottom: 8,
+                      bottom: _cornerButtonBottomInset,
                       child: _VideoOverlayButton(
                         key: const Key('LIVE-007'),
                         tooltip: _isMuted ? 'Unmute' : 'Mute',
@@ -504,7 +998,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                     ),
                     Positioned(
                       right: 8,
-                      bottom: 8,
+                      bottom: _cornerButtonBottomInset,
                       child: _VideoOverlayButton(
                         key: const Key('LIVE-008'),
                         tooltip: 'Fullscreen',
@@ -512,6 +1006,22 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                         onPressed: camera.isOnline ? _openFullscreen : null,
                       ),
                     ),
+                    // Two-way talk (LIVE-011) stays on this same screen —
+                    // the video keeps playing behind this status bar rather
+                    // than being replaced by a separate full-screen call
+                    // page, so you can still see who/what you're talking to.
+                    if (_liveViewController != null &&
+                        _liveViewController!.talkStatus != TalkStatus.idle)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: _TalkStatusBar(
+                          key: const Key('TALK-001'),
+                          controller: _liveViewController!,
+                          onEnd: _toggleTalk,
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -532,13 +1042,23 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                       isEnabled: camera.isOnline,
                       isRecording: _isRecording,
                       recordingElapsed: _recordingElapsed,
-                      isTalking: _isTalking,
+                      isTalking:
+                          (_liveViewController?.talkStatus ??
+                              TalkStatus.idle) !=
+                          TalkStatus.idle,
                       isSpotlightOn: _isSpotlightOn,
+                      privacyMode: camera.privacyMode,
+                      isPrivacyShortcutBusy: _isPrivacyShortcutBusy,
+                      videoMode: camera.videoMode,
+                      isVideoModeShortcutBusy: _isVideoModeShortcutBusy,
                       onSnapshot: _takeSnapshot,
                       onRecord: _toggleRecording,
-                      onTalk: () => setState(() => _isTalking = !_isTalking),
+                      onTalk: _toggleTalk,
                       onSpotlight: () =>
                           setState(() => _isSpotlightOn = !_isSpotlightOn),
+                      onPrivacy: () => _togglePrivacyShortcut(camera),
+                      onVideoMode: () => _cycleVideoModeShortcut(camera),
+                      onAiMode: () => _openAiMode(camera),
                     ),
                     _PlaybackTab(
                       controller: _videoController,
@@ -704,6 +1224,173 @@ class _VideoSurface extends StatelessWidget {
   }
 }
 
+/// Small "Remote" chip shown over the video whenever the current session is
+/// playing over WAN (KVS/HLS) rather than the LAN WebRTC path — the two have
+/// materially different latency (STREAMING_GUIDE.md §1: sub-second on LAN
+/// vs. several seconds on WAN), so it's worth surfacing which one is active
+/// rather than leaving that invisible.
+class _RemoteStreamBadge extends StatelessWidget {
+  const _RemoteStreamBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.cloud_outlined, color: Colors.white, size: 14),
+            SizedBox(width: 4),
+            Text(
+              'Remote',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Picks between the real LAN WebRTC live feed ([liveViewController], shown
+/// when [showLiveView] is true and a controller exists) and the dummy-asset
+/// fallback (`_VideoSurface(videoController)`) — used for the Playback tab,
+/// and for any camera with no saved LAN connection yet (same
+/// falls-back-to-local-state convention as every other camera-settings
+/// screen). Reused by both the inline hero video area and
+/// [_FullscreenVideo] so fullscreen shows whatever was already on screen.
+class _HeroVideo extends StatelessWidget {
+  const _HeroVideo({
+    required this.videoController,
+    required this.liveViewController,
+    required this.showLiveView,
+  });
+
+  final VideoPlayerController videoController;
+  final LiveViewController? liveViewController;
+  final bool showLiveView;
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = liveViewController;
+    if (!showLiveView || controller == null) {
+      return _VideoSurface(controller: videoController);
+    }
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        switch (controller.status) {
+          case LiveViewStatus.connecting:
+          case LiveViewStatus.reconnecting:
+            return ColoredBox(
+              color: Colors.black,
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(color: Colors.white),
+                    const SizedBox(height: 12),
+                    Text(
+                      controller.status == LiveViewStatus.reconnecting
+                          ? 'Reconnecting…'
+                          : 'Connecting…',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          case LiveViewStatus.connected:
+            final wanController = controller.wanVideoController;
+            if (controller.transport == LiveViewTransport.wan &&
+                wanController != null) {
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  _VideoSurface(controller: wanController),
+                  const Positioned(
+                    top: 8,
+                    left: 8,
+                    child: _RemoteStreamBadge(),
+                  ),
+                ],
+              );
+            }
+            return RTCVideoView(
+              controller.renderer,
+              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            );
+          case LiveViewStatus.failed:
+            return ColoredBox(
+              color: Colors.black,
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.wifi_off, color: Colors.white70, size: 32),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Camera Offline',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Retrying automatically…',
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      onPressed: controller.connect,
+                      child: const Text('Retry now'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          case LiveViewStatus.stopped:
+            return ColoredBox(
+              color: Colors.black,
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.wifi_off, color: Colors.white70, size: 32),
+                    const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24),
+                      child: Text(
+                        controller.errorMessage ?? "Couldn't connect to camera",
+                        style: const TextStyle(color: Colors.white70),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      onPressed: controller.connect,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+        }
+      },
+    );
+  }
+}
+
 class _LiveControls extends StatelessWidget {
   const _LiveControls({
     required this.isEnabled,
@@ -711,10 +1398,17 @@ class _LiveControls extends StatelessWidget {
     required this.recordingElapsed,
     required this.isTalking,
     required this.isSpotlightOn,
+    required this.privacyMode,
+    required this.isPrivacyShortcutBusy,
+    required this.videoMode,
+    required this.isVideoModeShortcutBusy,
     required this.onSnapshot,
     required this.onRecord,
     required this.onTalk,
     required this.onSpotlight,
+    required this.onPrivacy,
+    required this.onVideoMode,
+    required this.onAiMode,
   });
 
   final bool isEnabled;
@@ -722,10 +1416,17 @@ class _LiveControls extends StatelessWidget {
   final Duration recordingElapsed;
   final bool isTalking;
   final bool isSpotlightOn;
+  final CameraPrivacyMode privacyMode;
+  final bool isPrivacyShortcutBusy;
+  final CameraVideoMode videoMode;
+  final bool isVideoModeShortcutBusy;
   final VoidCallback onSnapshot;
   final VoidCallback onRecord;
   final VoidCallback onTalk;
   final VoidCallback onSpotlight;
+  final VoidCallback onPrivacy;
+  final VoidCallback onVideoMode;
+  final VoidCallback onAiMode;
 
   String _formatElapsed(Duration d) {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
@@ -739,51 +1440,114 @@ class _LiveControls extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       child: Align(
         alignment: Alignment.topCenter,
-        child: Row(
+        child: Column(
           children: [
-            Expanded(
-              child: _ControlTile(
-                key: const Key('LIVE-009'),
-                label: 'Snapshot',
-                icon: Icons.camera_alt_outlined,
-                onPressed: isEnabled ? onSnapshot : null,
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-009'),
+                    label: 'Snapshot',
+                    icon: Icons.camera_alt_outlined,
+                    onPressed: isEnabled ? onSnapshot : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-010'),
+                    label: isRecording
+                        ? _formatElapsed(recordingElapsed)
+                        : 'Record',
+                    icon: isRecording
+                        ? Icons.stop_circle
+                        : Icons.fiber_manual_record,
+                    color: isRecording ? AppColors.offline : null,
+                    onPressed: isEnabled ? onRecord : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-011'),
+                    label: isTalking ? 'Stop talking' : 'Talk',
+                    icon: isTalking ? Icons.mic : Icons.mic_none,
+                    color: isTalking ? AppColors.cyan : null,
+                    onPressed: isEnabled ? onTalk : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-018'),
+                    label: isSpotlightOn ? 'Spotlight off' : 'Spotlight',
+                    icon: isSpotlightOn
+                        ? Icons.flashlight_on
+                        : Icons.flashlight_off_outlined,
+                    color: isSpotlightOn ? Colors.amber : null,
+                    onPressed: isEnabled ? onSpotlight : null,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _ControlTile(
-                key: const Key('LIVE-010'),
-                label: isRecording
-                    ? _formatElapsed(recordingElapsed)
-                    : 'Record',
-                icon: isRecording
-                    ? Icons.stop_circle
-                    : Icons.fiber_manual_record,
-                color: isRecording ? AppColors.offline : null,
-                onPressed: isEnabled ? onRecord : null,
-              ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-041'),
+                    label: switch (privacyMode) {
+                      CameraPrivacyMode.off => 'Privacy Off',
+                      CameraPrivacyMode.full => 'Privacy Full',
+                      CameraPrivacyMode.zone => 'Privacy Zone',
+                    },
+                    icon: switch (privacyMode) {
+                      CameraPrivacyMode.off => Icons.visibility_outlined,
+                      CameraPrivacyMode.full => Icons.visibility_off,
+                      CameraPrivacyMode.zone => Icons.crop_square,
+                    },
+                    color: privacyMode == CameraPrivacyMode.off
+                        ? null
+                        : AppColors.offline,
+                    onPressed: (isEnabled && !isPrivacyShortcutBusy)
+                        ? onPrivacy
+                        : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-042'),
+                    label: switch (videoMode) {
+                      CameraVideoMode.day => 'Day',
+                      CameraVideoMode.auto => 'Auto',
+                      CameraVideoMode.night => 'Night',
+                    },
+                    icon: switch (videoMode) {
+                      CameraVideoMode.day => Icons.wb_sunny,
+                      CameraVideoMode.auto => Icons.brightness_auto,
+                      CameraVideoMode.night => Icons.nightlight_round,
+                    },
+                    onPressed: (isEnabled && !isVideoModeShortcutBusy)
+                        ? onVideoMode
+                        : null,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _ControlTile(
-                key: const Key('LIVE-011'),
-                label: isTalking ? 'Stop talking' : 'Talk',
-                icon: isTalking ? Icons.mic : Icons.mic_none,
-                color: isTalking ? AppColors.cyan : null,
-                onPressed: isEnabled ? onTalk : null,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _ControlTile(
-                key: const Key('LIVE-018'),
-                label: isSpotlightOn ? 'Spotlight off' : 'Spotlight',
-                icon: isSpotlightOn
-                    ? Icons.flashlight_on
-                    : Icons.flashlight_off_outlined,
-                color: isSpotlightOn ? Colors.amber : null,
-                onPressed: isEnabled ? onSpotlight : null,
-              ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: _ControlTile(
+                    key: const Key('LIVE-043'),
+                    label: 'AI Mode',
+                    icon: Icons.auto_awesome_outlined,
+                    color: AppColors.cyan,
+                    onPressed: isEnabled ? onAiMode : null,
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -1251,14 +2015,109 @@ class _ContinueRecordingDialogState extends State<_ContinueRecordingDialog> {
   }
 }
 
+/// Inline two-way-talk status bar (TALK-001) — overlaid at the bottom edge
+/// of the video (not a separate full-screen page) so the feed stays
+/// visible throughout a call, per user feedback that a full-screen panel
+/// hides exactly what you'd want to see while talking to someone on
+/// camera. Still implements `TWO_WAY_TALK_GUIDE.md` §5's call-style
+/// contract — a distinct connecting/talking/busy/error state (not just a
+/// spinner-or-not toggle) and a speakerphone control — just docked inline
+/// instead of taking over the screen. [_CameraLiveScreenState._toggleTalk]
+/// is what actually starts/ends the session and funnels every exit path
+/// (this bar's End button, or just leaving the screen) through
+/// [LiveViewController.endTalk]/`stop()`.
+class _TalkStatusBar extends StatelessWidget {
+  const _TalkStatusBar({
+    super.key,
+    required this.controller,
+    required this.onEnd,
+  });
+
+  final LiveViewController controller;
+  final VoidCallback onEnd;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = controller.talkStatus;
+    final speakerphoneOn = controller.speakerphoneOn;
+
+    return ColoredBox(
+      color: Colors.black.withValues(alpha: 0.72),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                key: const Key('TALK-002'),
+                switch (status) {
+                  TalkStatus.connecting => Icons.phone_in_talk_outlined,
+                  TalkStatus.talking => Icons.mic,
+                  TalkStatus.busy => Icons.person_off_outlined,
+                  TalkStatus.error => Icons.error_outline,
+                  TalkStatus.idle => Icons.mic_none,
+                },
+                size: 20,
+                color: switch (status) {
+                  TalkStatus.talking => AppColors.cyan,
+                  TalkStatus.busy || TalkStatus.error => AppColors.offline,
+                  TalkStatus.connecting || TalkStatus.idle => Colors.white70,
+                },
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  key: const Key('TALK-003'),
+                  switch (status) {
+                    TalkStatus.connecting => 'Calling…',
+                    TalkStatus.talking => 'Talking',
+                    TalkStatus.busy =>
+                      "Camera's busy — someone else is talking",
+                    TalkStatus.error =>
+                      controller.talkErrorMessage ?? 'Something went wrong',
+                    TalkStatus.idle => 'Ending…',
+                  },
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (status == TalkStatus.talking)
+                IconButton(
+                  key: const Key('TALK-004'),
+                  tooltip: speakerphoneOn ? 'Speaker on' : 'Speaker off',
+                  color: speakerphoneOn ? AppColors.cyan : Colors.white70,
+                  icon: const Icon(Icons.volume_up),
+                  onPressed: () =>
+                      controller.setSpeakerphoneOn(!speakerphoneOn),
+                ),
+              IconButton(
+                key: const Key('TALK-005'),
+                tooltip: 'End',
+                color: AppColors.offline,
+                icon: const Icon(Icons.call_end),
+                onPressed: onEnd,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _FullscreenVideo extends StatefulWidget {
   const _FullscreenVideo({
     required this.controller,
+    required this.liveViewController,
+    required this.showLiveView,
     required this.isMuted,
     required this.onMuteChanged,
   });
 
   final VideoPlayerController controller;
+  final LiveViewController? liveViewController;
+  final bool showLiveView;
   final bool isMuted;
   final ValueChanged<bool> onMuteChanged;
 
@@ -1273,6 +2132,10 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
     setState(() {
       _isMuted = !_isMuted;
       widget.controller.setVolume(_isMuted ? 0 : 1);
+      widget.liveViewController?.setAudioEnabled(!_isMuted);
+      widget.liveViewController?.wanVideoController?.setVolume(
+        _isMuted ? 0 : 1,
+      );
     });
     widget.onMuteChanged(_isMuted);
   }
@@ -1284,7 +2147,13 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
       body: SafeArea(
         child: Stack(
           children: [
-            Center(child: _VideoSurface(controller: widget.controller)),
+            Center(
+              child: _HeroVideo(
+                videoController: widget.controller,
+                liveViewController: widget.liveViewController,
+                showLiveView: widget.showLiveView,
+              ),
+            ),
             Positioned(
               bottom: 8,
               left: 8,

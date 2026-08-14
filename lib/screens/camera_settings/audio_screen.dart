@@ -13,10 +13,16 @@ import '../../widgets/settings_save_button.dart';
 /// track), speaker volume, microphone gain, and a test-sound action. Record
 /// Audio is independent of the volume sliders, which affect two-way talk and
 /// warning playback, not what gets recorded. Backed by real `camera_api`
-/// (`AudioCapabilityClient`/`AudioVolumeClient`/`SpeakerVolumeClient`, LAN
-/// only — same "no WAN fallback wired up yet" gap as every other settings
-/// screen so far) when the camera has a saved connection, falling back to
-/// local-only `HomesController` state (`simulateCameraSave`) otherwise.
+/// (`AudioCapabilityClient`/`AudioVolumeClient`/`SpeakerVolumeClient` over
+/// LAN, `WanAudioVolumeClient`/`WanSpeakerVolumeClient` over WAN) when the
+/// camera has a saved connection, falling back to local-only
+/// `HomesController` state (`simulateCameraSave`) otherwise. LAN is always
+/// tried first for every read/write; a WAN retry only kicks in when the LAN
+/// call itself fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// `AudioCapabilityClient`'s hasMicrophone/hasSpeaker gate is LAN-only
+/// (no WAN capability query exists) — unverified (no connection, or LAN
+/// unreachable) shows every control, same fallback reasoning as elsewhere.
 /// Speaker volume / mic gain controls are hidden (not disabled) when the
 /// camera's own `AudioCapabilityClient.getAudioCapability()` reports no
 /// speaker/microphone hardware, per
@@ -93,54 +99,82 @@ class _AudioScreenState extends State<AudioScreen> {
 
     final futures = <Future<void>>[];
     if (capability?.hasMicrophone ?? true) {
-      final volumeClient = AudioVolumeClient(connection);
-      futures.add(
-        Future(() async {
-          final results = await Future.wait([
-            volumeClient.getMicGain(),
-            volumeClient.isAudioRecordingEnabled(),
-          ]);
-          volumeClient.close();
-          if (!mounted) return;
-          setState(() {
-            if (results[0] case CameraSuccess<int>(:final value)) {
-              _micGain = value.toDouble();
-            }
-            if (results[1] case CameraSuccess<bool>(:final value)) {
-              _audioRecordingEnabled = value;
-            }
-          });
-          widget.homesController.updateCamera(
-            widget.camera.id,
-            (camera) => camera.copyWith(
-              micGain: _micGain,
-              audioRecordingEnabled: _audioRecordingEnabled,
-            ),
-          );
-        }),
-      );
+      futures.add(_loadMicrophoneState(connection));
     }
     if (capability?.hasSpeaker ?? true) {
-      final speakerClient = SpeakerVolumeClient(connection);
-      futures.add(
-        Future(() async {
-          final result = await speakerClient.getSpeakerVolume();
-          speakerClient.close();
-          if (!mounted) return;
-          if (result case CameraSuccess<SpeakerVolume>(:final value)) {
-            setState(() {
-              _speakerVolumeConfig = value;
-              _speakerVolume = value.outputLevel.toDouble();
-            });
-            widget.homesController.updateCamera(
-              widget.camera.id,
-              (camera) => camera.copyWith(speakerVolume: _speakerVolume),
-            );
-          }
-        }),
-      );
+      futures.add(_loadSpeakerState(connection));
     }
     await Future.wait(futures);
+  }
+
+  Future<void> _loadMicrophoneState(CameraConnection connection) async {
+    final volumeClient = AudioVolumeClient(connection);
+    var micGainResult = await volumeClient.getMicGain();
+    var recordingResult = await volumeClient.isAudioRecordingEnabled();
+    volumeClient.close();
+
+    final thingName = connection.thingName;
+    if (thingName != null) {
+      final wanAudio = WanAudioVolumeClient(thingName);
+      if (micGainResult is! CameraSuccess) {
+        micGainResult = await wanAudio.getMicGain();
+      }
+      if (recordingResult is! CameraSuccess) {
+        recordingResult = await wanAudio.isAudioRecordingEnabled();
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      if (micGainResult case CameraSuccess<int>(:final value)) {
+        _micGain = value.toDouble();
+      }
+      if (recordingResult case CameraSuccess<bool>(:final value)) {
+        _audioRecordingEnabled = value;
+      }
+    });
+    widget.homesController.updateCamera(
+      widget.camera.id,
+      (camera) => camera.copyWith(
+        micGain: _micGain,
+        audioRecordingEnabled: _audioRecordingEnabled,
+      ),
+    );
+  }
+
+  Future<void> _loadSpeakerState(CameraConnection connection) async {
+    final speakerClient = SpeakerVolumeClient(connection);
+    final result = await speakerClient.getSpeakerVolume();
+    speakerClient.close();
+
+    if (result case CameraSuccess<SpeakerVolume>(:final value)) {
+      if (!mounted) return;
+      setState(() {
+        _speakerVolumeConfig = value;
+        _speakerVolume = value.outputLevel.toDouble();
+      });
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (camera) => camera.copyWith(speakerVolume: _speakerVolume),
+      );
+      return;
+    }
+
+    // LAN failed — no ONVIF SpeakerVolume struct available this session
+    // (it's only used to echo token/name/outputToken back to SetSpeakerVolume
+    // over LAN); WAN's plain-int GetSpeakerVolume doesn't need one.
+    final thingName = connection.thingName;
+    if (thingName == null) return;
+    final wanResult = await WanSpeakerVolumeClient(
+      thingName,
+    ).getSpeakerVolume();
+    if (!mounted) return;
+    if (wanResult case CameraSuccess<int>(:final value)) {
+      setState(() => _speakerVolume = value.toDouble());
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (camera) => camera.copyWith(speakerVolume: _speakerVolume),
+      );
+    }
   }
 
   void _markDirty(VoidCallback update) {
@@ -159,26 +193,60 @@ class _AudioScreenState extends State<AudioScreen> {
       final results = <CameraResult<void>>[];
       final hasMicrophone = _audioCapability?.hasMicrophone ?? true;
       final hasSpeaker = _audioCapability?.hasSpeaker ?? true;
+      final thingName = connection.thingName;
 
       if (hasMicrophone) {
         final volumeClient = AudioVolumeClient(connection);
-        results.add(await volumeClient.setMicGain(_micGain.round()));
-        results.add(
-          await volumeClient.setAudioRecordingEnabled(_audioRecordingEnabled),
+        var micGainResult = await volumeClient.setMicGain(_micGain.round());
+        var recordingResult = await volumeClient.setAudioRecordingEnabled(
+          _audioRecordingEnabled,
         );
         volumeClient.close();
+
+        // A failed LAN Apply/Set retries over WAN before surfacing an
+        // error, per mobile-app-screen-conventions.md's LAN/WAN convention.
+        if (thingName != null) {
+          final wanAudio = WanAudioVolumeClient(thingName);
+          if (micGainResult is! CameraSuccess) {
+            micGainResult = await wanAudio.setMicGain(_micGain.round());
+          }
+          if (recordingResult is! CameraSuccess) {
+            recordingResult = await wanAudio.setAudioRecordingEnabled(
+              _audioRecordingEnabled,
+            );
+          }
+        }
+        results.add(micGainResult);
+        results.add(recordingResult);
       }
       if (hasSpeaker) {
         final speakerConfig = _speakerVolumeConfig;
+        final CameraResult<void> speakerResult;
         if (speakerConfig != null) {
           final speakerClient = SpeakerVolumeClient(connection);
-          results.add(
-            await speakerClient.setSpeakerVolume(
-              speakerConfig.withLevel(_speakerVolume.round()),
-            ),
+          var result = await speakerClient.setSpeakerVolume(
+            speakerConfig.withLevel(_speakerVolume.round()),
           );
           speakerClient.close();
+          if (result is! CameraSuccess && thingName != null) {
+            result = await WanSpeakerVolumeClient(
+              thingName,
+            ).setSpeakerVolume(_speakerVolume.round());
+          }
+          speakerResult = result;
+        } else if (thingName != null) {
+          // No LAN-loaded ONVIF SpeakerVolume struct this session (LAN
+          // never reachable) — WAN's plain-int SetSpeakerVolume doesn't
+          // need one.
+          speakerResult = await WanSpeakerVolumeClient(
+            thingName,
+          ).setSpeakerVolume(_speakerVolume.round());
+        } else {
+          speakerResult = const CameraFailure(
+            'No speaker configuration loaded',
+          );
         }
+        results.add(speakerResult);
       }
       succeeded = results.every((r) => r is CameraSuccess);
     } else {
@@ -215,8 +283,12 @@ class _AudioScreenState extends State<AudioScreen> {
     final connection = _camera.connection;
     if (connection != null) {
       final volumeClient = AudioVolumeClient(connection);
-      await volumeClient.playTestSound();
+      final result = await volumeClient.playTestSound();
       volumeClient.close();
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        await WanAudioVolumeClient(thingName).playTestSound();
+      }
     } else {
       await Future<void>.delayed(const Duration(seconds: 2));
     }

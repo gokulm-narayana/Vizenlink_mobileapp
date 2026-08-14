@@ -99,8 +99,13 @@ List<T> _optionsOrFallback<T>(Iterable<T>? real, T current, List<T> fallback) {
 /// `getVideoEncoderSettingsOptions()` response per encoding (H264/H265 can
 /// report different bounds/profile lists/resolution choices), never a
 /// hardcoded assumption. Falls back to local-only `HomesController` state
-/// (`simulateCameraSave`) for a camera with no saved connection yet. WAN
-/// fallback (`WanVideoEncoderClient`) isn't wired up yet.
+/// (`simulateCameraSave`) for a camera with no saved connection yet. LAN is
+/// always tried first for both load and save; a WAN retry
+/// (`WanVideoEncoderClient`) only kicks in when the LAN call itself
+/// fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// Per that same convention, WAN Options are never fetched on a normal
+/// load — only the current-value settings read gets a WAN fallback there.
 class VideoEncoderScreen extends StatefulWidget {
   const VideoEncoderScreen({
     super.key,
@@ -171,11 +176,20 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
       client.getVideoEncoderSettingsOptions(),
     ]);
     client.close();
-    if (!mounted) return;
 
-    final settingsResult = results[0] as CameraResult<VideoEncoderSettings>;
+    var settingsResult = results[0] as CameraResult<VideoEncoderSettings>;
     final optionsResult =
         results[1] as CameraResult<VideoEncoderSettingsOptions>;
+
+    // Options are LAN-only on a normal load (see this class's doc comment)
+    // — only the current-value settings read falls back to WAN here.
+    final thingName = connection.thingName;
+    if (settingsResult is! CameraSuccess && thingName != null) {
+      settingsResult = await WanVideoEncoderClient(
+        thingName,
+      ).getVideoEncoderSettings();
+    }
+    if (!mounted) return;
 
     setState(() {
       if (settingsResult case CameraSuccess(:final value)) {
@@ -264,21 +278,36 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
           }
         }
       }
-      final result = await client.setVideoEncoderSettings(
-        VideoEncoderSettings(
-          bitrate: _bitrateKbps.round(),
-          frameRate: _frameRate.round(),
-          govLength: _gov.round(),
-          quality: _quality.round(),
-          encoderProfile: _encoderProfileToWire(_profile),
-          width: width,
-          height: height,
-          encoding: _encoderTypeToWire(_encoder),
-          cbr: _bitrateMode == CameraBitrateMode.cbr,
-        ),
+      final settings = VideoEncoderSettings(
+        bitrate: _bitrateKbps.round(),
+        frameRate: _frameRate.round(),
+        govLength: _gov.round(),
+        quality: _quality.round(),
+        encoderProfile: _encoderProfileToWire(_profile),
+        width: width,
+        height: height,
+        encoding: _encoderTypeToWire(_encoder),
+        cbr: _bitrateMode == CameraBitrateMode.cbr,
       );
+      final result = await client.setVideoEncoderSettings(settings);
       client.close();
-      succeeded = result is CameraSuccess;
+
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention. WAN's
+      // setVideoEncoderSettings returns the applied VideoEncoderSettings
+      // rather than void, unlike the LAN client — only its success/failure
+      // matters here, not the returned value.
+      final thingName = connection.thingName;
+      if (result is CameraSuccess) {
+        succeeded = true;
+      } else if (thingName != null) {
+        final wanResult = await WanVideoEncoderClient(
+          thingName,
+        ).setVideoEncoderSettings(settings);
+        succeeded = wanResult is CameraSuccess;
+      } else {
+        succeeded = false;
+      }
     } else {
       succeeded = await simulateCameraSave();
     }

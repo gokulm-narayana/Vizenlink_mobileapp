@@ -131,6 +131,8 @@ class Camera {
     this.wdrLevel = 50,
     this.whiteBalance = CameraAutoManual.auto,
     this.exposure = CameraAutoManual.auto,
+    this.exposureTime = 10000,
+    this.exposureGain = 0,
     this.videoResolution = CameraResolution.p1080,
     this.encoderType = CameraEncoderType.h264,
     this.encoderProfile = CameraEncoderProfile.main,
@@ -252,6 +254,13 @@ class Camera {
   final double wdrLevel;
   final CameraAutoManual whiteBalance;
   final CameraAutoManual exposure;
+
+  /// ONVIF `ExposureTime`/`Gain` — only meaningful when [exposure] is
+  /// [CameraAutoManual.manual]; ignored by the camera in Auto mode. Units
+  /// match `ImagingSettings.exposureTime`/`exposureGain`'s wire values
+  /// (microseconds / dB), not independently re-derived here.
+  final double exposureTime;
+  final double exposureGain;
   final CameraResolution videoResolution;
   final CameraEncoderType encoderType;
   final CameraEncoderProfile encoderProfile;
@@ -391,6 +400,7 @@ class Camera {
     String? room,
     bool setRoom = false,
     String? thumbnailUrl,
+    DateTime? lastSeen,
     String? timezone,
     RecordingStatus? recordingStatus,
     List<RecordingScheduleWindow>? recordingScheduleWindows,
@@ -429,6 +439,8 @@ class Camera {
     double? wdrLevel,
     CameraAutoManual? whiteBalance,
     CameraAutoManual? exposure,
+    double? exposureTime,
+    double? exposureGain,
     CameraResolution? videoResolution,
     CameraEncoderType? encoderType,
     CameraEncoderProfile? encoderProfile,
@@ -472,7 +484,7 @@ class Camera {
       isFavorite: isFavorite ?? this.isFavorite,
       isPinned: isPinned ?? this.isPinned,
       thumbnailUrl: thumbnailUrl ?? this.thumbnailUrl,
-      lastSeen: lastSeen,
+      lastSeen: lastSeen ?? this.lastSeen,
       timezone: timezone ?? this.timezone,
       recordingStatus: recordingStatus ?? this.recordingStatus,
       recordingScheduleWindows:
@@ -516,6 +528,8 @@ class Camera {
       wdrLevel: wdrLevel ?? this.wdrLevel,
       whiteBalance: whiteBalance ?? this.whiteBalance,
       exposure: exposure ?? this.exposure,
+      exposureTime: exposureTime ?? this.exposureTime,
+      exposureGain: exposureGain ?? this.exposureGain,
       videoResolution: videoResolution ?? this.videoResolution,
       encoderType: encoderType ?? this.encoderType,
       encoderProfile: encoderProfile ?? this.encoderProfile,

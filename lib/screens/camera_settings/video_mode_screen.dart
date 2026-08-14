@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -35,8 +36,12 @@ CameraVideoMode? _irCutFilterToVideoMode(String? wireValue) =>
 /// Video Mode: preview thumbnail plus Day/Auto/Night selection, backed by
 /// ONVIF's `IrCutFilter` setting (`OnvifImagingClient`) when this camera has
 /// a saved connection — falls back to local-only `HomesController` state
-/// (via `simulateCameraSave`) otherwise, same as before. WAN fallback
-/// (`WanImagingClient.getDayNightMode`/`setDayNightMode`) isn't wired up yet.
+/// (via `simulateCameraSave`) otherwise, same as before. LAN is always tried
+/// first for both load and save; a WAN retry (`WanImagingClient
+/// .getDayNightMode`/`getImagingOptions`/`setDayNightMode`) only kicks in
+/// when the LAN call itself fails/times out and `connection.thingName` is
+/// known, per `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN
+/// convention.
 class VideoModeScreen extends StatefulWidget {
   const VideoModeScreen({
     super.key,
@@ -60,6 +65,13 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
+  /// fails — never persisted (see `fetchWanPreviewSnapshot`'s doc), just
+  /// held here for as long as this screen is open. Cleared once a LAN
+  /// refresh succeeds again, so the persisted (and now fresher) thumbnail
+  /// takes back over.
+  Uint8List? _wanPreviewBytes;
+
   /// The camera's own supported `IrCutFilter` values (`OnvifImagingClient
   /// .getImagingOptions`), fetched once a connection is available. Null
   /// means "camera not verified yet" — show every tile rather than none,
@@ -81,14 +93,29 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
       client.getImagingOptions(),
     ]);
     client.close();
-    if (!mounted) return;
 
     final settingsResult = results[0] as CameraResult<ImagingSettings>;
     final optionsResult = results[1] as CameraResult<ImagingOptions>;
 
+    // Options/capability queries are LAN-only on a normal load — WAN
+    // Options are only ever fetched as a recovery step right after a failed
+    // WAN Set (see _save), not here — per
+    // .claude/rules/mobile-app-screen-conventions.md item 4. Only the
+    // current-value read gets a WAN fallback.
+    final thingName = connection.thingName;
+    String? wanMode;
+    if (settingsResult is! CameraSuccess && thingName != null) {
+      final wanResult = await WanImagingClient(thingName).getDayNightMode();
+      if (wanResult case CameraSuccess(:final value)) wanMode = value;
+    }
+    if (!mounted) return;
+
     setState(() {
       if (settingsResult case CameraSuccess(:final value)) {
         final mode = _irCutFilterToVideoMode(value.irCutFilterMode);
+        if (mode != null) _mode = mode;
+      } else if (wanMode != null) {
+        final mode = _irCutFilterToVideoMode(wanMode);
         if (mode != null) _mode = mode;
       }
       if (optionsResult case CameraSuccess(:final value)) {
@@ -96,7 +123,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
       }
     });
 
-    if (settingsResult case CameraSuccess()) {
+    if (settingsResult is CameraSuccess || wanMode != null) {
       widget.homesController.updateCamera(
         widget.camera.id,
         (camera) => camera.copyWith(videoMode: _mode),
@@ -141,11 +168,27 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention. The last-shown preview (whether the persisted
+    // thumbnail or a previous WAN frame) stays on screen until this
+    // resolves, not blanked out mid-refresh.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -159,10 +202,19 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
     final bool succeeded;
     if (connection != null) {
       final client = OnvifImagingClient(connection);
-      final result = await client.setImagingSettings(
+      var result = await client.setImagingSettings(
         ImagingSettings(irCutFilterMode: _videoModeToIrCutFilter(_mode)),
       );
       client.close();
+
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        result = await WanImagingClient(
+          thingName,
+        ).setDayNightMode(_videoModeToIrCutFilter(_mode));
+      }
       succeeded = result is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();
@@ -226,6 +278,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('VIDMODE-003'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(

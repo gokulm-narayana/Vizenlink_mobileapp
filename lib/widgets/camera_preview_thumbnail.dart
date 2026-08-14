@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../models/camera.dart';
@@ -13,10 +15,18 @@ class CameraPreviewThumbnail extends StatelessWidget {
     super.key,
     required this.settingsKey,
     required this.camera,
+    this.overrideBytes,
   });
 
   final Key settingsKey;
   final Camera camera;
+
+  /// A transient, un-persisted frame (e.g. a decrypted WAN preview snapshot
+  /// — see `camera_sync.dart`'s `fetchWanPreviewSnapshot` doc for why this
+  /// must never be written to `Camera.thumbnailUrl`/disk) to show instead
+  /// of [camera]'s normal cached thumbnail, for as long as the caller holds
+  /// onto it in local widget state. Null shows the normal cached thumbnail.
+  final Uint8List? overrideBytes;
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +37,11 @@ class CameraPreviewThumbnail extends StatelessWidget {
         aspectRatio: 16 / 9,
         child: ClipRRect(
           borderRadius: BorderRadius.circular(20),
-          child: _CameraPreviewImage(settingsKey: settingsKey, camera: camera),
+          child: _CameraPreviewImage(
+            settingsKey: settingsKey,
+            camera: camera,
+            overrideBytes: overrideBytes,
+          ),
         ),
       ),
     );
@@ -35,16 +49,29 @@ class CameraPreviewThumbnail extends StatelessWidget {
 }
 
 class _CameraPreviewImage extends StatelessWidget {
-  const _CameraPreviewImage({required this.settingsKey, required this.camera});
+  const _CameraPreviewImage({
+    required this.settingsKey,
+    required this.camera,
+    this.overrideBytes,
+  });
 
   final Key settingsKey;
   final Camera camera;
+  final Uint8List? overrideBytes;
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bytes = overrideBytes;
     final thumbnailUrl = camera.thumbnailUrl;
+
+    if (bytes != null) {
+      return KeyedSubtree(
+        key: settingsKey,
+        child: Image.memory(bytes, fit: BoxFit.cover, gaplessPlayback: true),
+      );
+    }
 
     if (thumbnailUrl == null) {
       return KeyedSubtree(

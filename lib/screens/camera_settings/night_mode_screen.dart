@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -33,7 +34,10 @@ CameraNightMode _typeToNightMode(NightVisionType type) => switch (type) {
 /// backed by `NightVisionClient` (`GetNightVisionType`/`SetNightVisionType`)
 /// when this camera has a saved connection — falls back to local-only
 /// `HomesController` state (via `simulateCameraSave`) otherwise, same as
-/// before. WAN fallback (`WanNightVisionClient`) isn't wired up yet.
+/// before. LAN is always tried first for both load and save; a WAN retry
+/// (`WanNightVisionClient`) only kicks in when the LAN call itself
+/// fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
 class NightModeScreen extends StatefulWidget {
   const NightModeScreen({
     super.key,
@@ -57,6 +61,13 @@ class _NightModeScreenState extends State<NightModeScreen> {
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
+  /// fails — never persisted (see `fetchWanPreviewSnapshot`'s doc), just
+  /// held here for as long as this screen is open. Cleared once a LAN
+  /// refresh succeeds again, so the persisted (and now fresher) thumbnail
+  /// takes back over.
+  Uint8List? _wanPreviewBytes;
+
   /// Hardware/firmware capability flags from the camera's own
   /// `GetNightVisionType` response — null means "camera not verified yet",
   /// in which case every tile shows (same fallback reasoning as
@@ -76,8 +87,13 @@ class _NightModeScreenState extends State<NightModeScreen> {
     final connection = _camera.connection;
     if (connection == null) return;
     final nuraeye = NuraeyeClient(connection);
-    final result = await NightVisionClient(nuraeye).getNightVisionType();
+    var result = await NightVisionClient(nuraeye).getNightVisionType();
     nuraeye.close();
+
+    final thingName = connection.thingName;
+    if (result is! CameraSuccess && thingName != null) {
+      result = await WanNightVisionClient(thingName).getNightVisionType();
+    }
     if (!mounted) return;
     if (result case CameraSuccess(:final value)) {
       setState(() {
@@ -133,11 +149,27 @@ class _NightModeScreenState extends State<NightModeScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention. The last-shown preview (whether the persisted
+    // thumbnail or a previous WAN frame) stays on screen until this
+    // resolves, not blanked out mid-refresh.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -151,10 +183,19 @@ class _NightModeScreenState extends State<NightModeScreen> {
     final bool succeeded;
     if (connection != null) {
       final nuraeye = NuraeyeClient(connection);
-      final result = await NightVisionClient(
+      var result = await NightVisionClient(
         nuraeye,
       ).setNightVisionType(_nightModeToType(_mode));
       nuraeye.close();
+
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        result = await WanNightVisionClient(
+          thingName,
+        ).setNightVisionType(_nightModeToType(_mode));
+      }
       succeeded = result is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();
@@ -218,6 +259,7 @@ class _NightModeScreenState extends State<NightModeScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('NIGHT-005'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(

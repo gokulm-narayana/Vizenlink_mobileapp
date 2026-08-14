@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -15,6 +16,13 @@ import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/refresh_preview_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
+
+/// ONVIF's fixed `tt:Colorspace` URI for RGB (`onvif_types.h`'s
+/// `OnvifOSDColorspaceEnum`) — no longer exported by `camera_api` as of the
+/// latest client package drop (was `kOnvifColorspaceRgb`), but this is a
+/// fixed spec value, not camera-specific, so a local constant is fine
+/// instead of touching the package.
+const _kOnvifColorspaceRgb = 'http://www.onvif.org/ver10/colorspace/RGB';
 
 enum _DateFormat { ymd, dmy, mdy }
 
@@ -124,7 +132,7 @@ OsdColor _colorToWire(Color color) => OsdColor(
   x: color.r,
   y: color.g,
   z: color.b,
-  colorspace: kOnvifColorspaceRgb,
+  colorspace: _kOnvifColorspaceRgb,
 );
 
 /// Fallback wire strings, used only when the camera hasn't reported a real
@@ -149,49 +157,97 @@ const _timeFormatWireByEnum = {
   _TimeFormat.h12: kOsdDefaultTimeFormat,
 };
 
-/// Resolves [format] to one of the camera's own reported `dateFormats`
-/// (matched by token order — y/M/d — since the two vocabularies otherwise
-/// don't correspond), falling back to `_dateFormatWireByEnum`'s guess only
-/// when the camera hasn't reported a real list. Always prefer a real
-/// reported string over an invented one — see this file's `OsdOptions`
-/// comment for why the guess alone isn't safe to send.
+/// Whether [wire] (one of the camera's own reported `dateFormats` strings)
+/// matches [format]'s y/M/d token order — the two vocabularies otherwise
+/// don't correspond directly, so this is the shared matching rule both
+/// [_resolveDateFormatWire] (picks a wire string to send) and
+/// [_availableDateFormats] (picks which dropdown choices to show) use.
+bool _dateFormatMatchesWire(_DateFormat format, String wire) {
+  final lower = wire.toLowerCase();
+  final y = lower.indexOf('y');
+  final m = lower.indexOf('m');
+  final d = lower.indexOf('d');
+  if (y == -1 || m == -1 || d == -1) return false;
+  return switch (format) {
+    _DateFormat.ymd => y < m && m < d,
+    _DateFormat.dmy => d < m && m < y,
+    _DateFormat.mdy => m < d && d < y,
+  };
+}
+
+/// Resolves [format] to one of the camera's own reported `dateFormats`,
+/// falling back to `_dateFormatWireByEnum`'s guess only when the camera
+/// hasn't reported a real list. Always prefer a real reported string over
+/// an invented one — see this file's `OsdOptions` comment for why the guess
+/// alone isn't safe to send.
 String _resolveDateFormatWire(_DateFormat format, OsdOptions? options) {
   final real = options?.dateFormats;
   if (real == null || real.isEmpty) return _dateFormatWireByEnum[format]!;
-  bool matchesOrder(String wire) {
-    final lower = wire.toLowerCase();
-    final y = lower.indexOf('y');
-    final m = lower.indexOf('m');
-    final d = lower.indexOf('d');
-    if (y == -1 || m == -1 || d == -1) return false;
-    return switch (format) {
-      _DateFormat.ymd => y < m && m < d,
-      _DateFormat.dmy => d < m && m < y,
-      _DateFormat.mdy => m < d && d < y,
-    };
-  }
-
   for (final wire in real) {
-    if (matchesOrder(wire)) return wire;
+    if (_dateFormatMatchesWire(format, wire)) return wire;
   }
   return real.first;
 }
 
-/// Resolves [format] to one of the camera's own reported `timeFormats`
-/// (matched by AM/PM-marker presence), same reasoning as
-/// [_resolveDateFormatWire].
+/// Date format choices to actually offer in the dropdown — only formats
+/// that match at least one of the camera's own `getOsdOptions().dateFormats`
+/// entries (all 3 when unverified — no connection yet, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s rule #5), always
+/// keeping [current] so the dropdown's selected value is never outside its
+/// own item list.
+List<_DateFormat> _availableDateFormats(
+  OsdOptions? options,
+  _DateFormat current,
+) {
+  final real = options?.dateFormats;
+  if (real == null || real.isEmpty) return _DateFormat.values;
+  final supported = {
+    for (final format in _DateFormat.values)
+      if (real.any((wire) => _dateFormatMatchesWire(format, wire))) format,
+  }..add(current);
+  return [
+    for (final format in _DateFormat.values)
+      if (supported.contains(format)) format,
+  ];
+}
+
+/// Whether [wire] (one of the camera's own reported `timeFormats` strings)
+/// has an AM/PM marker matching [format] — same shared-matching-rule
+/// reasoning as [_dateFormatMatchesWire].
+bool _timeFormatMatchesWire(_TimeFormat format, String wire) {
+  final lower = wire.toLowerCase();
+  final hasAmPmMarker =
+      lower.contains('tt') || lower.contains(' a') || lower.endsWith('a');
+  return hasAmPmMarker == (format == _TimeFormat.h12);
+}
+
+/// Resolves [format] to one of the camera's own reported `timeFormats`,
+/// same reasoning as [_resolveDateFormatWire].
 String _resolveTimeFormatWire(_TimeFormat format, OsdOptions? options) {
   final real = options?.timeFormats;
   if (real == null || real.isEmpty) return _timeFormatWireByEnum[format]!;
-  bool hasAmPmMarker(String wire) {
-    final lower = wire.toLowerCase();
-    return lower.contains('tt') || lower.contains(' a') || lower.endsWith('a');
-  }
-
   for (final wire in real) {
-    if (hasAmPmMarker(wire) == (format == _TimeFormat.h12)) return wire;
+    if (_timeFormatMatchesWire(format, wire)) return wire;
   }
   return real.first;
+}
+
+/// Time format choices to actually offer — same reasoning as
+/// [_availableDateFormats].
+List<_TimeFormat> _availableTimeFormats(
+  OsdOptions? options,
+  _TimeFormat current,
+) {
+  final real = options?.timeFormats;
+  if (real == null || real.isEmpty) return _TimeFormat.values;
+  final supported = {
+    for (final format in _TimeFormat.values)
+      if (real.any((wire) => _timeFormatMatchesWire(format, wire))) format,
+  }..add(current);
+  return [
+    for (final format in _TimeFormat.values)
+      if (supported.contains(format)) format,
+  ];
 }
 
 /// Position choices to actually offer — only what the camera's own
@@ -226,8 +282,16 @@ List<_OverlayPosition> _availablePositions(
 /// sends `DeleteOSD`. Falls back to local-only `HomesController`-free draft
 /// state (`simulateCameraSave`) for a camera with no saved connection yet —
 /// this screen never persisted its fields through `HomesController` even
-/// before this, unlike other camera-settings screens (see CLAUDE.md). WAN
-/// fallback (`WanOsdClient`) isn't wired up yet. Bitrate and Signal Strength
+/// before this, unlike other camera-settings screens (see CLAUDE.md). LAN
+/// is always tried first for both load and save; a WAN retry (`WanOsdClient`
+/// — a single `setOsd` covers both LAN's `createTimestampOsd`/
+/// `createTextOsd`/`updateTimestampPosition`/`updateTextOsd`, keyed by
+/// whether a token is passed) only kicks in when the LAN call itself
+/// fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// Per that same convention, WAN OSD *Options* are never fetched on a
+/// normal load — only the current-value `getOsds` read gets a WAN fallback
+/// there. Bitrate and Signal Strength
 /// (app-side, non-draggable status badges that actually apply to the Camera
 /// Live page) live on the separate Tags screen, since they affect the
 /// Camera Live page rather than this screen's own preview. Save is disabled
@@ -267,6 +331,13 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
+  /// fails — never persisted (see `fetchWanPreviewSnapshot`'s doc), just
+  /// held here for as long as this screen is open. Cleared once a LAN
+  /// refresh succeeds again, so the persisted (and now fresher) thumbnail
+  /// takes back over.
+  Uint8List? _wanPreviewBytes;
+
   /// Server-assigned OSD token for each slot that already exists on the
   /// camera — null means that slot doesn't exist there yet, so Save should
   /// `CreateOSD` for it instead of `SetOSD`.
@@ -305,10 +376,17 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
       client.getOsdOptions(),
     ]);
     client.close();
-    if (!mounted) return;
 
-    final osdsResult = results[0] as CameraResult<List<OsdEntry>>;
+    var osdsResult = results[0] as CameraResult<List<OsdEntry>>;
     final optionsResult = results[1] as CameraResult<OsdOptions>;
+
+    // Options are LAN-only on a normal load (see this class's doc comment)
+    // — only the current-value getOsds read falls back to WAN here.
+    final thingName = connection.thingName;
+    if (osdsResult is! CameraSuccess && thingName != null) {
+      osdsResult = await WanOsdClient(thingName).getOsds();
+    }
+    if (!mounted) return;
 
     setState(() {
       if (osdsResult case CameraSuccess(:final value)) {
@@ -392,11 +470,27 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention. The last-shown preview (whether the persisted
+    // thumbnail or a previous WAN frame) stays on screen until this
+    // resolves, not blanked out mid-refresh.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -417,6 +511,8 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
 
     if (connection != null) {
       final client = OsdClient(connection);
+      final thingName = connection.thingName;
+      final wanClient = thingName != null ? WanOsdClient(thingName) : null;
 
       // Time (DateAndTime) slot.
       if (_timeEnabled) {
@@ -429,7 +525,7 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
         final color = _colorToWire(_timeColor);
         final timeToken = _timeToken;
         if (timeToken != null) {
-          final result = await client.updateTimestampPosition(
+          var result = await client.updateTimestampPosition(
             timeToken,
             posType: posType,
             posX: onvifPos?.x ?? 0,
@@ -438,11 +534,29 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
             timeFormat: timeWire,
             fontColor: color,
           );
+          // A failed LAN Apply/Set retries over WAN before surfacing an
+          // error, per mobile-app-screen-conventions.md's LAN/WAN
+          // convention. WAN's single setOsd covers both create and update.
+          if (result is! CameraSuccess && wanClient != null) {
+            final wanResult = await wanClient.setOsd(
+              token: timeToken,
+              textType: 'DateAndTime',
+              posType: posType,
+              posX: onvifPos?.x ?? 0,
+              posY: onvifPos?.y ?? 0,
+              dateFormat: dateWire,
+              timeFormat: timeWire,
+              fontColor: color,
+            );
+            result = wanResult is CameraSuccess
+                ? const CameraSuccess(null)
+                : CameraFailure(reasonOf(wanResult));
+          }
           if (result is! CameraSuccess) {
             failures.add('time (${reasonOf(result)})');
           }
         } else {
-          final result = await client.createTimestampOsd(
+          var result = await client.createTimestampOsd(
             posType: posType,
             posX: onvifPos?.x ?? 0.8,
             posY: onvifPos?.y ?? 1,
@@ -450,6 +564,17 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
             timeFormat: timeWire,
             fontColor: color,
           );
+          if (result is! CameraSuccess && wanClient != null) {
+            result = await wanClient.setOsd(
+              textType: 'DateAndTime',
+              posType: posType,
+              posX: onvifPos?.x ?? 0.8,
+              posY: onvifPos?.y ?? 1,
+              dateFormat: dateWire,
+              timeFormat: timeWire,
+              fontColor: color,
+            );
+          }
           if (result case CameraSuccess(:final value)) {
             _timeToken = value;
           } else {
@@ -457,7 +582,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
           }
         }
       } else if (_timeToken != null) {
-        final result = await client.deleteOsd(_timeToken!);
+        var result = await client.deleteOsd(_timeToken!);
+        if (result is! CameraSuccess && wanClient != null) {
+          result = await wanClient.deleteOsd(_timeToken!);
+        }
         if (result is CameraSuccess) {
           _timeToken = null;
         } else {
@@ -477,7 +605,7 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
         final color = _colorToWire(_customTextColor);
         final customTextToken = _customTextToken;
         if (customTextToken != null) {
-          final result = await client.updateTextOsd(
+          var result = await client.updateTextOsd(
             customTextToken,
             _customTextController.text,
             posType: posType,
@@ -485,17 +613,41 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
             posY: onvifPos?.y ?? 1,
             fontColor: color,
           );
+          if (result is! CameraSuccess && wanClient != null) {
+            final wanResult = await wanClient.setOsd(
+              token: customTextToken,
+              textType: 'Plain',
+              text: _customTextController.text,
+              posType: posType,
+              posX: onvifPos?.x ?? -1,
+              posY: onvifPos?.y ?? 1,
+              fontColor: color,
+            );
+            result = wanResult is CameraSuccess
+                ? const CameraSuccess(null)
+                : CameraFailure(reasonOf(wanResult));
+          }
           if (result is! CameraSuccess) {
             failures.add('custom text (${reasonOf(result)})');
           }
         } else {
-          final result = await client.createTextOsd(
+          var result = await client.createTextOsd(
             _customTextController.text,
             posType: posType,
             posX: onvifPos?.x ?? -1,
             posY: onvifPos?.y ?? 1,
             fontColor: color,
           );
+          if (result is! CameraSuccess && wanClient != null) {
+            result = await wanClient.setOsd(
+              textType: 'Plain',
+              text: _customTextController.text,
+              posType: posType,
+              posX: onvifPos?.x ?? -1,
+              posY: onvifPos?.y ?? 1,
+              fontColor: color,
+            );
+          }
           if (result case CameraSuccess(:final value)) {
             _customTextToken = value;
           } else {
@@ -503,7 +655,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
           }
         }
       } else if (_customTextToken != null) {
-        final result = await client.deleteOsd(_customTextToken!);
+        var result = await client.deleteOsd(_customTextToken!);
+        if (result is! CameraSuccess && wanClient != null) {
+          result = await wanClient.deleteOsd(_customTextToken!);
+        }
         if (result is CameraSuccess) {
           _customTextToken = null;
         } else {
@@ -577,6 +732,7 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('OSD-005'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                     timeEnabled: _timeEnabled,
                     timeText:
                         '${_dateFormat.format(DateTime.now())} '
@@ -624,7 +780,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           labelText: 'Date format',
                         ),
                         items: [
-                          for (final format in _DateFormat.values)
+                          for (final format in _availableDateFormats(
+                            _osdOptions,
+                            _dateFormat,
+                          ))
                             DropdownMenuItem(
                               value: format,
                               child: Text(
@@ -646,7 +805,10 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                           labelText: 'Time format',
                         ),
                         items: [
-                          for (final format in _TimeFormat.values)
+                          for (final format in _availableTimeFormats(
+                            _osdOptions,
+                            _timeFormat,
+                          ))
                             DropdownMenuItem(
                               value: format,
                               child: Text(
@@ -804,6 +966,7 @@ class _OsdPreview extends StatelessWidget {
     super.key,
     required this.settingsKey,
     required this.camera,
+    this.overrideBytes,
     required this.timeEnabled,
     required this.timeText,
     required this.timeColor,
@@ -820,6 +983,10 @@ class _OsdPreview extends StatelessWidget {
 
   final Key settingsKey;
   final Camera camera;
+
+  /// See `CameraPreviewThumbnail.overrideBytes`'s doc — same
+  /// never-persisted transient-frame contract.
+  final Uint8List? overrideBytes;
   final bool timeEnabled;
   final String timeText;
   final Color timeColor;
@@ -841,6 +1008,7 @@ class _OsdPreview extends StatelessWidget {
         CameraPreviewThumbnail(
           settingsKey: const Key('OSD-005-image'),
           camera: camera,
+          overrideBytes: overrideBytes,
         ),
         Positioned.fill(
           child: LayoutBuilder(

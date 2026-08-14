@@ -1,3 +1,5 @@
+import 'package:auth_api/auth_api.dart';
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
@@ -5,7 +7,9 @@ import 'app_state/ai_model_manager.dart';
 import 'app_state/alerts_controller.dart';
 import 'app_state/events_controller.dart';
 import 'app_state/homes_controller.dart';
+import 'app_state/preview_key_store.dart';
 import 'app_state/profile_controller.dart';
+import 'app_state/route_observer.dart';
 import 'app_state/theme_controller.dart';
 import 'models/camera.dart';
 import 'models/alert.dart';
@@ -15,6 +19,7 @@ import 'screens/account/account_screen.dart';
 import 'screens/account/account_settings_screen.dart';
 import 'screens/account/active_sessions_screen.dart';
 import 'screens/account/camera_access_screen.dart';
+import 'screens/account/change_password_screen.dart';
 import 'screens/account/create_user_screen.dart';
 import 'screens/account/invite_user_screen.dart';
 import 'screens/account/notification_preferences_screen.dart';
@@ -49,15 +54,58 @@ import 'screens/events/event_detail_screen.dart';
 import 'screens/events/events_screen.dart';
 import 'screens/events/events_summary_screen.dart';
 import 'screens/homes/manage_homes_screen.dart';
+import 'screens/login/forgot_password_screen.dart';
 import 'screens/login/login_screen.dart';
 import 'screens/scan/scanned_devices_screen.dart';
 import 'screens/shell/main_shell.dart';
+import 'screens/signup/confirm_signup_screen.dart';
 import 'screens/signup/signup_screen.dart';
 import 'screens/splash/splash_screen.dart';
 import 'theme/app_theme.dart';
+import 'theme/branding.dart';
 import 'widgets/navigation_leave_guard.dart';
 
 void main() {
+  // Live `vizenlink-mobile` Cognito pool — see packages/auth_api/API_REFERENCE.md
+  // § Configuration. Can be overridden at build time via
+  // --dart-define=COGNITO_USER_POOL_ID=.../COGNITO_APP_CLIENT_ID=.../COGNITO_IDENTITY_POOL_ID=...
+  AuthController.configure(
+    const AuthApiConfig(
+      region: 'ap-south-1',
+      userPoolId: String.fromEnvironment(
+        'COGNITO_USER_POOL_ID',
+        defaultValue: 'ap-south-1_RKoTtmxCi',
+      ),
+      appClientId: String.fromEnvironment(
+        'COGNITO_APP_CLIENT_ID',
+        defaultValue: '28b1gba2nk2oe0v70obu439bu9',
+      ),
+      identityPoolId: String.fromEnvironment(
+        'COGNITO_IDENTITY_POOL_ID',
+        defaultValue: 'ap-south-1:5afc6818-10ed-498f-9106-fb190aa44976',
+      ),
+    ),
+  );
+  // camera_api's WAN clients (packages/camera_api/lib/src/wan/wan_auth.dart)
+  // fall back to these app-wide hooks instead of importing anything
+  // app-specific — set once, before the first WAN call.
+  WanAuth.idTokenProvider = () => AuthController.instance.session?.idToken;
+  // This project's real, live deployed relay (VizenLinkKvsPlaybackProxy,
+  // confirmed live 2026-08-12 per packages/camera_api/API_REFERENCE.md
+  // "Getting started") — not a placeholder. Overridable via
+  // --dart-define=KVS_PLAYBACK_LAMBDA_URL=... if it's ever redeployed at a
+  // new Function URL.
+  WanAuth.kvsPlaybackLambdaUrl = const String.fromEnvironment(
+    'KVS_PLAYBACK_LAMBDA_URL',
+    defaultValue:
+        'https://jxce73jfkwoouhcmxvhsoysxxq0gavso.lambda-url.ap-south-1.on.aws/',
+  );
+  // Backs WanPreviewSnapshotClient's decrypt step — see PreviewKeyStore's
+  // own doc comment for the full registration/re-registration picture.
+  WanAuth.previewPrivateKeyProvider =
+      PreviewKeyStore.instance.getExistingPrivateKey;
+  WanAuth.onPreviewKeyNeedsRegistration =
+      PreviewKeyStore.instance.flagNeedsReregistration;
   runApp(const MobileCctvApp());
 }
 
@@ -91,6 +139,7 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
       _themeController.load(),
       _aiModelManager.load(),
       _homesController.load(),
+      AuthController.instance.restore(),
     ]);
     _router = _buildRouter();
   }
@@ -109,10 +158,14 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
   GoRouter _buildRouter() {
     return GoRouter(
       initialLocation: SplashScreen.routeName,
+      observers: [routeObserver],
       routes: [
         GoRoute(
           path: SplashScreen.routeName,
-          builder: (context, state) => SplashScreen(appReady: _appReady),
+          builder: (context, state) => SplashScreen(
+            appReady: _appReady,
+            authController: AuthController.instance,
+          ),
         ),
         GoRoute(
           path: LoginScreen.routeName,
@@ -123,6 +176,15 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
           path: SignupScreen.routeName,
           builder: (context, state) =>
               SignupScreen(themeController: _themeController),
+        ),
+        GoRoute(
+          path: ConfirmSignupScreen.routeName,
+          builder: (context, state) =>
+              ConfirmSignupScreen(args: state.extra as ConfirmSignupArgs),
+        ),
+        GoRoute(
+          path: ForgotPasswordScreen.routeName,
+          builder: (context, state) => const ForgotPasswordScreen(),
         ),
         StatefulShellRoute.indexedStack(
           builder: (context, state, navigationShell) => MainShell(
@@ -404,6 +466,11 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
                           builder: (context, state) =>
                               const ActiveSessionsScreen(),
                         ),
+                        GoRoute(
+                          path: ChangePasswordScreen.routeName,
+                          builder: (context, state) =>
+                              const ChangePasswordScreen(),
+                        ),
                       ],
                     ),
                     GoRoute(
@@ -457,7 +524,7 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
       valueListenable: _themeController,
       builder: (context, mode, _) {
         return MaterialApp.router(
-          title: 'Mobile CCTV',
+          title: kAppBrandName,
           themeMode: mode,
           theme: AppTheme.light(),
           darkTheme: AppTheme.dark(),

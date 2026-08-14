@@ -87,8 +87,18 @@ class LiveStatusBadge extends StatelessWidget {
   }
 }
 
-/// Stub bitrate until a real stream reports one, in kbps.
-const _stubBitrateKbps = 2048.0;
+/// Rough dBm -> 0-4 bar mapping, same scale [Camera.signalStrength] uses —
+/// `NetworkInfoClient.getWifiSignalStrength` only reports raw RSSI, no
+/// bucketed rating of its own. Shared by every screen that turns a real RSSI
+/// reading into the app's bar scale (Camera Live's [SignalStrengthBadge],
+/// `wifi_config_screen.dart`'s own signal icon).
+int barsForRssi(int rssi) => switch (rssi) {
+  >= -50 => 4,
+  >= -60 => 3,
+  >= -70 => 2,
+  >= -80 => 1,
+  _ => 0,
+};
 
 /// Formats a network-speed kbps value auto-scaled to KB/s or MB/s, matching
 /// how a real bandwidth reading is usually displayed (e.g. "256 KB/s",
@@ -119,9 +129,17 @@ class AudioRecordingBadge extends StatelessWidget {
 
 /// Small app-side "bitrate" badge — a stream-rate icon plus the raw kbps
 /// value — composited by the app rather than sent to or rendered by the
-/// camera. Value is a stub until a real stream reports it.
+/// camera. Shows [configuredKbps] (`Camera.bitrateKbps`, the camera's
+/// actual configured target encoder bitrate from Video Encoder settings) —
+/// a stable configuration fact, not the live per-second measured throughput
+/// (`LiveViewController.measuredBitrateKbps`, shown separately on LIVE-038's
+/// connection indicator instead), which naturally jitters with scene
+/// motion/compression and isn't what "what's this camera's bitrate set to"
+/// is asking.
 class BitrateBadge extends StatelessWidget {
-  const BitrateBadge({super.key});
+  const BitrateBadge({super.key, required this.configuredKbps});
+
+  final double configuredKbps;
 
   @override
   Widget build(BuildContext context) {
@@ -131,7 +149,7 @@ class BitrateBadge extends StatelessWidget {
         const Icon(Icons.speed, color: Colors.white, size: 14),
         const SizedBox(width: 4),
         Text(
-          '${_stubBitrateKbps.round()} kbps',
+          '${configuredKbps.round()} kbps',
           style: const TextStyle(
             color: Colors.white,
             fontWeight: FontWeight.w700,

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -24,6 +25,19 @@ const _defaultWdrEnabled = false;
 const _defaultWdrLevel = 50.0;
 const _defaultWhiteBalance = CameraAutoManual.auto;
 const _defaultExposure = CameraAutoManual.auto;
+
+/// Fallback bounds/defaults for manual exposure's numeric fields, only used
+/// pre-connection or when the camera hasn't reported real
+/// `getImagingOptions().exposureTime`/`exposureGain` ranges yet — same
+/// fallback-range convention `video_encoder_screen.dart`'s sliders use.
+/// Units match the ONVIF wire values (`ImagingSettings.exposureTime`
+/// microseconds, `exposureGain` dB) — not independently re-derived.
+const _defaultExposureTime = 10000.0;
+const _defaultExposureGain = 0.0;
+const _fallbackExposureTimeMin = 100.0;
+const _fallbackExposureTimeMax = 100000.0;
+const _fallbackExposureGainMin = 0.0;
+const _fallbackExposureGainMax = 48.0;
 
 /// `CameraMirrorFlip` <-> `MirrorFlipMode` — same 4 values, different enum
 /// types (one app-side, one camera_api-side).
@@ -54,6 +68,45 @@ CameraAutoManual? _autoManualFromWire(String? wireValue) =>
       'MANUAL' => CameraAutoManual.manual,
       _ => null,
     };
+
+/// Parsed from `NuraeyeClient.call('GetImageDefaults')`'s raw JSON — only the fields this
+/// screen's sliders/segmented buttons cover. Mirror/flip and WDR have no defaults endpoint, so
+/// [_resetToDefault] keeps this screen's local hardcoded fallback for those two.
+class _ImageDefaults {
+  const _ImageDefaults({
+    this.brightness,
+    this.contrast,
+    this.saturation,
+    this.sharpness,
+    this.whiteBalance,
+    this.exposure,
+    this.exposureTime,
+    this.exposureGain,
+  });
+
+  final double? brightness;
+  final double? contrast;
+  final double? saturation;
+  final double? sharpness;
+  final CameraAutoManual? whiteBalance;
+  final CameraAutoManual? exposure;
+  final double? exposureTime;
+  final double? exposureGain;
+
+  factory _ImageDefaults.fromJson(Map<String, dynamic> json) => _ImageDefaults(
+    brightness: (json['brightness'] as num?)?.toDouble(),
+    contrast: (json['contrast'] as num?)?.toDouble(),
+    saturation: (json['saturation'] as num?)?.toDouble(),
+    sharpness: (json['sharpness'] as num?)?.toDouble(),
+    whiteBalance: _autoManualFromWire(json['white_balance_mode'] as String?),
+    exposure: _autoManualFromWire(json['exposure_mode'] as String?),
+    // Not confirmed present in GetImageDefaults' real response (undocumented
+    // beyond the fields this screen already used before this) — read
+    // defensively; absent simply falls back to the hardcoded default below.
+    exposureTime: (json['exposure_time'] as num?)?.toDouble(),
+    exposureGain: (json['exposure_gain'] as num?)?.toDouble(),
+  );
+}
 
 const _autoManualSegmentsByMode = {
   CameraAutoManual.auto: ButtonSegment(
@@ -95,11 +148,33 @@ List<ButtonSegment<CameraAutoManual>> _autoManualSegments(
 /// both are loaded together on screen open and saved together on Save.
 /// Falls back to local-only `HomesController` state (`simulateCameraSave`)
 /// for a camera with no saved connection yet. Manual exposure's numeric
-/// time/gain fields (`ImagingSettings.exposureTime`/`exposureGain`) have no
-/// UI here yet — this screen only has an Auto/Manual toggle, not sliders for
-/// them, matching the existing design; WAN fallback isn't wired up either.
-/// "Reset to Default" resets to this screen's hardcoded factory defaults,
-/// not to whatever was last saved.
+/// time/gain fields (`ImagingSettings.exposureTime`/`exposureGain`, IMG-018/
+/// IMG-019) only render when Exposure (IMG-010) is set to Manual, bounded by
+/// the camera's own `getImagingOptions().exposureTime`/`exposureGain`
+/// ranges when available. LAN-only — unlike every other field on this
+/// screen, no WAN fallback exists for these two specifically
+/// (`WanImageQualityClient`'s raw JSON map is undocumented for these two
+/// keys, and `OnvifImagingClient`'s own doc previously noted no WAN
+/// counterpart existed here at all — since superseded by `WanImageQualityClient`
+/// for the other fields, but not independently confirmed for these). LAN is
+/// tried first for both load and save; a WAN retry (`WanImageQualityClient`
+/// for brightness/contrast/
+/// saturation/sharpness/white-balance/exposure, `WanImagingClient.setWdr`
+/// for WDR, `WanMirrorFlipClient` for mirror/flip) kicks in when the LAN
+/// call itself fails/times out and `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// `WanImageQualityClient.getImageSettings`/`setImageSettings` take/return a
+/// raw JSON map (no typed wrapper exists) — this screen reads/writes it
+/// using the same field-name vocabulary `GetImageDefaults`'s JSON already
+/// uses (`brightness`/`contrast`/`saturation`/`sharpness`/
+/// `white_balance_mode`/`exposure_mode`), not independently hardware-verified
+/// since no other documented source names them for this specific WAN call.
+/// "Reset to Default" resets brightness/contrast/saturation/sharpness/white-balance/exposure to
+/// the camera's own reported factory defaults (`NuraeyeClient.call('GetImageDefaults')`, loaded
+/// alongside the other LAN calls above) when available — not to whatever was last saved.
+/// Mirror/flip and WDR have no defaults endpoint, so those two always fall back to this screen's
+/// hardcoded constants; the other fields also fall back to those constants when unverified (no
+/// connection yet, or the `GetImageDefaults` call failed).
 class ImagingScreen extends StatefulWidget {
   const ImagingScreen({
     super.key,
@@ -126,15 +201,29 @@ class _ImagingScreenState extends State<ImagingScreen> {
   late double _wdrLevel = _camera.wdrLevel;
   late CameraAutoManual _whiteBalance = _camera.whiteBalance;
   late CameraAutoManual _exposure = _camera.exposure;
+  late double _exposureTime = _camera.exposureTime;
+  late double _exposureGain = _camera.exposureGain;
   bool _isDirty = false;
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
 
+  /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
+  /// fails — never persisted (see `fetchWanPreviewSnapshot`'s doc), just
+  /// held here for as long as this screen is open. Cleared once a LAN
+  /// refresh succeeds again, so the persisted (and now fresher) thumbnail
+  /// takes back over.
+  Uint8List? _wanPreviewBytes;
+
   /// Bounds/choice lists from the camera's own `getImagingOptions()` — null
   /// means "camera not verified yet", in which case every control shows
   /// (same fallback reasoning as `_dummyTimezones` in camera_info_screen).
   ImagingOptions? _imagingOptions;
+
+  /// Camera-reported factory defaults for "Reset to Default" (`GetImageDefaults`) — null means
+  /// unverified (no connection yet, or the call failed), in which case [_resetToDefault] falls
+  /// back to this screen's hardcoded defaults.
+  _ImageDefaults? _imageDefaults;
 
   @override
   void initState() {
@@ -151,14 +240,42 @@ class _ImagingScreenState extends State<ImagingScreen> {
       imagingClient.getImagingSettings(),
       imagingClient.getImagingOptions(),
       MirrorFlipClient(nuraeye).getMirrorFlip(),
+      nuraeye.call('GetImageDefaults'),
     ]);
     imagingClient.close();
     nuraeye.close();
-    if (!mounted) return;
 
-    final settingsResult = results[0] as CameraResult<ImagingSettings>;
+    var settingsResult = results[0] as CameraResult<ImagingSettings>;
     final optionsResult = results[1] as CameraResult<ImagingOptions>;
-    final mirrorFlipResult = results[2] as CameraResult<MirrorFlipMode>;
+    var mirrorFlipResult = results[2] as CameraResult<MirrorFlipMode>;
+    var defaultsResult = results[3] as CameraResult<Map<String, dynamic>>;
+
+    // Options are LAN-only on a normal load (see this class's doc comment)
+    // — only current-value reads fall back to WAN here.
+    final thingName = connection.thingName;
+    Map<String, dynamic>? wanImageSettings;
+    ({bool enabled, double level})? wanWdr;
+    if (thingName != null) {
+      if (settingsResult is! CameraSuccess) {
+        final wanResult = await WanImageQualityClient(
+          thingName,
+        ).getImageSettings();
+        if (wanResult case CameraSuccess(:final value)) {
+          wanImageSettings = value;
+        }
+        final wanWdrResult = await WanImagingClient(thingName).getWdr();
+        if (wanWdrResult case CameraSuccess(:final value)) wanWdr = value;
+      }
+      if (mirrorFlipResult is! CameraSuccess) {
+        mirrorFlipResult = await WanMirrorFlipClient(thingName).getMirrorFlip();
+      }
+      if (defaultsResult is! CameraSuccess) {
+        defaultsResult = await WanImageQualityClient(
+          thingName,
+        ).getImageDefaults();
+      }
+    }
+    if (!mounted) return;
 
     setState(() {
       if (settingsResult case CameraSuccess(:final value)) {
@@ -176,12 +293,38 @@ class _ImagingScreenState extends State<ImagingScreen> {
         if (whiteBalance != null) _whiteBalance = whiteBalance;
         final exposure = _autoManualFromWire(value.exposureMode);
         if (exposure != null) _exposure = exposure;
+        if (value.exposureTime != null) _exposureTime = value.exposureTime!;
+        if (value.exposureGain != null) _exposureGain = value.exposureGain!;
+      } else if (wanImageSettings != null) {
+        final m = wanImageSettings;
+        final brightness = (m['brightness'] as num?)?.toDouble();
+        if (brightness != null) _brightness = brightness;
+        final contrast = (m['contrast'] as num?)?.toDouble();
+        if (contrast != null) _contrast = contrast;
+        final saturation = (m['saturation'] as num?)?.toDouble();
+        if (saturation != null) _saturation = saturation;
+        final sharpness = (m['sharpness'] as num?)?.toDouble();
+        if (sharpness != null) _sharpness = sharpness;
+        final whiteBalance = _autoManualFromWire(
+          m['white_balance_mode'] as String?,
+        );
+        if (whiteBalance != null) _whiteBalance = whiteBalance;
+        final exposure = _autoManualFromWire(m['exposure_mode'] as String?);
+        if (exposure != null) _exposure = exposure;
+        final wdr = wanWdr;
+        if (wdr != null) {
+          _wdrEnabled = wdr.enabled;
+          _wdrLevel = wdr.level;
+        }
       }
       if (optionsResult case CameraSuccess(:final value)) {
         _imagingOptions = value;
       }
       if (mirrorFlipResult case CameraSuccess(:final value)) {
         _mirrorFlip = _fromWireMirrorFlip(value);
+      }
+      if (defaultsResult case CameraSuccess(:final value)) {
+        _imageDefaults = _ImageDefaults.fromJson(value);
       }
     });
 
@@ -237,11 +380,27 @@ class _ImagingScreenState extends State<ImagingScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention. The last-shown preview (whether the persisted
+    // thumbnail or a previous WAN frame) stays on screen until this
+    // resolves, not blanked out mid-refresh.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -254,8 +413,10 @@ class _ImagingScreenState extends State<ImagingScreen> {
 
     final bool succeeded;
     if (connection != null) {
-      final imagingClient = OnvifImagingClient(connection);
+      final thingName = connection.thingName;
       final wdrSupported = _imagingOptions?.wdrSupported ?? true;
+
+      final imagingClient = OnvifImagingClient(connection);
       final imagingResult = await imagingClient.setImagingSettings(
         ImagingSettings(
           brightness: _brightness,
@@ -266,18 +427,51 @@ class _ImagingScreenState extends State<ImagingScreen> {
           wdrLevel: (wdrSupported && _wdrEnabled) ? _wdrLevel : null,
           whiteBalanceMode: _autoManualToWire(_whiteBalance),
           exposureMode: _autoManualToWire(_exposure),
+          exposureTime: _exposure == CameraAutoManual.manual
+              ? _exposureTime
+              : null,
+          exposureGain: _exposure == CameraAutoManual.manual
+              ? _exposureGain
+              : null,
         ),
       );
       imagingClient.close();
 
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      var imagingSucceeded = imagingResult is CameraSuccess;
+      if (!imagingSucceeded && thingName != null) {
+        final wanQualityResult = await WanImageQualityClient(thingName)
+            .setImageSettings({
+              'brightness': _brightness,
+              'contrast': _contrast,
+              'saturation': _saturation,
+              'sharpness': _sharpness,
+              'white_balance_mode': _autoManualToWire(_whiteBalance),
+              'exposure_mode': _autoManualToWire(_exposure),
+            });
+        var wdrOk = true;
+        if (wdrSupported) {
+          final wanWdrResult = await WanImagingClient(
+            thingName,
+          ).setWdr(_wdrEnabled, _wdrEnabled ? _wdrLevel : 0);
+          wdrOk = wanWdrResult is CameraSuccess;
+        }
+        imagingSucceeded = wanQualityResult is CameraSuccess && wdrOk;
+      }
+
       final nuraeye = NuraeyeClient(connection);
-      final mirrorFlipResult = await MirrorFlipClient(
+      var mirrorFlipResult = await MirrorFlipClient(
         nuraeye,
       ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
       nuraeye.close();
+      if (mirrorFlipResult is! CameraSuccess && thingName != null) {
+        mirrorFlipResult = await WanMirrorFlipClient(
+          thingName,
+        ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
+      }
 
-      succeeded =
-          imagingResult is CameraSuccess && mirrorFlipResult is CameraSuccess;
+      succeeded = imagingSucceeded && mirrorFlipResult is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();
     }
@@ -312,16 +506,21 @@ class _ImagingScreenState extends State<ImagingScreen> {
   }
 
   void _resetToDefault() {
+    final defaults = _imageDefaults;
     _markDirty(() {
+      // Mirror/flip and WDR have no camera-reported defaults endpoint — always this screen's
+      // own hardcoded fallback.
       _mirrorFlip = _defaultMirrorFlip;
-      _brightness = _defaultBrightness;
-      _contrast = _defaultContrast;
-      _saturation = _defaultSaturation;
-      _sharpness = _defaultSharpness;
       _wdrEnabled = _defaultWdrEnabled;
       _wdrLevel = _defaultWdrLevel;
-      _whiteBalance = _defaultWhiteBalance;
-      _exposure = _defaultExposure;
+      _brightness = defaults?.brightness ?? _defaultBrightness;
+      _contrast = defaults?.contrast ?? _defaultContrast;
+      _saturation = defaults?.saturation ?? _defaultSaturation;
+      _sharpness = defaults?.sharpness ?? _defaultSharpness;
+      _whiteBalance = defaults?.whiteBalance ?? _defaultWhiteBalance;
+      _exposure = defaults?.exposure ?? _defaultExposure;
+      _exposureTime = defaults?.exposureTime ?? _defaultExposureTime;
+      _exposureGain = defaults?.exposureGain ?? _defaultExposureGain;
     });
   }
 
@@ -364,6 +563,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('IMG-003'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(
@@ -518,6 +718,47 @@ class _ImagingScreenState extends State<ImagingScreen> {
                   onSelectionChanged: (selection) =>
                       _markDirty(() => _exposure = selection.first),
                 ),
+                // Only meaningful in Manual mode — the camera ignores these
+                // in Auto (ImagingSettings.exposureTime/exposureGain are
+                // omitted from the Save request outside Manual, see _save).
+                if (_exposure == CameraAutoManual.manual) ...[
+                  const SizedBox(height: 16),
+                  GlassCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Builder(
+                          builder: (context) {
+                            final range = _imagingOptions?.exposureTime;
+                            return _SliderRow(
+                              settingsKey: const Key('IMG-018'),
+                              label: 'Exposure time',
+                              value: _exposureTime,
+                              min: range?.min ?? _fallbackExposureTimeMin,
+                              max: range?.max ?? _fallbackExposureTimeMax,
+                              onChanged: (value) =>
+                                  _markDirty(() => _exposureTime = value),
+                            );
+                          },
+                        ),
+                        Builder(
+                          builder: (context) {
+                            final range = _imagingOptions?.exposureGain;
+                            return _SliderRow(
+                              settingsKey: const Key('IMG-019'),
+                              label: 'Exposure gain',
+                              value: _exposureGain,
+                              min: range?.min ?? _fallbackExposureGainMin,
+                              max: range?.max ?? _fallbackExposureGainMax,
+                              onChanged: (value) =>
+                                  _markDirty(() => _exposureGain = value),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -534,12 +775,14 @@ class _SliderRow extends StatelessWidget {
     required this.value,
     required this.onChanged,
     this.min = 0,
+    this.max = 100,
   });
 
   final Key settingsKey;
   final String label;
   final double value;
   final double min;
+  final double max;
   final ValueChanged<double> onChanged;
 
   @override
@@ -553,10 +796,10 @@ class _SliderRow extends StatelessWidget {
         ),
         Slider(
           key: settingsKey,
-          value: value,
+          value: value.clamp(min, max),
           min: min,
-          max: 100,
-          divisions: (100 - min).round(),
+          max: max,
+          divisions: (max - min).round().clamp(1, 1000),
           onChanged: onChanged,
         ),
       ],

@@ -7,6 +7,7 @@ import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
+import '../../widgets/live_status_badges.dart' show barsForRssi;
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart' show simulateCameraSave;
 
@@ -26,17 +27,6 @@ bool get _supportsNetworkScan =>
 /// these tokens.
 bool _isSecured(String capabilities) =>
     RegExp('WEP|WPA|EAP', caseSensitive: false).hasMatch(capabilities);
-
-/// Rough dBm -> 0-4 bar mapping, same scale as `Camera.signalStrength`
-/// elsewhere in the app — `NetworkInfoClient.getWifiSignalStrength` only
-/// reports raw RSSI, no bucketed rating of its own.
-int _barsForRssi(int rssi) => switch (rssi) {
-  >= -50 => 4,
-  >= -60 => 3,
-  >= -70 => 2,
-  >= -80 => 1,
-  _ => 0,
-};
 
 IconData _signalIcon(int bars) => switch (bars) {
   0 => Icons.signal_cellular_0_bar,
@@ -291,7 +281,7 @@ class _WifiConfigScreenState extends State<WifiConfigScreen> {
                     child: ListTile(
                       key: const Key('WIFI-010'),
                       leading: Icon(
-                        _signalIcon(_barsForRssi(_currentRssi ?? -100)),
+                        _signalIcon(barsForRssi(_currentRssi ?? -100)),
                         color: colorScheme.onSurfaceVariant,
                       ),
                       title: Text(_currentSsid ?? 'Unknown network'),
@@ -456,7 +446,7 @@ class _NearbyNetworkTile extends StatelessWidget {
         onTap: onTap,
         child: ListTile(
           leading: Icon(
-            _signalIcon(_barsForRssi(network.level)),
+            _signalIcon(barsForRssi(network.level)),
             color: colorScheme.onSurfaceVariant,
           ),
           title: Text(network.ssid.isEmpty ? '(hidden network)' : network.ssid),

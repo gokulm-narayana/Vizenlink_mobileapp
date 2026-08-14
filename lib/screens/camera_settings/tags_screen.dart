@@ -343,7 +343,7 @@ class _TagsPreview extends StatelessWidget {
           osdPositioned(
             bitrateOsdPosition,
             stackIndex: stackIndices[i++],
-            child: const BitrateBadge(),
+            child: BitrateBadge(configuredKbps: camera.bitrateKbps),
           ),
         if (signalStrengthOsdEnabled)
           osdPositioned(
