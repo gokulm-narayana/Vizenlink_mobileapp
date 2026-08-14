@@ -1,0 +1,25 @@
+name: alerts_api
+description: >
+  Always-on background WAN camera-alert listener (direct AWS-SigV4-signed MQTT-over-WSS to AWS
+  IoT Core) — extracted from mobile_app/lib/core/ so the mobile-app UI/business-logic team has a
+  documented, stable contract for camera alert delivery, the same way camera_api documents
+  camera access. Not pure-Dart: owns an Android foreground service and local notifications,
+  both inherently platform-specific.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  crypto: ^3.0.7
+  mqtt_client: ^10.11.11
+  flutter_foreground_task: ^10.0.0
+  flutter_local_notifications: ^22.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0
