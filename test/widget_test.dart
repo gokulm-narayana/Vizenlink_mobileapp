@@ -170,15 +170,19 @@ void main() {
   SharedPreferences.setMockInitialValues({});
   _mockSecureStorageChannel();
 
-  testWidgets('Dashboard is the initial route', (WidgetTester tester) async {
+  testWidgets('Splash routes to login when no session is restored', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const MobileCctvApp());
-    // The splash screen hands off to the dashboard once app startup
-    // (theme/AI-consent/homes loading) resolves — no more fixed minimum
-    // delay to pump through, just real (mocked) SharedPreferences reads.
+    // The splash screen waits on app startup (theme/AI-consent/homes
+    // loading, plus AuthController.restore()) before routing — no more
+    // fixed minimum delay to pump through, just real (mocked)
+    // SharedPreferences/secure-storage reads. With no persisted session
+    // (mocked secure storage starts empty), it lands on Login, not
+    // Dashboard — the app is now gated on a real auth_api session.
     await tester.pumpAndSettle();
 
-    expect(find.text('Main House'), findsOneWidget);
-    expect(find.byKey(const Key('SHELL-001')), findsOneWidget);
+    expect(find.byKey(const Key('LOGIN-001')), findsOneWidget);
   });
 
   testWidgets('Switching homes via the dropdown does not crash', (

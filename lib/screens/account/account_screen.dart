@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:auth_api/auth_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
@@ -36,6 +37,23 @@ class AccountScreen extends StatefulWidget {
 }
 
 class _AccountScreenState extends State<AccountScreen> {
+  bool _isSigningOut = false;
+
+  Future<void> _signOut() async {
+    setState(() => _isSigningOut = true);
+    try {
+      await AuthController.instance.signOut();
+    } catch (_) {
+      // Best-effort even at this layer — if AuthController.signOut() itself throws
+      // (e.g. a network failure reaching Cognito for the server-side session
+      // invalidation), still let the user return to Login rather than getting stuck.
+    } finally {
+      if (mounted) setState(() => _isSigningOut = false);
+    }
+    if (!mounted) return;
+    context.go(LoginScreen.routeName);
+  }
+
   void _showComingSoon(String label) {
     ScaffoldMessenger.of(
       context,
@@ -268,9 +286,15 @@ class _AccountScreenState extends State<AccountScreen> {
               const SizedBox(height: 24),
               ElevatedButton.icon(
                 key: const Key('ACCT-013'),
-                onPressed: () => context.go(LoginScreen.routeName),
+                onPressed: _isSigningOut ? null : _signOut,
                 icon: const Icon(Icons.logout),
-                label: const Text('Log out'),
+                label: _isSigningOut
+                    ? const SizedBox(
+                        height: 16,
+                        width: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Log out'),
               ),
             ],
           ),

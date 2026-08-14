@@ -1,0 +1,23 @@
+name: auth_api
+description: >
+  AWS Cognito account/session API (sign-up, sign-in, session persistence and silent refresh,
+  password management) — extracted from mobile_app/lib/features/account/ so the mobile-app
+  UI/business-logic team has a documented, stable contract, the same way camera_api documents
+  camera access. Not pure-Dart like camera_api: session persistence needs Android Keystore/iOS
+  Keychain (flutter_secure_storage), which is inherently platform-specific.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  flutter_secure_storage: ^11.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0

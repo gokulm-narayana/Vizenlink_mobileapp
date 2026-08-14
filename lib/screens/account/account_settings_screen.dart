@@ -8,13 +8,28 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import 'account_screen.dart';
 import 'active_sessions_screen.dart';
+import 'change_password_screen.dart';
 
 /// Account settings: edit display name, change email/phone (via a stubbed
-/// OTP flow), change password, toggle 2FA, view active sessions, delete
-/// account. No auth backend is wired up yet (see CLAUDE.md), so every
-/// "verification" here always succeeds — there's nothing real to check
-/// against. Display name/email/phone write through [profileController] so
-/// the Profile tab stays in sync.
+/// OTP flow — no client code exists for that yet), change password (pushes
+/// [ChangePasswordScreen], a full screen — calls real `auth_api`
+/// `AuthController.changePassword`), toggle 2FA, view active sessions,
+/// delete account. Display name/email/phone write through
+/// [profileController] so the Profile tab stays in sync.
+///
+/// Every text-entry dialog below (`_TextFieldDialog`, `_CodeDialog`) owns
+/// its `TextEditingController`(s) in its own `State`, disposed via
+/// `State.dispose()` rather than manually right after `showDialog` returns.
+/// **Manual disposal there is a real bug, not just style** — `showDialog`'s
+/// Future completes as soon as `Navigator.pop()` is called, which is before
+/// the dialog's exit *animation* finishes; its `TextFormField`s are still
+/// mounted and can still rebuild mid-transition, referencing a controller
+/// that's already been disposed ("A TextEditingController was used after
+/// being disposed", cascading into a framework `_dependents.isEmpty`
+/// assertion — hit on real hardware 2026-08-14, originally on the
+/// change-password dialog, which has since moved to its own screen for
+/// unrelated UI reasons but the same latent bug existed in every dialog in
+/// this file).
 class AccountSettingsScreen extends StatefulWidget {
   const AccountSettingsScreen({super.key, required this.profileController});
 
@@ -54,33 +69,17 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
     required String currentValue,
     required ValueChanged<String> onVerified,
   }) async {
-    final valueController = TextEditingController(text: currentValue);
-
     final newValue = await showDialog<String>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text('New $label'),
-        content: TextFormField(
-          key: const Key('ACSET-010'),
-          controller: valueController,
-          decoration: InputDecoration(labelText: label),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            key: const Key('ACSET-011'),
-            onPressed: () =>
-                Navigator.of(dialogContext).pop(valueController.text.trim()),
-            child: const Text('Send code'),
-          ),
-        ],
+      builder: (dialogContext) => _TextFieldDialog(
+        title: 'New $label',
+        initialValue: currentValue,
+        fieldKey: const Key('ACSET-010'),
+        labelText: label,
+        confirmLabel: 'Send code',
+        confirmKey: const Key('ACSET-011'),
       ),
     );
-
-    valueController.dispose();
 
     if (newValue == null || newValue.isEmpty || !mounted) return;
 
@@ -92,126 +91,19 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
   }
 
   Future<bool> _showOtpDialog() async {
-    final otpController = TextEditingController();
-    final formKey = GlobalKey<FormState>();
-
     final result = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Enter verification code'),
-        content: Form(
-          key: formKey,
-          child: TextFormField(
-            key: const Key('ACSET-012'),
-            controller: otpController,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            maxLength: 6,
-            decoration: const InputDecoration(labelText: '6-digit code'),
-            validator: (value) =>
-                (value?.length ?? 0) == 6 ? null : 'Enter the 6-digit code',
-          ),
-        ),
-        actions: [
-          TextButton(
-            key: const Key('ACSET-014'),
-            onPressed: () => _showSnackBar('Code resent'),
-            child: const Text('Resend code'),
-          ),
-          ElevatedButton(
-            key: const Key('ACSET-013'),
-            onPressed: () {
-              if (formKey.currentState!.validate()) {
-                Navigator.of(dialogContext).pop(true);
-              }
-            },
-            child: const Text('Verify'),
-          ),
-        ],
+      builder: (dialogContext) => _CodeDialog(
+        title: 'Enter verification code',
+        fieldKey: const Key('ACSET-012'),
+        confirmKey: const Key('ACSET-013'),
+        confirmLabel: 'Verify',
+        showCancel: false,
+        onResend: () => _showSnackBar('Code resent'),
+        resendKey: const Key('ACSET-014'),
       ),
     );
-    otpController.dispose();
     return result ?? false;
-  }
-
-  Future<void> _changePassword() async {
-    final currentController = TextEditingController();
-    final newController = TextEditingController();
-    final confirmController = TextEditingController();
-    final formKey = GlobalKey<FormState>();
-
-    final updated = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Change password'),
-        content: Form(
-          key: formKey,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextFormField(
-                key: const Key('ACSET-015'),
-                controller: currentController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Current password',
-                ),
-                validator: (value) =>
-                    (value == null || value.isEmpty) ? 'Required' : null,
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                key: const Key('ACSET-016'),
-                controller: newController,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: 'New password'),
-                validator: (value) => (value == null || value.length < 6)
-                    ? 'At least 6 characters'
-                    : null,
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                key: const Key('ACSET-017'),
-                controller: confirmController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Confirm new password',
-                ),
-                validator: (value) => value != newController.text
-                    ? 'Passwords do not match'
-                    : null,
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            key: const Key('ACSET-018'),
-            onPressed: () {
-              if (formKey.currentState!.validate()) {
-                Navigator.of(dialogContext).pop(true);
-              }
-            },
-            child: const Text('Update'),
-          ),
-        ],
-      ),
-    );
-
-    currentController.dispose();
-    newController.dispose();
-    confirmController.dispose();
-
-    if ((updated ?? false) && mounted) {
-      final verified = await _showOtpDialog();
-      if (verified && mounted) {
-        _showSnackBar('Password updated');
-      }
-    }
   }
 
   Future<void> _toggleTwoFactor(bool requestedValue) async {
@@ -289,45 +181,15 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
       _confirmTwoFactorCode(title: 'Disable two-factor authentication?');
 
   Future<bool> _confirmTwoFactorCode({required String title}) async {
-    final codeController = TextEditingController();
-    final formKey = GlobalKey<FormState>();
-
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(title),
-        content: Form(
-          key: formKey,
-          child: TextFormField(
-            key: const Key('ACSET-019'),
-            controller: codeController,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            maxLength: 6,
-            decoration: const InputDecoration(labelText: '6-digit code'),
-            validator: (value) =>
-                (value?.length ?? 0) == 6 ? null : 'Enter the 6-digit code',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            key: const Key('ACSET-020'),
-            onPressed: () {
-              if (formKey.currentState!.validate()) {
-                Navigator.of(dialogContext).pop(true);
-              }
-            },
-            child: const Text('Confirm'),
-          ),
-        ],
+      builder: (dialogContext) => _CodeDialog(
+        title: title,
+        fieldKey: const Key('ACSET-019'),
+        confirmKey: const Key('ACSET-020'),
+        confirmLabel: 'Confirm',
       ),
     );
-
-    codeController.dispose();
     return confirmed ?? false;
   }
 
@@ -440,7 +302,9 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
                       leading: const Icon(Icons.lock_outline),
                       title: const Text('Change password'),
                       trailing: const Icon(Icons.chevron_right),
-                      onTap: _changePassword,
+                      onTap: () => context.push(
+                        '${AccountScreen.routeName}/${AccountSettingsScreen.routeName}/${ChangePasswordScreen.routeName}',
+                      ),
                     ),
                     const Divider(height: 1),
                     SwitchListTile(
@@ -483,6 +347,143 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Single-field text-entry dialog (email/phone change) — see this file's
+/// top doc comment for why it owns its own controller instead of the caller
+/// disposing one manually after `showDialog` returns.
+class _TextFieldDialog extends StatefulWidget {
+  const _TextFieldDialog({
+    required this.title,
+    required this.initialValue,
+    required this.fieldKey,
+    required this.labelText,
+    required this.confirmLabel,
+    required this.confirmKey,
+  });
+
+  final String title;
+  final String initialValue;
+  final Key fieldKey;
+  final String labelText;
+  final String confirmLabel;
+  final Key confirmKey;
+
+  @override
+  State<_TextFieldDialog> createState() => _TextFieldDialogState();
+}
+
+class _TextFieldDialogState extends State<_TextFieldDialog> {
+  late final _controller = TextEditingController(text: widget.initialValue);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: TextFormField(
+        key: widget.fieldKey,
+        controller: _controller,
+        decoration: InputDecoration(labelText: widget.labelText),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          key: widget.confirmKey,
+          onPressed: () => Navigator.of(context).pop(_controller.text.trim()),
+          child: Text(widget.confirmLabel),
+        ),
+      ],
+    );
+  }
+}
+
+/// 6-digit code entry dialog, shared by the OTP-verification step
+/// ([showCancel] false, has [onResend]) and the 2FA enable/disable
+/// confirmation ([showCancel] true, no resend). Same controller-ownership
+/// reasoning as [_TextFieldDialog].
+class _CodeDialog extends StatefulWidget {
+  const _CodeDialog({
+    required this.title,
+    required this.fieldKey,
+    required this.confirmKey,
+    required this.confirmLabel,
+    this.showCancel = true,
+    this.onResend,
+    this.resendKey,
+  });
+
+  final String title;
+  final Key fieldKey;
+  final Key confirmKey;
+  final String confirmLabel;
+  final bool showCancel;
+  final VoidCallback? onResend;
+  final Key? resendKey;
+
+  @override
+  State<_CodeDialog> createState() => _CodeDialogState();
+}
+
+class _CodeDialogState extends State<_CodeDialog> {
+  final _controller = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: Form(
+        key: _formKey,
+        child: TextFormField(
+          key: widget.fieldKey,
+          controller: _controller,
+          keyboardType: TextInputType.number,
+          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+          maxLength: 6,
+          decoration: const InputDecoration(labelText: '6-digit code'),
+          validator: (value) =>
+              (value?.length ?? 0) == 6 ? null : 'Enter the 6-digit code',
+        ),
+      ),
+      actions: [
+        if (widget.onResend != null)
+          TextButton(
+            key: widget.resendKey,
+            onPressed: widget.onResend,
+            child: const Text('Resend code'),
+          ),
+        if (widget.showCancel)
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+        ElevatedButton(
+          key: widget.confirmKey,
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              Navigator.of(context).pop(true);
+            }
+          },
+          child: Text(widget.confirmLabel),
+        ),
+      ],
     );
   }
 }

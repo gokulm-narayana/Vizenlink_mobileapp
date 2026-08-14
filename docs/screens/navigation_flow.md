@@ -5,7 +5,7 @@ How screens connect and how routing is implemented. This is a companion to the p
 ## Routing implementation
 
 - Router: `go_router` (`GoRouter`, configured in `lib/main.dart`).
-- Auth screens (`/login`, `/signup`) are top-level `GoRoute`s outside the shell.
+- Auth screens (`/login`, `/signup`, `/confirm-signup`, `/forgot-password`) are top-level `GoRoute`s outside the shell. Real AWS Cognito auth via `auth_api`'s `AuthController` — `AuthController.configure()` runs once in `main()` before `runApp`, and `AuthController.instance.restore()` is part of Splash's `appReady` future, which then routes to `/dashboard` or `/login` depending on whether a session was restored (see [splash_screen.md](splash/splash_screen.md)).
 - The four main sections (`/dashboard`, `/alerts`, `/events`, `/account`) are children of a `StatefulShellRoute.indexedStack`, rendered inside [MainShell](shell/main_shell.md) (`lib/screens/shell/main_shell.dart`). Each branch keeps its own navigation stack — switching tabs does not reset a branch's stack, and returning to a previously-visited tab restores where you left off.
 - `CameraLiveScreen` and its settings sub-tree (`/dashboard/live/:cameraId/...`) are nested as a child route of the Dashboard branch's `GoRoute`, alongside `homes/manage` and `ScannedDevicesScreen.routeName` — so it renders inside `MainShell` and the bottom nav bar stays visible throughout, including every Camera Settings sub-screen. The fullscreen landscape video view (LIVE-008) is the one exception: it's pushed via `Navigator.of(context, rootNavigator: true)`, escaping above `MainShell` so the bottom bar is correctly hidden there.
 - Leaving `CameraLiveScreen` or any dirty Camera Settings sub-screen via a bottom-nav tap is guarded the same way as the back gesture — see [main_shell.md](shell/main_shell.md)'s `NavigationGuardController` note and `lib/widgets/navigation_leave_guard.dart`.
@@ -18,8 +18,13 @@ How screens connect and how routing is implemented. This is a companion to the p
 flowchart TD
     Login["/login\nLoginScreen"] -->|"Sign up link"| Signup["/signup\nSignupScreen"]
     Signup -->|"Log in link"| Login
-    Login -->|"successful login (stubbed)"| Shell
-    Signup -->|"successful signup (stubbed)"| Shell
+    Login -->|"successful signIn()"| Shell
+    Login -->|"Forgot password? link"| Forgot["/forgot-password\nForgotPasswordScreen"]
+    Forgot -->|"reset succeeds / Back to log in"| Login
+    Login -->|"UserNotConfirmedException"| Confirm["/confirm-signup\nConfirmSignupScreen"]
+    Signup -->|"successful signUp()"| Confirm
+    Confirm -->|"confirmSignUp() + signIn() succeed"| Shell
+    Confirm -->|"Back to log in"| Login
 
     subgraph Shell["MainShell — bottom NavigationBar"]
         direction LR
@@ -96,6 +101,8 @@ flowchart TD
 
     Account -->|"Account settings row"| AcctSettings["/account/settings\nAccountSettingsScreen"]
     AcctSettings -->|"back"| Account
+    AcctSettings -->|"Change password row"| ChangePw["/account/settings/change-password\nChangePasswordScreen"]
+    ChangePw -->|"Update succeeds / back"| AcctSettings
     AcctSettings -->|"Active sessions row"| Sessions["/account/settings/sessions\nActiveSessionsScreen"]
     Sessions -->|"back"| AcctSettings
     Account -->|"Notification preferences row"| Notif["/account/notifications\nNotificationPreferencesScreen"]
@@ -118,9 +125,11 @@ flowchart TD
 
 | Route | Screen | Doc | Reachable from |
 |-------|--------|-----|-----------------|
-| `/splash` | SplashScreen | [splash_screen.md](splash/splash_screen.md) | actual `initialLocation` — hands off to `/dashboard` after ~1.4s. `/login`/`/signup` exist as routes but aren't currently reachable from app launch (no auth gate wired up yet) |
-| `/login` | LoginScreen | [login_screen.md](login/login_screen.md) | from Signup via "Log in" link |
+| `/splash` | SplashScreen | [splash_screen.md](splash/splash_screen.md) | actual `initialLocation` — routes to `/dashboard` if `AuthController.restore()` found a valid session, otherwise `/login` |
+| `/login` | LoginScreen | [login_screen.md](login/login_screen.md) | from Signup via "Log in" link; also where Splash lands when unauthenticated |
 | `/signup` | SignupScreen | [signup_screen.md](signup/signup_screen.md) | from Login via "Sign up" link |
+| `/confirm-signup` | ConfirmSignupScreen | [confirm_signup_screen.md](signup/confirm_signup_screen.md) | pushed from Signup after a successful `signUp()`, or from Login on a `UserNotConfirmedException`; receives `ConfirmSignupArgs` via `state.extra` |
+| `/forgot-password` | ForgotPasswordScreen | [forgot_password_screen.md](login/forgot_password_screen.md) | pushed from Login's "Forgot password?" link |
 | `/dashboard` | DashboardScreen | [dashboard_screen.md](dashboard/dashboard_screen.md) | after login/signup success; bottom nav tab 1 |
 | `/dashboard/homes/manage` | ManageHomesScreen | [manage_homes_screen.md](homes/manage_homes_screen.md) | pushed from the Dashboard's home-selector dropdown ("Manage homes") |
 | `/dashboard/scan` | ScannedDevicesScreen | [scan_cameras_screen.md](scan/scan_cameras_screen.md) | pushed from the Dashboard's "Add Camera" FAB, after the scanning popup completes |
@@ -153,6 +162,7 @@ flowchart TD
 | `/events/detail` | EventDetailScreen | [event_detail_screen.md](events/event_detail_screen.md) | pushed via `context.push` when tapping an event on EventsScreen; receives the `RecordedEvent` via `state.extra`. Its "View live" button deep-links cross-branch to `/dashboard/live/{cameraId}` via `context.go`, same pattern as AlertDetailScreen |
 | `/account` | AccountScreen | [account_screen.md](account/account_screen.md) | bottom nav tab 4 (labeled "Profile") |
 | `/account/settings` | AccountSettingsScreen | [account_settings_screen.md](account/account_settings_screen.md) | pushed from the "Account settings" row on AccountScreen |
+| `/account/settings/change-password` | ChangePasswordScreen | [change_password_screen.md](account/change_password_screen.md) | pushed from the "Change password" row on AccountSettingsScreen |
 | `/account/settings/sessions` | ActiveSessionsScreen | [active_sessions_screen.md](account/active_sessions_screen.md) | pushed from the "Active sessions" row on AccountSettingsScreen |
 | `/account/notifications` | NotificationPreferencesScreen | [notification_preferences_screen.md](account/notification_preferences_screen.md) | pushed from the "Notification preferences" row on AccountScreen |
 | `/account/users-invites` | UsersInvitesScreen | [users_invites_screen.md](account/users_invites_screen.md) | pushed from the "Users & Invites" row on AccountScreen |
@@ -171,7 +181,7 @@ flowchart TD
 - `alertsController` (`AlertsController`, `lib/app_state/alerts_controller.dart`) is threaded as a direct constructor param on `MainShell`, `DashboardScreen`, `AlertsScreen`, and `AlertDetailScreen`. It backs the unread-alert dot on the bottom nav's Alerts tab, per-camera unread-count badges on Dashboard tiles, and is the full backing store for AlertsScreen's list/filters and AlertDetailScreen's read/unread/delete/snooze actions. Also in-memory/mock only — no backend wired up yet.
 - `AlertsScreen` additionally takes `homesController` (for the Home filter — Alert only stores `cameraId`/`cameraName`, not `homeId`, so it's derived via a cameraId→home lookup) and optional `initialCameraFilter`/`initialTypeFilter`/`initialUnreadOnly`, all sourced from a `(String, AlertType, bool)` record passed as `state.extra` on the `/alerts` route, used when arriving from AlertDetailScreen's "Unread notifications" related-alerts row.
 - `AlertDetailScreen` and `EventDetailScreen` also take `homesController` (`state.extra` only carries the `Alert`/`RecordedEvent`, not a `Camera`), used solely to resolve `alert.cameraId`/`event.cameraId` into a `Camera` for their "View live" button, which calls `context.go('${DashboardScreen.routeName}/${CameraLiveScreen.routeName}/{cameraId}', extra: camera)` — an absolute cross-branch `go`, not a same-branch `push`, since `CameraLiveScreen` lives in the Dashboard branch's `GoRoute` tree, not the Alerts/Events branches. This switches the bottom-nav selection to Dashboard and lands directly on that camera's live view; if no camera matches the id (shouldn't happen with this mock data, but guarded anyway), a "Camera unreachable" snackbar shows instead of navigating.
-- Log out (AccountScreen's ACCT-013 button) calls `context.go(LoginScreen.routeName)`, sending the user back to `/login` from inside the shell. It doesn't clear any app state (no auth backend wired up yet), so `HomesController`/`AlertsController`/`ProfileController` etc. still hold their in-memory data if the user logs back in during the same app session.
+- Log out (AccountScreen's ACCT-013 button) calls `auth_api`'s `AuthController.instance.signOut()` (invalidates the Cognito session server-side) then `context.go(LoginScreen.routeName)`, sending the user back to `/login` from inside the shell. `signOut()` doesn't clear any app-side state itself — `AuthController.configure()`'s `onSignOut` hooks are where that would happen, and none are registered yet — so `HomesController`/`AlertsController`/`ProfileController` etc. still hold their in-memory data if the user logs back in during the same app session.
 - `profileController` (`ProfileController`, `lib/app_state/profile_controller.dart`) is threaded as a direct constructor param on `AccountScreen` and `AccountSettingsScreen` so display name, role, email, phone, and avatar image stay in sync between the two screens — edits made in Account Settings show up immediately on the Profile tab. In-memory only, resets on app restart.
 - `UsersInvitesScreen`, `InviteUserScreen`, `CreateUserScreen`, and `CameraAccessScreen` all take `homesController` as a direct constructor param, since camera access (all three) and the member/camera-count summary text (`UsersInvitesScreen`) read from it. `InviteUserScreen`/`CreateUserScreen` pop an `InviteUserResult`/`CreateUserResult` (contact-or-name, role, expiry, `CameraAccessScope`) rather than mutating any shared controller directly — `UsersInvitesScreen` applies the result to its own local `_invites`/`_members` list on a non-null pop. `CameraAccessScreen` pops a bare `CameraAccessScope` the same way. The switch + per-home/per-camera checklist itself is a shared `CameraAccessChecklist` widget (`lib/widgets/camera_access_checklist.dart`): `CameraAccessScreen` wraps it as a full screen (editing an existing member is its own destination), while `InviteUserScreen`/`CreateUserScreen` embed it inline (camera access there is just one field of the form, not worth a navigation hop) — same widget, different design IDs per screen.
 - Keep this file in sync whenever a route is added, removed, or its reachability changes — treat it as part of the same rule that requires per-screen docs (see `screen-docs` skill).

@@ -1,24 +1,34 @@
+import 'package:auth_api/auth_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../theme/app_colors.dart';
 import '../dashboard/dashboard_screen.dart';
+import '../login/login_screen.dart';
 
 /// In-app splash shown until the app has finished loading, replacing the
 /// native Android launch splash (removed — see `pubspec.yaml`'s
 /// `flutter_native_splash: android: false`; Android's native Splash Screen
 /// API only supports a centered icon on a solid color, so it couldn't render
 /// the full VizenLink wordmark anyway). Stays up for exactly as long as
-/// [appReady] takes to complete, then hands off to the dashboard — no
-/// arbitrary fixed delay.
+/// [appReady] takes to complete — which includes [AuthController.restore]
+/// — then routes to the dashboard or the login screen depending on whether
+/// a session was restored. No arbitrary fixed delay.
 class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key, required this.appReady});
+  const SplashScreen({
+    super.key,
+    required this.appReady,
+    required this.authController,
+  });
 
   static const routeName = '/splash';
 
   /// Resolves once app-level startup work (theme preference, AI consent
-  /// state, etc. — see `_MobileCctvAppState.initState`) has finished.
+  /// state, auth session restore, etc. — see `_MobileCctvAppState.initState`)
+  /// has finished.
   final Future<void> appReady;
+
+  final AuthController authController;
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -29,7 +39,12 @@ class _SplashScreenState extends State<SplashScreen> {
   void initState() {
     super.initState();
     widget.appReady.then((_) {
-      if (mounted) context.go(DashboardScreen.routeName);
+      if (!mounted) return;
+      final destination =
+          widget.authController.status == AuthStatus.authenticated
+          ? DashboardScreen.routeName
+          : LoginScreen.routeName;
+      context.go(destination);
     });
   }
 

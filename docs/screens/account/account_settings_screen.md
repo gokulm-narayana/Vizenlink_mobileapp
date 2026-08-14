@@ -17,11 +17,7 @@
 | ACSET-012 | OTP entry field | TextFormField (6-digit, numeric) | step 2 of 2 |
 | ACSET-013 | OTP — "Verify" button | ElevatedButton | stub — any 6-digit code is accepted; on success updates the email/phone in local state and closes the dialog |
 | ACSET-014 | OTP — "Resend code" link | TextButton | stub — shows a "Code resent" snackbar |
-| ACSET-005 | Change password row | ListTile | opens the change-password dialog (ACSET-015–018) |
-| ACSET-015 | Change password dialog — current password field | TextFormField | obscured |
-| ACSET-016 | Change password dialog — new password field | TextFormField | obscured; validated min 6 characters |
-| ACSET-017 | Change password dialog — confirm password field | TextFormField | obscured; validated to match ACSET-016 |
-| ACSET-018 | Change password dialog — "Update" button | ElevatedButton | validates the form, then chains into the same OTP dialog as email/phone changes (ACSET-012–014); on verified success shows a "Password updated" snackbar |
+| ACSET-005 | Change password row | ListTile | pushes [change_password_screen.md](change_password_screen.md) (`/account/settings/change-password`) — a full screen, not a dialog (moved off a popup 2026-08-14 for visual consistency with the rest of the app) |
 | ACSET-006 | Two-factor authentication toggle | Switch (in ListTile) | turning ON opens the QR setup dialog (ACSET-021–023) then the confirm-code dialog (ACSET-019–020); turning OFF opens only the confirm-code dialog (already-enrolled authenticator, no re-scan needed); canceling either leaves the switch unchanged |
 | ACSET-021 | 2FA setup dialog — QR code placeholder | Container with a QR-style icon | static placeholder graphic — no real secret is encoded, since there's no auth backend to tie it to |
 | ACSET-022 | 2FA setup dialog — manual secret key | SelectableText | static mock key shown as a manual-entry fallback to the QR code |

@@ -1,3 +1,4 @@
+import 'package:auth_api/auth_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
@@ -5,9 +6,10 @@ import '../../app_state/theme_controller.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_button.dart';
+import '../../widgets/password_form_field.dart';
 import '../../widgets/theme_toggle_button.dart';
-import '../dashboard/dashboard_screen.dart';
 import '../login/login_screen.dart';
+import 'confirm_signup_screen.dart';
 
 class SignupScreen extends StatefulWidget {
   const SignupScreen({super.key, required this.themeController});
@@ -29,7 +31,6 @@ class _SignupScreenState extends State<SignupScreen>
   final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
-  bool _obscurePassword = true;
   bool _isSubmitting = false;
 
   @override
@@ -87,13 +88,43 @@ class _SignupScreenState extends State<SignupScreen>
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
 
-    setState(() => _isSubmitting = true);
-    // Stubbed auth: no backend wired up yet.
-    await Future<void>.delayed(const Duration(milliseconds: 400));
-    setState(() => _isSubmitting = false);
+    if (_identifierTabController.index != 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Phone sign-up is not available yet — use email.'),
+        ),
+      );
+      return;
+    }
 
-    if (!mounted) return;
-    context.go(DashboardScreen.routeName);
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+
+    setState(() => _isSubmitting = true);
+    try {
+      await AuthController.instance.signUp(email, password);
+      if (!mounted) return;
+      context.push(
+        ConfirmSignupScreen.routeName,
+        extra: ConfirmSignupArgs(email: email, password: password),
+      );
+    } on CognitoAuthException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(AuthController.instance.lastError ?? e.message)),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not reach the server. Check your connection and try again.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
   }
 
   Future<void> _submitWithGoogle() async {
@@ -207,35 +238,17 @@ class _SignupScreenState extends State<SignupScreen>
                             ),
                           ),
                           const SizedBox(height: 4),
-                          TextFormField(
+                          PasswordFormField(
                             key: const Key('SIGNUP-006'),
                             controller: _passwordController,
-                            obscureText: _obscurePassword,
-                            decoration: InputDecoration(
-                              labelText: 'Password',
-                              prefixIcon: const Icon(Icons.lock_outline),
-                              suffixIcon: IconButton(
-                                icon: Icon(
-                                  _obscurePassword
-                                      ? Icons.visibility_outlined
-                                      : Icons.visibility_off_outlined,
-                                ),
-                                onPressed: () => setState(
-                                  () => _obscurePassword = !_obscurePassword,
-                                ),
-                              ),
-                            ),
+                            labelText: 'Password',
                             validator: _validatePassword,
                           ),
                           const SizedBox(height: 16),
-                          TextFormField(
+                          PasswordFormField(
                             key: const Key('SIGNUP-007'),
                             controller: _confirmPasswordController,
-                            obscureText: _obscurePassword,
-                            decoration: const InputDecoration(
-                              labelText: 'Confirm password',
-                              prefixIcon: Icon(Icons.lock_outline),
-                            ),
+                            labelText: 'Confirm password',
                             validator: _validateConfirmPassword,
                           ),
                           const SizedBox(height: 24),

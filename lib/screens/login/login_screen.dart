@@ -1,3 +1,4 @@
+import 'package:auth_api/auth_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
@@ -5,9 +6,12 @@ import '../../app_state/theme_controller.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_button.dart';
+import '../../widgets/password_form_field.dart';
 import '../../widgets/theme_toggle_button.dart';
 import '../dashboard/dashboard_screen.dart';
+import '../signup/confirm_signup_screen.dart';
 import '../signup/signup_screen.dart';
+import 'forgot_password_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key, required this.themeController});
@@ -27,13 +31,21 @@ class _LoginScreenState extends State<LoginScreen>
   final _emailController = TextEditingController();
   final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
-  bool _obscurePassword = true;
   bool _isSubmitting = false;
 
   @override
   void initState() {
     super.initState();
     _identifierTabController = TabController(length: 2, vsync: this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final expiredMessage = AuthController.instance.sessionExpiredMessage;
+      if (expiredMessage != null && mounted) {
+        AuthController.instance.sessionExpiredMessage = null;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(expiredMessage)));
+      }
+    });
   }
 
   @override
@@ -72,13 +84,47 @@ class _LoginScreenState extends State<LoginScreen>
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
 
-    setState(() => _isSubmitting = true);
-    // Stubbed auth: no backend wired up yet.
-    await Future<void>.delayed(const Duration(milliseconds: 400));
-    setState(() => _isSubmitting = false);
+    if (_identifierTabController.index != 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Phone sign-in is not available yet — use email.'),
+        ),
+      );
+      return;
+    }
 
-    if (!mounted) return;
-    context.go(DashboardScreen.routeName);
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+
+    setState(() => _isSubmitting = true);
+    try {
+      await AuthController.instance.signIn(email, password);
+      if (!mounted) return;
+      context.go(DashboardScreen.routeName);
+    } on CognitoAuthException catch (e) {
+      if (!mounted) return;
+      if (e.code == 'UserNotConfirmedException') {
+        context.push(
+          ConfirmSignupScreen.routeName,
+          extra: ConfirmSignupArgs(email: email, password: password),
+        );
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(AuthController.instance.lastError ?? e.message)),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not reach the server. Check your connection and try again.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
   }
 
   Future<void> _submitWithGoogle() async {
@@ -183,27 +229,22 @@ class _LoginScreenState extends State<LoginScreen>
                             ),
                           ),
                           const SizedBox(height: 4),
-                          TextFormField(
+                          PasswordFormField(
                             key: const Key('LOGIN-005'),
                             controller: _passwordController,
-                            obscureText: _obscurePassword,
-                            decoration: InputDecoration(
-                              labelText: 'Password',
-                              prefixIcon: const Icon(Icons.lock_outline),
-                              suffixIcon: IconButton(
-                                icon: Icon(
-                                  _obscurePassword
-                                      ? Icons.visibility_outlined
-                                      : Icons.visibility_off_outlined,
-                                ),
-                                onPressed: () => setState(
-                                  () => _obscurePassword = !_obscurePassword,
-                                ),
-                              ),
-                            ),
+                            labelText: 'Password',
                             validator: _validatePassword,
                           ),
-                          const SizedBox(height: 24),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton(
+                              key: const Key('LOGIN-011'),
+                              onPressed: () =>
+                                  context.push(ForgotPasswordScreen.routeName),
+                              child: const Text('Forgot password?'),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
                           GradientButton(
                             key: const Key('LOGIN-006'),
                             onPressed: _isSubmitting ? null : _submit,
