@@ -51,6 +51,7 @@ lib/
         event_preferences_client.dart
         event_response_actions_client.dart
         capabilities_client.dart
+        deterrence_client.dart
         cloud_streaming_client.dart
         mirror_flip_client.dart
         anti_flicker_client.dart
@@ -71,6 +72,7 @@ lib/
       wan_live_view_client.dart    — WanLiveViewClient interface
       aws_wan_live_view_client.dart — concrete WanLiveViewClient implementation
       wan_audio_volume_client.dart
+      wan_deterrence_client.dart
       wan_device_identity_client.dart
       wan_image_quality_client.dart
       wan_imaging_client.dart
@@ -112,6 +114,7 @@ network as the camera.
     - [AudioVolumeClient](#audiovolumeclient)
     - [EventPreferencesClient](#eventpreferencesclient)
     - [EventResponseActionsClient](#eventresponseactionsclient)
+    - [DeterrenceClient](#deterrenceclient)
     - [CapabilitiesClient](#capabilitiesclient)
     - [CloudStreamingLanClient](#cloudstreaminglanclient)
     - [MirrorFlipClient](#mirrorflipclient)
@@ -139,6 +142,7 @@ network as the camera.
   - [WanAntiFlickerClient](#wanantiflickerclient)
   - [WanEventPreferencesClient](#waneventpreferencesclient)
   - [WanEventResponseActionsClient](#waneventresponseactionsclient)
+  - [WanDeterrenceClient](#wandeterrenceclient)
   - [WanNightVisionClient](#wannightvisionclient)
   - [WanOsdClient](#wanosdclient)
   - [WanPrivacyModeClient](#wanprivacymodeclient)
@@ -516,7 +520,7 @@ CapabilitiesClient(NuraeyeClient nuraeye)
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support), `wanLiveViewCapable` (additionally requires KVS build support — both also require this specific device to have real AWS credentials provisioned, not just build-time support), `supportedEventTypes` (`FR-CF-143`/`FR-NE-111` — the alert event strings this build actually generates; empty on firmware too old to report it), and `supportedEventDeterrenceOptions` (`FR-CF-144`/`FR-NE-112` — per detection event type, which response actions are eligible for it; only detection-type events appear as keys, empty map on firmware too old to report it). |
+| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support), `wanLiveViewCapable` (additionally requires KVS build support — both also require this specific device to have real AWS credentials provisioned, not just build-time support), `supportedEventTypes` (`FR-CF-143`/`FR-NE-111` — the alert event strings this build actually generates; empty on firmware too old to report it), `supportedEventDeterrenceOptions` (`FR-CF-144`/`FR-NE-112` — per detection event type, which response actions are eligible for it; only detection-type events appear as keys, empty map on firmware too old to report it), and `sirenCapable`/`spotlightCapable`/`warningCapable` (`FEAT-236`, 2026-08-14 — same hardware-presence flags `GetDeterrenceCapabilities` reports on its own dedicated endpoint, mirrored here so `DeterrenceClient`-consuming UI can reuse this already-fetched response instead of a second round trip; `false` on firmware too old to report them). |
 
 #### EventPreferencesClient
 
@@ -556,6 +560,33 @@ generated at all; this controls what happens *in addition* when an already-enabl
 event fires. `siren`/`spotlight`/`warning` are real physical device actions the camera
 auto-triggers; `mobile_alert` has no device-side effect at all — this app reads it locally to
 decide whether to show a push notification, never as a device-side gate.
+
+#### DeterrenceClient
+
+`lan/nuraeye/deterrence_client.dart` — `ActivateDeterrence`/`DeactivateDeterrence`/
+`GetDeterrenceStatus` (`FR-NE-082`/`083`) plus `GetDeterrenceDurations`/`SetDeterrenceDurations`
+(`FR-NE-113`, `FEAT-236`) — see `WanDeterrenceClient` for the WAN mirror.
+
+```dart
+DeterrenceClient(NuraeyeClient nuraeye)
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getDeterrenceStatus` | `{Duration timeout}` | `CameraResult<DeterrenceStatus>` | Each deterrence action's own independent active/inactive state (`siren`/`spotlight`/`warning` fields, `activeActions` getter, `isActive(action)` helper) — siren/spotlight/warning are independent hardware outputs and can be active simultaneously (`FEAT-236`, 2026-08-14 fix; previously a single `{active, action}` pair could only ever report one action as "the" active one). |
+| `activateDeterrence` | `String action, {Duration timeout}` | `CameraResult<void>` | `action` ∈ `siren`/`spotlight`/`warning`, gated on `CapabilitiesClient`'s `sirenCapable`/`spotlightCapable`/`warningCapable`. **No duration parameter** (removed `FEAT-236`, 2026-08-14) — the camera applies its own persisted duration from `getDeterrenceDurations`/`setDeterrenceDurations` instead, shared with the camera's own automatic detection-triggered response (`EventResponseActionsClient`). |
+| `deactivateDeterrence` | `String action, {Duration timeout}` | `CameraResult<void>` | Stops immediately, regardless of how much of the configured duration remains. |
+| `getDeterrenceDurations` | `{Duration timeout}` | `CameraResult<Map<String, int>>` | Current configured auto-stop value per action, keyed `siren_seconds`/`spotlight_seconds` (whole seconds) and `warning_repeat_count` (a repeat count, not seconds — see below). Only the keys `CapabilitiesClient` reports as capable are meaningful. |
+| `setDeterrenceDurations` | `Map<String, int> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — only the keys present in `changes` change. An unrecognized key, a value outside `getDeterrenceDurationOptions`' reported range for it, or an action this build isn't capable of is a `CameraFailure` (camera returns `HTTP 400`, whole request rejected). |
+| `getDeterrenceDurationOptions` | `{Duration timeout}` | `CameraResult<DeterrenceDurationOptions>` | Camera-reported valid `min`/`max` per key — **build UI bounds from this, never hardcode a range** (real-hardware finding, 2026-08-15: an earlier version hardcoded 0-60s and let the UI set a degenerate `0`). |
+
+**`warning`'s value is a repeat count, not seconds** (revised `FEAT-236`, 2026-08-15, after
+real-hardware testing) — it repeats its prerecorded clip `warning_repeat_count` times before
+stopping (or until an explicit `deactivateDeterrence`), rather than running for a duration. A
+duration-based loop was tried first and found unreliable on real hardware (a fixed-period guess
+timer cut the clip off partway through and restarted it) — the current implementation is
+completion-driven internally (`bsp_camera_ameba.c`'s `prvWarningPollTimerCallback()`), so the
+app only needs to know "how many times," not "how long."
 
 #### CloudStreamingLanClient
 
@@ -827,7 +858,11 @@ abstract interface class WanLiveViewClient {
 }
 
 class AwsWanLiveViewClient implements WanLiveViewClient {
-  AwsWanLiveViewClient(String thingName)
+  AwsWanLiveViewClient(
+    String thingName, {
+    IotCommandClient? iotCommandClient,
+    KvsPlaybackClient? kvsPlaybackClient,
+  })
 }
 ```
 
@@ -842,6 +877,17 @@ class AwsWanLiveViewClient implements WanLiveViewClient {
 [STREAMING_GUIDE.md](STREAMING_GUIDE.md) for the full WAN sequence this class implements, and
 its "Reconnect and failure semantics" section for a known, unresolved gap in how the app
 recovers from a camera-initiated KVS producer restart mid-session.
+
+**Fixed 2026-08-14**: `getCloudStreamingStatus()` was the one method on this class missing the
+`try`/`catch` its three siblings all had — `IotCommandClient.sendCommandWithResponse()` throws
+on a genuine relay/network failure, and with nothing to catch it here that exception propagated
+straight out past every caller's `CameraResult` switch, crashing on a plain transient network
+failure (found by the mobile app team on a real device as an uncaught `SocketException`). Fixed,
+and the constructor now accepts `iotCommandClient`/`kvsPlaybackClient` overrides (matching every
+other `Wan*Client` in this package) — it previously had no way to inject a fake client at all,
+which is why no test had ever exercised this class's real logic directly (every existing test
+went through a hand-written fake of the `WanLiveViewClient` *interface* instead). See
+`test/aws_wan_live_view_client_test.dart` for the new coverage.
 
 ### WanAudioVolumeClient
 
@@ -1013,6 +1059,25 @@ WanEventResponseActionsClient(String thingName, {IotCommandClient? iotCommandCli
 |---|---|---|---|
 | `getEventResponseActions` | `{Duration timeout}` | `CameraResult<Map<String, List<String>>>` | Current selected response actions per detection event type. |
 | `setEventResponseActions` | `Map<String, List<String>> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — same semantics as the LAN client. |
+
+### WanDeterrenceClient
+
+`wan/wan_deterrence_client.dart` — WAN counterpart to `DeterrenceClient`. Same wire vocabulary
+and "no duration parameter on activate" behavior as LAN (`FEAT-236`). No WAN "capabilities"
+command — see `CapabilitiesClient.sirenCapable`/`spotlightCapable`/`warningCapable`, LAN-only.
+
+```dart
+WanDeterrenceClient(String thingName, {IotCommandClient? iotCommandClient})
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getDeterrenceStatus` | `{Duration timeout}` | `CameraResult<DeterrenceStatus>` | Each deterrence action's own independent active/inactive state — same shape as `DeterrenceClient.getDeterrenceStatus`, see there. |
+| `activateDeterrence` | `String action, {Duration timeout}` | `CameraResult<void>` | No duration parameter — the camera applies its own persisted duration. |
+| `deactivateDeterrence` | `String action, {Duration timeout}` | `CameraResult<void>` | Stops immediately. |
+| `getDeterrenceDurations` | `{Duration timeout}` | `CameraResult<Map<String, int>>` | Current configured auto-stop value per action. |
+| `setDeterrenceDurations` | `Map<String, int> changes, {Duration timeout}` | `CameraResult<void>` | Partial update — same semantics as the LAN client. |
+| `getDeterrenceDurationOptions` | `{Duration timeout}` | `CameraResult<DeterrenceDurationOptions>` | Camera-reported valid range per key — same semantics as the LAN client. |
 
 ### WanNightVisionClient
 

@@ -25,9 +25,28 @@
          MulticastLock via a platform channel, which this pure-Dart package
          doesn't do yet) but is required before anything can. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
-    <!-- Needed by flutter_webrtc's getUserMedia for two-way talk (LiveViewController.startTalk)
-         — captures the phone's mic to send to the camera's speaker. -->
+    <!-- Required by flutter_webrtc's native Android audio device module, even for a
+         receive-only audio transceiver (live view has no local mic capture on its own, but
+         the ADM initializes audio routing regardless) — per flutter_webrtc's own setup docs.
+         Missing these causes a native crash immediately after WebRTC connects, not a
+         catchable Dart exception. RECORD_AUDIO is also what two-way talk's getUserMedia
+         (LiveViewController.startTalk) captures the mic through. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <!-- Bluetooth audio-routing permissions the ADM also touches — split by API level per
+         Android 12's (API 31) BLUETOOTH_CONNECT runtime-permission change. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <!-- alerts_api's always-on background camera-alert listener
+         (CameraAlertsHub, packages/alerts_api) runs as a foreground service
+         via flutter_foreground_task — that plugin's own manifest already
+         merges in FOREGROUND_SERVICE/WAKE_LOCK/RECEIVE_BOOT_COMPLETED/
+         POST_NOTIFICATIONS, but not the specific service-type permission
+         Android 14 (API 34) requires for the dataSync foreground-service
+         type this app requests (ForegroundServiceTypes.dataSync in
+         CameraAlertsHub.ensureRunning's startService call). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <application
         android:label="VizenLink"
         android:name="${applicationName}"
@@ -54,6 +73,18 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Required by flutter_foreground_task (alerts_api's CameraAlertsHub) — the plugin
+             does NOT register this service via its own plugin manifest; every consuming app
+             must declare it directly (per the plugin's own example app manifest). Missing this
+             is why CameraAlertsHub.ensureRunning's startService call silently failed with
+             "Unable to start service ... not found" — the service class was never declared
+             anywhere in this app's manifest. Warning: do not change the service name.
+             foregroundServiceType must match ForegroundServiceTypes.dataSync passed to
+             startService() in camera_alerts_hub.dart. -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

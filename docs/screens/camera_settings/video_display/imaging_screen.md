@@ -27,6 +27,10 @@
 | IMG-015 | Unsaved-changes dialog | AlertDialog (shared, `confirmDiscardOnLeave` in `lib/widgets/navigation_leave_guard.dart`) | shown when leaving (back gesture or bottom-nav tap, via the shared `LeaveGuard` widget) while dirty |
 | IMG-016 | Discard button (in IMG-015) | TextButton | discards the change and leaves |
 | IMG-017 | Save button (in IMG-015) | FilledButton | saves via `_save()` before leaving |
+| IMG-020 | WDR unsupported notice | Text | shown in place of IMG-012/IMG-013 once loading finishes and `getImagingOptions().wdrSupported` is explicitly `false` — "WDR not supported by this camera." |
+| IMG-021 | Reload settings button (AppBar action) | `ReloadSettingsButton` (shared widget, `lib/widgets/reload_settings_button.dart`) | re-runs `getImagingSettings`/`getImagingOptions`/`getMirrorFlip`/`GetImageDefaults` (same LAN/WAN logic as the initial load) to refresh every field from the camera's current state, for a change made elsewhere (another client, the camera's own web UI) that hasn't shown up here yet; disabled while a load or save is already in flight; shows a snackbar instead if the camera has no saved connection yet |
+
+While the camera's `getImagingSettings`/`getImagingOptions`/`getMirrorFlip`/`GetImageDefaults` calls are in flight (saved connection only), the whole screen is blocked by the same `SavingOverlay` used for Save, showing "Loading…" instead of "Saving…" — this replaces what used to be an optimistic render of IMG-012/IMG-013 (shown by default pre-load) that could disappear after ~1s once the real response landed.
 
 Body uses `FixedPreviewLayout` (shared widget, `lib/widgets/fixed_preview_layout.dart`): the preview stays pinned at the top of the screen while only the controls below it scroll — the same layout used by every camera-settings screen with a preview (Video Mode, Night Mode, On-Screen Display, Tags).
 

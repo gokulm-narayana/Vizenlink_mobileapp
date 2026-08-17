@@ -13,6 +13,7 @@ import '../../widgets/gradient_background.dart';
 import '../../widgets/mode_tile.dart';
 import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/refresh_preview_button.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -77,6 +78,22 @@ class _NightModeScreenState extends State<NightModeScreen> {
   late bool? _colorCapable = _camera.nightVisionColorCapable;
   late bool? _smartCapable = _camera.nightVisionSmartCapable;
 
+  /// True only while a saved connection exists and its `GetNightVisionType`
+  /// response hasn't landed yet — gates the Smart/Full Color tiles so they
+  /// never render off a stale/guessed capability flag and then flicker once
+  /// the real answer arrives. No connection means there's nothing to wait
+  /// for, so this starts `false` and the tiles fall back to "show both"
+  /// (see the `_smartCapable`/`_colorCapable` doc above).
+  late bool _isLoading = _camera.connection != null;
+
+  /// Which tiles the camera's own response explicitly ruled out — only
+  /// populated once [_isLoading] is `false`, so this never flashes based on
+  /// a stale or unverified guess.
+  List<String> get _unsupportedNightModeFeatures => [
+    if (_smartCapable == false) 'Smart',
+    if (_colorCapable == false) 'Full Color',
+  ];
+
   @override
   void initState() {
     super.initState();
@@ -100,6 +117,7 @@ class _NightModeScreenState extends State<NightModeScreen> {
         _mode = _typeToNightMode(value.type);
         _colorCapable = value.colorCapable;
         _smartCapable = value.smartCapable;
+        _isLoading = false;
       });
       widget.homesController.updateCamera(
         widget.camera.id,
@@ -109,7 +127,26 @@ class _NightModeScreenState extends State<NightModeScreen> {
           nightVisionSmartCapable: value.smartCapable,
         ),
       );
+    } else {
+      setState(() => _isLoading = false);
     }
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits)
+  /// and [_refreshPreview] (only refetches the preview image).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isLoading = true);
+    await _loadRealNightMode();
   }
 
   void _onModeChanged(CameraNightMode? value) {
@@ -241,6 +278,11 @@ class _NightModeScreenState extends State<NightModeScreen> {
             key: const Key('NIGHT-001'),
             title: const Text('Night Mode'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('NIGHT-012'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('NIGHT-004'),
                 isDirty: _isDirty,
@@ -250,7 +292,8 @@ class _NightModeScreenState extends State<NightModeScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -312,6 +355,16 @@ class _NightModeScreenState extends State<NightModeScreen> {
                       ],
                   ],
                 ),
+                if (!_isLoading &&
+                    _unsupportedNightModeFeatures.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Not supported by this camera: '
+                    '${_unsupportedNightModeFeatures.join(', ')}',
+                    key: const Key('NIGHT-011'),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
               ],
             ),
           ),

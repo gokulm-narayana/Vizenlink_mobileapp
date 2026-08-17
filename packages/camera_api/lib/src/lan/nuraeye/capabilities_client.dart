@@ -17,6 +17,9 @@ class CameraCapabilities {
     required this.wanLiveViewCapable,
     required this.supportedEventTypes,
     required this.supportedEventDeterrenceOptions,
+    required this.sirenCapable,
+    required this.spotlightCapable,
+    required this.warningCapable,
   });
 
   /// Whether this device can receive AWS IoT/MQTT commands at all (deterrence, settings sync,
@@ -45,6 +48,16 @@ class CameraCapabilities {
   /// builds its response-action multi-select from this map only, never a hardcoded action list.
   /// Empty on firmware too old to report it.
   final Map<String, List<String>> supportedEventDeterrenceOptions;
+
+  /// `FR-CF-124`/`FR-CF-127`/`FR-CF-132` hardware presence — same fields
+  /// `GetDeterrenceCapabilities` (`FR-NE-082`) already reports on its own dedicated endpoint,
+  /// mirrored onto this one too (`FEAT-236`) so `EventSettingsScreen`'s Deterrence duration
+  /// section and Live View's manual trigger controls can gate on the same already-fetched
+  /// response other capability-driven UI already uses, instead of a second round trip. Default
+  /// `false` on firmware too old to report them.
+  final bool sirenCapable;
+  final bool spotlightCapable;
+  final bool warningCapable;
 }
 
 /// Dispatches over both LAN and WAN on the firmware side (`FR-NE-092`, matching the
@@ -91,6 +104,9 @@ class CapabilitiesClient {
               wanLiveViewCapable: wanLiveViewCapable,
               supportedEventTypes: supportedEventTypes,
               supportedEventDeterrenceOptions: supportedEventDeterrenceOptions,
+              sirenCapable: value['siren_capable'] == true,
+              spotlightCapable: value['spotlight_capable'] == true,
+              warningCapable: value['warning_capable'] == true,
             ),
           );
         }(),

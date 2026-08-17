@@ -25,9 +25,11 @@ enum AlertType {
   other,
 }
 
-/// A single alert/notification, e.g. "Motion detected" for a camera.
-/// Local-only mock data for now — no backend/protocol wired up yet (see
-/// CLAUDE.md).
+/// A single alert/notification, e.g. "Motion detected" for a camera. Backed
+/// by `alerts_api`'s live `CameraAlertsHub.events` stream (see
+/// `AlertsController`) and persisted locally via [toJson]/[fromJson] so
+/// history survives an app restart — `alerts_api` itself only delivers
+/// alerts live, going forward, with no historical-list endpoint.
 class Alert {
   const Alert({
     required this.id,
@@ -69,4 +71,31 @@ class Alert {
       snapshotUrl: snapshotUrl,
     );
   }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'type': type.name,
+    'message': message,
+    'cameraId': cameraId,
+    'cameraName': cameraName,
+    'timestamp': timestamp.toIso8601String(),
+    'isRead': isRead,
+    if (description != null) 'description': description,
+    if (snapshotUrl != null) 'snapshotUrl': snapshotUrl,
+  };
+
+  factory Alert.fromJson(Map<String, dynamic> json) => Alert(
+    id: json['id'] as String,
+    type: AlertType.values.firstWhere(
+      (t) => t.name == json['type'],
+      orElse: () => AlertType.other,
+    ),
+    message: json['message'] as String,
+    cameraId: json['cameraId'] as String,
+    cameraName: json['cameraName'] as String,
+    timestamp: DateTime.parse(json['timestamp'] as String),
+    isRead: json['isRead'] as bool? ?? false,
+    description: json['description'] as String?,
+    snapshotUrl: json['snapshotUrl'] as String?,
+  );
 }

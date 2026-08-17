@@ -16,6 +16,10 @@
 | NIGHT-008 | Unsaved-changes dialog | AlertDialog (shared, `confirmDiscardOnLeave` in `lib/widgets/navigation_leave_guard.dart`) | shown when leaving (back gesture or bottom-nav tap, via the shared `LeaveGuard` widget) while dirty |
 | NIGHT-009 | Discard button (in NIGHT-008) | TextButton | discards the change and leaves |
 | NIGHT-010 | Save button (in NIGHT-008) | FilledButton | saves via `_save()` before leaving |
+| NIGHT-011 | Unsupported-features notice | Text | shown below NIGHT-006 once loading finishes (never during the initial `GetNightVisionType` round trip, so it never flashes) and only when the camera's response explicitly rules out Smart and/or Full Color — e.g. "Not supported by this camera: Smart, Full Color" |
+| NIGHT-012 | Reload settings button (AppBar action) | `ReloadSettingsButton` (shared widget, `lib/widgets/reload_settings_button.dart`) | re-runs `NightVisionClient.getNightVisionType` (same LAN/WAN logic as the initial load) to refresh NIGHT-006/NIGHT-011 from the camera's current state, for a change made elsewhere (another client, the camera's own web UI) that hasn't shown up here yet; disabled while a load or save is already in flight; shows a snackbar instead if the camera has no saved connection yet |
+
+While the camera's `GetNightVisionType` response is in flight (saved connection only), the whole screen is blocked by the same `SavingOverlay` used for Save, showing "Loading…" instead of "Saving…" — this replaces what used to be an optimistic render of NIGHT-006 off a stale/guessed capability flag that could flip after ~1s once the real response landed.
 
 NIGHT-002 (previously Auto/On/Off) and NIGHT-003 (previously IR LED brightness slider) are retired — replaced by NIGHT-005/006 above.
 

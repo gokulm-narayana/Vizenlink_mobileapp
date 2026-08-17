@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:alerts_api/alerts_api.dart';
 import 'package:auth_api/auth_api.dart';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
@@ -106,6 +109,25 @@ void main() {
       PreviewKeyStore.instance.getExistingPrivateKey;
   WanAuth.onPreviewKeyNeedsRegistration =
       PreviewKeyStore.instance.flagNeedsReregistration;
+  // alerts_api's always-on background alert listener (packages/alerts_api/
+  // API_REFERENCE.md § Configuration) — same live, fleet-wide AWS IoT Core
+  // values as camera_api's own WAN clients, not a placeholder.
+  // `cameraListProvider` reads whatever `HomesController` currently has
+  // loaded; `ensureRunning()`/`.stop()` themselves are driven by auth state
+  // in `_MobileCctvAppState`, not here.
+  AlertsAuth.config = const AlertsApiConfig(
+    region: 'ap-south-1',
+    iotEndpoint: 'a1zfm34z2p80an-ats.iot.ap-south-1.amazonaws.com',
+  );
+  AlertsAuth.credentialsProvider = () async {
+    final creds = await AuthController.instance.awsCredentials();
+    return AlertsCredentials(
+      accessKeyId: creds.accessKeyId,
+      secretKey: creds.secretKey,
+      sessionToken: creds.sessionToken,
+      expiresAt: creds.expiresAt,
+    );
+  };
   runApp(const MobileCctvApp());
 }
 
@@ -116,10 +138,13 @@ class MobileCctvApp extends StatefulWidget {
   State<MobileCctvApp> createState() => _MobileCctvAppState();
 }
 
-class _MobileCctvAppState extends State<MobileCctvApp> {
+class _MobileCctvAppState extends State<MobileCctvApp>
+    with WidgetsBindingObserver {
   final _themeController = ThemeController();
   final _homesController = HomesController();
-  final _alertsController = AlertsController();
+  late final _alertsController = AlertsController(
+    homesController: _homesController,
+  );
   final _eventsController = EventsController();
   final _profileController = ProfileController();
   final _navigationGuard = NavigationGuardController();
@@ -130,6 +155,21 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // alerts_api's cameraListProvider hook (packages/alerts_api/
+    // API_REFERENCE.md § Configuration) — every onboarded camera with a
+    // known thingName, read fresh on every ensureRunning() call.
+    AlertsAuth.cameraListProvider = () async => [
+      for (final home in _homesController.value.homes)
+        for (final camera in home.cameras)
+          if (camera.thingName != null)
+            WatchedCamera(thingName: camera.thingName!),
+    ];
+    // ensureRunning()/stop() themselves are driven by AuthController's own
+    // status ("after login"/"on logout" per alerts_api's own doc) — set up
+    // before restore() below so a session restored at cold start is caught
+    // too, not just an interactive sign-in.
+    AuthController.instance.addListener(_syncAlertsListenerToAuthStatus);
     // The splash stays up for exactly as long as this real background
     // loading takes — no artificial padding. It used to force a fixed
     // 15-second minimum regardless of how fast loading actually finished,
@@ -140,12 +180,45 @@ class _MobileCctvAppState extends State<MobileCctvApp> {
       _aiModelManager.load(),
       _homesController.load(),
       AuthController.instance.restore(),
-    ]);
+    ]).then((_) => _syncAlertsListenerToAuthStatus());
     _router = _buildRouter();
+  }
+
+  AuthStatus? _lastSyncedAuthStatus;
+
+  void _syncAlertsListenerToAuthStatus() {
+    final status = AuthController.instance.status;
+    if (status == _lastSyncedAuthStatus) return;
+    _lastSyncedAuthStatus = status;
+    if (status == AuthStatus.authenticated) {
+      // ignore: avoid_print
+      print('[Alerts] auth authenticated — calling ensureRunning()');
+      unawaited(
+        CameraAlertsHub.instance.ensureRunning().then(
+          // ignore: avoid_print
+          (_) => print('[Alerts] ensureRunning() completed'),
+        ),
+      );
+    } else if (status == AuthStatus.unauthenticated) {
+      unawaited(CameraAlertsHub.instance.stop());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // alerts_api's own doc: "Call after login, on app resume, and
+    // periodically while signed in" — the periodic part is handled
+    // internally by the package itself once started.
+    if (state == AppLifecycleState.resumed &&
+        AuthController.instance.status == AuthStatus.authenticated) {
+      unawaited(CameraAlertsHub.instance.ensureRunning());
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    AuthController.instance.removeListener(_syncAlertsListenerToAuthStatus);
     _themeController.dispose();
     _homesController.dispose();
     _alertsController.dispose();

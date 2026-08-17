@@ -24,6 +24,12 @@
 | OSD-019 | Unsaved-changes dialog | AlertDialog (shared, `confirmDiscardOnLeave` in `lib/widgets/navigation_leave_guard.dart`) | shown when leaving (back gesture or bottom-nav tap, via the shared `LeaveGuard` widget) while dirty |
 | OSD-020 | Discard button (in OSD-019) | TextButton | discards the change and leaves |
 | OSD-021 | Save button (in OSD-019) | FilledButton | saves via `_save()` before leaving |
+| OSD-022 | Time color unsupported notice | Text | shown in place of OSD-013 once loading finishes and the camera's `getOsdOptions()` response explicitly reports neither a continuous RGB range nor a discrete color list — "Color not supported by this camera." |
+| OSD-023 | Custom text color unsupported notice | Text | same as OSD-022, shown in place of OSD-015 |
+| OSD-024 | Reload settings button (AppBar action) | `ReloadSettingsButton` (shared widget, `lib/widgets/reload_settings_button.dart`) | re-runs `getOsds`/`getOsdOptions`/`Media2CapabilitiesClient.getServiceCapabilities` (same LAN/WAN logic as the initial load) to refresh every field from the camera's current state, for a change made elsewhere (another client, the camera's own web UI) that hasn't shown up here yet; disabled while a load or save is already in flight; shows a snackbar instead if the camera has no saved connection yet |
+| OSD-025 | OSD unsupported notice | Text (in a `GlassCard`) | replaces both OSD-006–023 cards entirely, once loading finishes, when the camera's own `Media2CapabilitiesClient.getServiceCapabilities().osdSupported` explicitly reports `false` — "This camera doesn't support On-Screen Display." This is a coarser, separate gate from OSD-022/023 (which only cover font color): `_osdOptions` staying `null` on a `getOsds`/`getOsdOptions` failure looks identical to "still loading," so `osdSupported` is the only reliable signal for "this camera's Media2 service doesn't offer OSD at all," per `packages/camera_api/SETTINGS_API_GUIDE.md`'s two-gate OSD design |
+
+While the camera's `getOsds`/`getOsdOptions` responses are in flight (saved connection only), the whole screen is blocked by the same `SavingOverlay` used for Save, showing "Loading…" instead of "Saving…" — this replaces what used to be an optimistic render of OSD-013/OSD-015 (shown by default pre-load) that could disappear after ~1s once the real response landed.
 
 The Time overlay always shows date + time combined (e.g. "2026-08-05 14:05"), formatted per OSD-016/OSD-017 independently — there's no separate show/hide for date vs. time.
 

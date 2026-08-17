@@ -6,6 +6,7 @@ import '../../models/camera.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -147,6 +148,15 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
   /// reasoning as `_dummyTimezones` in camera_info_screen).
   VideoEncoderSettingsOptions? _encoderOptions;
 
+  /// True only while a saved connection exists and its
+  /// `getVideoEncoderSettings`/`getVideoEncoderSettingsOptions` responses
+  /// haven't landed yet — gates the full-screen loading overlay so
+  /// capability-derived controls (resolution/encoder/profile/bitrate-mode
+  /// choices) never render off a stale/fallback guess and then flicker once
+  /// the real answer arrives. No connection means there's nothing to wait
+  /// for.
+  late bool _isLoading = _camera.connection != null;
+
   EncodingOptions? get _currentEncodingOptions =>
       _encoderOptions?.forEncoding(_encoderTypeToWire(_encoder));
 
@@ -210,6 +220,7 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
       if (optionsResult case CameraSuccess(:final value)) {
         _encoderOptions = value;
       }
+      _isLoading = false;
     });
 
     if (settingsResult case CameraSuccess(:final value)) {
@@ -231,6 +242,22 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
         ),
       );
     }
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isLoading = true);
+    await _loadRealVideoEncoder();
   }
 
   void _markDirty(VoidCallback update) {
@@ -360,6 +387,11 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
             key: const Key('ENC-001'),
             title: const Text('Video Encoder'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('ENC-018'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('ENC-002'),
                 isDirty: _isDirty,
@@ -369,7 +401,8 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: ListView(
               padding: const EdgeInsets.all(16),
               children: [

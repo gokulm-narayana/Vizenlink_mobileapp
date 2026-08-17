@@ -14,6 +14,7 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/refresh_preview_button.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -296,6 +297,15 @@ List<_OverlayPosition> _availablePositions(
 /// Live page) live on the separate Tags screen, since they affect the
 /// Camera Live page rather than this screen's own preview. Save is disabled
 /// until a field changes.
+///
+/// Two separate capability gates apply, per `SETTINGS_API_GUIDE.md`: device-
+/// wide OSD support (`Media2CapabilitiesClient.getServiceCapabilities()
+/// .osdSupported`) hides the whole Time/Custom Text UI when explicitly
+/// `false` (OSD-025) — a `getOsds`/`getOsdOptions` failure alone can't be
+/// used for this, since it leaves `_osdOptions` `null`, indistinguishable
+/// from "still loading". Font color support (`OsdOptions
+/// .fontColorRangeAvailable`/`.fontColors`) only hides the two color pickers
+/// (OSD-022/023). Neither substitutes for the other.
 class OnScreenDisplayScreen extends StatefulWidget {
   const OnScreenDisplayScreen({
     super.key,
@@ -349,6 +359,32 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
   /// color pickers to what the camera actually reports.
   OsdOptions? _osdOptions;
 
+  /// Device-wide OSD support (`Media2CapabilitiesClient.getServiceCapabilities()
+  /// .osdSupported`) — null means unverified. This is a coarser, separate gate
+  /// from [_osdOptions]/[_colorUnsupported]: a camera whose Media2 service
+  /// doesn't offer OSD at all still lets `getOsds`/`getOsdOptions` return a
+  /// (non-success) result, which on its own leaves [_osdOptions] `null` and
+  /// would otherwise look identical to "still loading" — this flag is what
+  /// actually distinguishes "verified unsupported" from "unverified", per
+  /// `packages/camera_api/SETTINGS_API_GUIDE.md`'s two-gate OSD design.
+  bool? _osdSupported;
+
+  /// True only while a saved connection exists and its `getOsds`/
+  /// `getOsdOptions`/`getServiceCapabilities` responses haven't landed yet —
+  /// gates the capability-derived controls (color pickers, and the whole
+  /// Time/Custom Text UI via [_osdSupported]) so they never render off a
+  /// default/unverified guess and then flicker once the real answer
+  /// arrives. No connection means there's nothing to wait for.
+  late bool _isLoading = _camera.connection != null;
+
+  /// Whether the camera's own `getOsdOptions()` response explicitly ruled
+  /// out font color (neither a continuous range nor a discrete list) — only
+  /// meaningful once [_isLoading] is `false`.
+  bool get _colorUnsupported =>
+      _osdOptions != null &&
+      !_osdOptions!.fontColorRangeAvailable &&
+      _osdOptions!.fontColors.isEmpty;
+
   /// Looked up fresh from [HomesController] on every build (not
   /// [widget.camera] directly) so a refreshed snapshot from [_refreshPreview]
   /// actually shows up without leaving and re-entering this screen.
@@ -371,14 +407,18 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
     final connection = _camera.connection;
     if (connection == null) return;
     final client = OsdClient(connection);
+    final capabilitiesClient = Media2CapabilitiesClient(connection);
     final results = await Future.wait([
       client.getOsds(),
       client.getOsdOptions(),
+      capabilitiesClient.getServiceCapabilities(),
     ]);
     client.close();
+    capabilitiesClient.close();
 
     var osdsResult = results[0] as CameraResult<List<OsdEntry>>;
     final optionsResult = results[1] as CameraResult<OsdOptions>;
+    final capabilitiesResult = results[2] as CameraResult<Media2Capabilities>;
 
     // Options are LAN-only on a normal load (see this class's doc comment)
     // — only the current-value getOsds read falls back to WAN here.
@@ -437,7 +477,28 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
       if (optionsResult case CameraSuccess(:final value)) {
         _osdOptions = value;
       }
+      if (capabilitiesResult case CameraSuccess(:final value)) {
+        _osdSupported = value.osdSupported;
+      }
+      _isLoading = false;
     });
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits)
+  /// and [_refreshPreview] (only refetches the preview image).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isLoading = true);
+    await _loadRealOsd();
   }
 
   @override
@@ -714,6 +775,11 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
             key: const Key('OSD-001'),
             title: const Text('On-Screen Display'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('OSD-024'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('OSD-004'),
                 isDirty: _isDirty,
@@ -723,7 +789,8 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -759,199 +826,228 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                 ],
               ),
               scrollableChildren: [
-                GlassCard(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      SwitchListTile(
-                        key: const Key('OSD-006'),
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Time'),
-                        value: _timeEnabled,
-                        onChanged: (value) =>
-                            _markDirty(() => _timeEnabled = value),
-                      ),
-                      const SizedBox(height: 8),
-                      DropdownButtonFormField<_DateFormat>(
-                        key: const Key('OSD-016'),
-                        initialValue: _dateFormat,
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Date format',
-                        ),
-                        items: [
-                          for (final format in _availableDateFormats(
-                            _osdOptions,
-                            _dateFormat,
-                          ))
-                            DropdownMenuItem(
-                              value: format,
-                              child: Text(
-                                format.label,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                        ],
-                        onChanged: _timeEnabled
-                            ? (value) => _markDirty(() => _dateFormat = value!)
-                            : null,
-                      ),
-                      const SizedBox(height: 8),
-                      DropdownButtonFormField<_TimeFormat>(
-                        key: const Key('OSD-017'),
-                        initialValue: _timeFormat,
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Time format',
-                        ),
-                        items: [
-                          for (final format in _availableTimeFormats(
-                            _osdOptions,
-                            _timeFormat,
-                          ))
-                            DropdownMenuItem(
-                              value: format,
-                              child: Text(
-                                format.label,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                        ],
-                        onChanged: _timeEnabled
-                            ? (value) => _markDirty(() => _timeFormat = value!)
-                            : null,
-                      ),
-                      const SizedBox(height: 8),
-                      DropdownButtonFormField<_OverlayPosition>(
-                        key: const Key('OSD-012'),
-                        initialValue: _timePosition,
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Position',
-                        ),
-                        items: [
-                          for (final position in _availablePositions(
-                            _osdOptions,
-                            _timePosition,
-                          ))
-                            DropdownMenuItem(
-                              value: position,
-                              child: Text(
-                                position.label,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                        ],
-                        onChanged: _timeEnabled
-                            ? (value) =>
-                                  _markDirty(() => _timePosition = value!)
-                            : null,
-                      ),
-                      if (_timePosition == _OverlayPosition.custom) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          'Drag on the preview to reposition',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ],
-                      // Hidden outright when the camera reports neither a
-                      // continuous RGB range nor a discrete color list — per
-                      // OsdOptions' doc, a color control with nothing behind
-                      // it isn't a real choice.
-                      if (_osdOptions == null ||
-                          _osdOptions!.fontColorRangeAvailable ||
-                          _osdOptions!.fontColors.isNotEmpty) ...[
-                        const SizedBox(height: 12),
-                        Text(
-                          'Color',
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                        const SizedBox(height: 8),
-                        ColorPickerField(
-                          settingsKey: const Key('OSD-013'),
-                          color: _timeColor,
-                          enabled: _timeEnabled,
-                          onChanged: (color) =>
-                              _markDirty(() => _timeColor = color),
-                        ),
-                      ],
-                    ],
+                if (_osdSupported == false && !_isLoading) ...[
+                  GlassCard(
+                    child: Text(
+                      "This camera doesn't support On-Screen Display.",
+                      key: const Key('OSD-025'),
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 12),
-                GlassCard(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      SwitchListTile(
-                        key: const Key('OSD-007'),
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Custom text'),
-                        value: _customTextEnabled,
-                        onChanged: (value) =>
-                            _markDirty(() => _customTextEnabled = value),
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        key: const Key('OSD-008'),
-                        controller: _customTextController,
-                        enabled: _customTextEnabled,
-                        decoration: const InputDecoration(labelText: 'Text'),
-                        onChanged: (_) => _markDirty(() {}),
-                      ),
-                      const SizedBox(height: 8),
-                      DropdownButtonFormField<_OverlayPosition>(
-                        key: const Key('OSD-014'),
-                        initialValue: _customTextPosition,
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Position',
-                        ),
-                        items: [
-                          for (final position in _availablePositions(
-                            _osdOptions,
-                            _customTextPosition,
-                          ))
-                            DropdownMenuItem(
-                              value: position,
-                              child: Text(
-                                position.label,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                        ],
-                        onChanged: _customTextEnabled
-                            ? (value) =>
-                                  _markDirty(() => _customTextPosition = value!)
-                            : null,
-                      ),
-                      if (_customTextPosition == _OverlayPosition.custom) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          'Drag on the preview to reposition',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ],
-                      if (_osdOptions == null ||
-                          _osdOptions!.fontColorRangeAvailable ||
-                          _osdOptions!.fontColors.isNotEmpty) ...[
-                        const SizedBox(height: 12),
-                        Text(
-                          'Color',
-                          style: Theme.of(context).textTheme.bodyMedium,
+                ] else ...[
+                  GlassCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        SwitchListTile(
+                          key: const Key('OSD-006'),
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Time'),
+                          value: _timeEnabled,
+                          onChanged: (value) =>
+                              _markDirty(() => _timeEnabled = value),
                         ),
                         const SizedBox(height: 8),
-                        ColorPickerField(
-                          settingsKey: const Key('OSD-015'),
-                          color: _customTextColor,
+                        DropdownButtonFormField<_DateFormat>(
+                          key: const Key('OSD-016'),
+                          initialValue: _dateFormat,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Date format',
+                          ),
+                          items: [
+                            for (final format in _availableDateFormats(
+                              _osdOptions,
+                              _dateFormat,
+                            ))
+                              DropdownMenuItem(
+                                value: format,
+                                child: Text(
+                                  format.label,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                          ],
+                          onChanged: _timeEnabled
+                              ? (value) =>
+                                    _markDirty(() => _dateFormat = value!)
+                              : null,
+                        ),
+                        const SizedBox(height: 8),
+                        DropdownButtonFormField<_TimeFormat>(
+                          key: const Key('OSD-017'),
+                          initialValue: _timeFormat,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Time format',
+                          ),
+                          items: [
+                            for (final format in _availableTimeFormats(
+                              _osdOptions,
+                              _timeFormat,
+                            ))
+                              DropdownMenuItem(
+                                value: format,
+                                child: Text(
+                                  format.label,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                          ],
+                          onChanged: _timeEnabled
+                              ? (value) =>
+                                    _markDirty(() => _timeFormat = value!)
+                              : null,
+                        ),
+                        const SizedBox(height: 8),
+                        DropdownButtonFormField<_OverlayPosition>(
+                          key: const Key('OSD-012'),
+                          initialValue: _timePosition,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Position',
+                          ),
+                          items: [
+                            for (final position in _availablePositions(
+                              _osdOptions,
+                              _timePosition,
+                            ))
+                              DropdownMenuItem(
+                                value: position,
+                                child: Text(
+                                  position.label,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                          ],
+                          onChanged: _timeEnabled
+                              ? (value) =>
+                                    _markDirty(() => _timePosition = value!)
+                              : null,
+                        ),
+                        if (_timePosition == _OverlayPosition.custom) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'Drag on the preview to reposition',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                        // Hidden outright when the camera reports neither a
+                        // continuous RGB range nor a discrete color list — per
+                        // OsdOptions' doc, a color control with nothing behind
+                        // it isn't a real choice.
+                        if (_osdOptions == null ||
+                            _osdOptions!.fontColorRangeAvailable ||
+                            _osdOptions!.fontColors.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            'Color',
+                            style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                          const SizedBox(height: 8),
+                          ColorPickerField(
+                            settingsKey: const Key('OSD-013'),
+                            color: _timeColor,
+                            enabled: _timeEnabled,
+                            onChanged: (color) =>
+                                _markDirty(() => _timeColor = color),
+                          ),
+                        ],
+                        if (!_isLoading && _colorUnsupported) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Color not supported by this camera.',
+                            key: const Key('OSD-022'),
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  GlassCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        SwitchListTile(
+                          key: const Key('OSD-007'),
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Custom text'),
+                          value: _customTextEnabled,
+                          onChanged: (value) =>
+                              _markDirty(() => _customTextEnabled = value),
+                        ),
+                        const SizedBox(height: 8),
+                        TextField(
+                          key: const Key('OSD-008'),
+                          controller: _customTextController,
                           enabled: _customTextEnabled,
-                          onChanged: (color) =>
-                              _markDirty(() => _customTextColor = color),
+                          decoration: const InputDecoration(labelText: 'Text'),
+                          onChanged: (_) => _markDirty(() {}),
                         ),
+                        const SizedBox(height: 8),
+                        DropdownButtonFormField<_OverlayPosition>(
+                          key: const Key('OSD-014'),
+                          initialValue: _customTextPosition,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Position',
+                          ),
+                          items: [
+                            for (final position in _availablePositions(
+                              _osdOptions,
+                              _customTextPosition,
+                            ))
+                              DropdownMenuItem(
+                                value: position,
+                                child: Text(
+                                  position.label,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                          ],
+                          onChanged: _customTextEnabled
+                              ? (value) => _markDirty(
+                                  () => _customTextPosition = value!,
+                                )
+                              : null,
+                        ),
+                        if (_customTextPosition == _OverlayPosition.custom) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'Drag on the preview to reposition',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                        if (_osdOptions == null ||
+                            _osdOptions!.fontColorRangeAvailable ||
+                            _osdOptions!.fontColors.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            'Color',
+                            style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                          const SizedBox(height: 8),
+                          ColorPickerField(
+                            settingsKey: const Key('OSD-015'),
+                            color: _customTextColor,
+                            enabled: _customTextEnabled,
+                            onChanged: (color) =>
+                                _markDirty(() => _customTextColor = color),
+                          ),
+                        ],
+                        if (!_isLoading && _colorUnsupported) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Color not supported by this camera.',
+                            key: const Key('OSD-023'),
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),

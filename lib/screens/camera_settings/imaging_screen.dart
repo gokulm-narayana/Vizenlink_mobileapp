@@ -13,6 +13,7 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/refresh_preview_button.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -225,6 +226,13 @@ class _ImagingScreenState extends State<ImagingScreen> {
   /// back to this screen's hardcoded defaults.
   _ImageDefaults? _imageDefaults;
 
+  /// True only while a saved connection exists and its `getImagingOptions`/
+  /// `getImagingSettings` responses haven't landed yet — gates the
+  /// capability-derived controls (WDR) so they never render off a default/
+  /// unverified guess and then flicker once the real answer arrives. No
+  /// connection means there's nothing to wait for.
+  late bool _isLoading = _camera.connection != null;
+
   @override
   void initState() {
     super.initState();
@@ -326,6 +334,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
       if (defaultsResult case CameraSuccess(:final value)) {
         _imageDefaults = _ImageDefaults.fromJson(value);
       }
+      _isLoading = false;
     });
 
     widget.homesController.updateCamera(
@@ -342,6 +351,23 @@ class _ImagingScreenState extends State<ImagingScreen> {
         exposure: _exposure,
       ),
     );
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits)
+  /// and [_refreshPreview] (only refetches the preview image).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isLoading = true);
+    await _loadRealImaging();
   }
 
   void _markDirty(VoidCallback update) {
@@ -545,6 +571,11 @@ class _ImagingScreenState extends State<ImagingScreen> {
             key: const Key('IMG-001'),
             title: const Text('Imaging'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('IMG-021'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('IMG-002'),
                 isDirty: _isDirty,
@@ -554,7 +585,8 @@ class _ImagingScreenState extends State<ImagingScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -686,6 +718,13 @@ class _ImagingScreenState extends State<ImagingScreen> {
                       ),
                     ),
                   ],
+                ] else if (!_isLoading) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'WDR not supported by this camera.',
+                    key: const Key('IMG-020'),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
                 ],
                 const SizedBox(height: 16),
                 Text(

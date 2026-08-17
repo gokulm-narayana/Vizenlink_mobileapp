@@ -398,10 +398,12 @@ have zero, one, or several response actions selected at once.
   (`NuraeyeClient.call('...alert-rules...')`) — a narrower, pre-existing concept this
   generalizes for the event types it covers.
 - The manual, on-demand `ActivateDeterrence`/`DeactivateDeterrence`/`GetDeterrenceStatus`
-  actions (no dedicated `camera_api` client yet, reachable via `NuraeyeClient.call()` directly)
-  — those are a human pressing a button to fire an action right now for a chosen duration; this
-  is the camera auto-firing an action because a detection event just happened, with a
-  firmware-chosen duration.
+  actions (`DeterrenceClient`, see [Deterrence — Manual Trigger & Auto-Stop
+  Duration](#deterrence--manual-trigger--auto-stop-duration) below) — those are a human pressing
+  a button in Live View to fire an action right now; this is the camera auto-firing an action
+  because a detection event just happened. **Both share the exact same configured auto-stop
+  duration** (`FR-NE-113`, `FEAT-236`) — there is no separate "automatic" vs. "manual" duration
+  value anymore.
 
 **`mobile_alert` has no device-side effect at all.** Selecting/unselecting it never changes
 whether the camera delivers the event — that's `EventPreferencesClient`'s job alone, and stays
@@ -509,18 +511,80 @@ active interface. `setupWifi`'s `verify: true` (default) is itself overridden by
 behavior — it always forces save-only when currently reached over Ethernet, regardless of what
 the app passes.
 
-## Deterrence Alarms & Local Storage — capability-gated, not yet wired up
+## Deterrence — Manual Trigger & Auto-Stop Duration
 
-**Concept:** siren/spotlight/warning deterrence actions and SD-card local storage status/config.
+**Concept:** two related settings, per `FEAT-236` (2026-08-14, revised 2026-08-15 after
+real-hardware testing — see the note at the bottom of this section):
+- **Manual trigger** (`FR-NE-082`/`083`) — a human activating siren/spotlight/warning right now,
+  from Live View, independent of any detection event.
+- **Auto-stop configuration** (`FR-NE-113`) — how long/how many times each action
+  (siren/spotlight/warning) runs before stopping on its own. **One configured value per action,
+  shared by both this manual trigger and the automatic detection-triggered response** ([Response
+  Actions](#response-actions-deterrence-on-event) above) — not a per-request or
+  per-trigger-path setting. `ActivateDeterrence`'s request carries **no duration parameter at
+  all** — the camera always applies its own persisted value.
 
-**Status:** the REST clients exist (`RestDeterrenceAlarmsClient`, `RestStorageClient`, both
-generated) and their capability gates exist (`GetCapabilitiesResponse.sirenCapable`/
-`spotlightCapable`/`warningCapable`/`localStorageCapable`, from `RestCapabilitiesClient`) —
-but **nothing in `mobile_app/lib` calls either the settings clients or the capability check yet.**
-If you're the one wiring these up: call `RestCapabilitiesClient.getCapabilities()` first and gate
-each control on its corresponding `*Capable` flag before touching
-`RestDeterrenceAlarmsClient`/`RestStorageClient` — there is no existing call site to copy this
-pattern from, so don't assume one already checks it.
+**Mixed units — `warning` is a repeat count, not seconds.** `siren_seconds`/`spotlight_seconds`
+are whole seconds; `warning_repeat_count` (renamed from `warning_seconds`, 2026-08-15) is how
+many times the clip plays before stopping, not a duration. `warning` loops internally
+(completion-driven — see the note below), rather than playing once and self-terminating on the
+clip's own length (the pre-`FEAT-236` behavior, when `warning` had no auto-stop concept at all).
+
+**Bounds come from the camera, never hardcode a range.** `getDeterrenceDurationOptions()` reports
+the real `min`/`max` per key — build slider/stepper bounds from this response, same "every Set
+has a matching Options, UI built from it" rule this repo already applies to every other setting.
+An earlier version of this feature hardcoded a 0-60s UI range instead, found and corrected via
+real-hardware testing (a value of `0` degenerates to "never really activates").
+
+**Not to be confused with:** [Response Actions](#response-actions-deterrence-on-event) above —
+that decides *which* actions auto-fire on a detection event; this decides *how long/how many
+times* an action (fired either way) runs, and gives the user a way to fire one directly.
+
+**LAN:** `DeterrenceClient` — `getDeterrenceStatus()`, `activateDeterrence(String action)`,
+`deactivateDeterrence(String action)`, `getDeterrenceDurations()` →
+`Map<String, int>` (`siren_seconds`/`spotlight_seconds`/`warning_repeat_count`),
+`setDeterrenceDurations(Map<String, int> changes)` (partial update),
+`getDeterrenceDurationOptions()` → `DeterrenceDurationOptions` (per-key `min`/`max`).
+
+**WAN:** `WanDeterrenceClient` — same method names and semantics.
+
+**Notes:** gate the manual-trigger controls and duration section on
+`CapabilitiesClient.getCapabilities().sirenCapable`/`spotlightCapable`/`warningCapable`
+([Capabilities](#capabilities-discovery-not-a-setting)) — never a hardcoded action list, and
+**never gated on any event type's own enable/disable toggle**: manual triggering doesn't depend
+on detection being enabled at all, unlike the per-event Response Actions cards. Reference
+implementation: `mobile_app/lib/features/live_view/live_view_screen.dart` (`_ControlsBar`'s
+deterrence row, manual trigger, plus a periodic `GetDeterrenceStatus` poll while an action is
+active — added 2026-08-15, real-hardware finding: without it, the control kept showing "active"
+forever after the camera's own auto-stop fired, since nothing re-checked status) and
+`mobile_app/lib/features/alerts/event_settings_screen.dart` (the Deterrence section — a slider
+per second-based action, a `+`/`-` stepper for `warning_repeat_count`).
+
+**Real-hardware finding, 2026-08-15 — do not reintroduce a duration-based warning loop.** The
+first version of `warning`'s auto-stop used a fixed-period timer to *guess* when the clip
+finished and re-trigger it. Real-device testing found this cut the clip off partway through and
+restarted it. The fix (firmware-side, `bsp_camera_ameba.c`'s `prvWarningPollTimerCallback()`)
+polls the actual playback-finished signal and only re-triggers on a real completion, decremented
+against a repeat count — this is why `warning`'s unit had to change from seconds to a count in
+the first place, not just a naming preference.
+
+**Superseded generated client note:** the generated `RestDeterrenceAlarmsClient` (`/nuraeye/
+buzzer`, `/nuraeye/deterrence`, `/nuraeye/deterrence/durations`) exists but is **not** what
+`DeterrenceClient`/`WanDeterrenceClient` call — like every other hand-written NuraEye client,
+they go through `NuraeyeClient.call()`'s REST-backed action-name facade instead (see [Hand-written
+vs. generated REST clients](#hand-written-vs-generated-rest-clients) below). `RestBuzzerClient`-
+style direct usage is unused in the app.
+
+## Local Storage — capability-gated, not yet wired up
+
+**Concept:** SD-card local storage status/config.
+
+**Status:** the REST client exists (`RestStorageClient`, generated) and its capability gate
+exists (`GetCapabilitiesResponse.localStorageCapable`, from `RestCapabilitiesClient`) — but
+**nothing in `mobile_app/lib` calls either the settings client or the capability check yet.** If
+you're the one wiring this up: call `RestCapabilitiesClient.getCapabilities()` first and gate the
+control on `localStorageCapable` before touching `RestStorageClient` — there is no existing call
+site to copy this pattern from, so don't assume one already checks it.
 
 ## Capabilities (discovery, not a setting)
 
@@ -533,13 +597,16 @@ here if you're not sure whether a flag you're about to ignore is load-bearing.
 
 **LAN:**
 - `CapabilitiesClient.getCapabilities()` → `wanCommandCapable`/`wanLiveViewCapable`/
-  `supportedEventTypes`/`supportedEventDeterrenceOptions` (the hand-written client, four fields
-  — see the WAN paragraph below for the first two, [Event Preferences](#event-preferences) for
-  the third, and [Response Actions](#response-actions-deterrence-on-event) for the fourth).
+  `supportedEventTypes`/`supportedEventDeterrenceOptions`/`sirenCapable`/`spotlightCapable`/
+  `warningCapable` (the hand-written client, seven fields — see the WAN paragraph below for the
+  first two, [Event Preferences](#event-preferences) for the third, [Response
+  Actions](#response-actions-deterrence-on-event) for the fourth, and [Deterrence — Manual
+  Trigger & Auto-Stop Duration](#deterrence--manual-trigger--auto-stop-duration) for the last
+  three — added `FEAT-236`, 2026-08-14, mirroring fields the generated client below already had).
 - The generated `RestCapabilitiesClient.getCapabilities()` (`/nuraeye/capabilities`) returns a
   **broader** response, `GetCapabilitiesResponse`, with the same fields plus
-  `sirenCapable`/`spotlightCapable`/`warningCapable` (deterrence actions — buzzer/spotlight/voice
-  alert) and `localStorageCapable` (SD card), plus REST-surface duplicates of night-vision
+  `sirenCapable`/`spotlightCapable`/`warningCapable` (now also on the hand-written client above)
+  and `localStorageCapable` (SD card), plus REST-surface duplicates of night-vision
   capability (`nightVisionColorCapable`/`nightVisionSmartCapable`, see below). **Nothing in the
   app currently calls this client** — if you're wiring up local-storage controls, this is the
   flag you need and it isn't being checked anywhere yet; don't assume an equivalent check

@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:video_player/video_player.dart';
 
 /// Debug helper for [LiveViewController.startTalk]'s diagnostic logging —
@@ -183,30 +185,33 @@ class LiveViewController extends ChangeNotifier {
     _fail(errorMessage ?? 'Could not connect to the camera');
   }
 
+  /// `RECORD_AUDIO`/`BLUETOOTH_CONNECT` are Android *runtime* permissions
+  /// (API 23+/31+) — a manifest `<uses-permission>` declaration alone is not
+  /// enough. `flutter_webrtc`'s native audio device module can crash the
+  /// whole process (not a catchable Dart exception) if it touches
+  /// audio-routing/Bluetooth APIs without these actually granted, even for
+  /// a recvonly-only (non-talk) live-view session — the ADM initializes
+  /// audio routing regardless of transceiver direction. Requested here, not
+  /// at app startup, so the user only sees the permission prompt when they
+  /// actually open live view.
+  Future<void> _ensureRuntimePermissions() async {
+    if (!Platform.isAndroid) return;
+    await [Permission.microphone, Permission.bluetoothConnect].request();
+  }
+
   /// LAN WebRTC path (STREAMING_GUIDE.md §2). Returns true and leaves
   /// [status] as [LiveViewStatus.connected] on success; on failure, sets
   /// [errorMessage] and returns false without touching [status] — the
   /// caller ([connect]) decides whether a WAN attempt follows or this is
   /// the final failure.
   Future<bool> _connectLan() async {
+    await _ensureRuntimePermissions();
+    if (_disposed) return false;
+
     if (!_rendererInitialized) {
       await renderer.initialize();
       _rendererInitialized = true;
     }
-    if (_disposed) return false;
-
-    // iOS-only (no-op elsewhere, see AppleNativeAudioManagement's own
-    // platform check): configures AVAudioSession for receive-only remote
-    // audio playback before the peer connection exists. Without this, the
-    // native WebRTC audio engine renders against an unconfigured session —
-    // reproduced as a real SIGSEGV inside WebRTC's own audio unit callback
-    // (crash report 2026-08-14, iOS Simulator) once the remote audio track
-    // went live.
-    await AppleNativeAudioManagement.setAppleAudioConfiguration(
-      AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
-        AppleAudioIOMode.remoteOnly,
-      ),
-    );
     if (_disposed) return false;
 
     final nuraeye = NuraeyeClient(connection);
@@ -226,7 +231,64 @@ class LiveViewController extends ChangeNotifier {
         return false;
     }
 
-    _signalingUrl = target.signalingUrl;
+    return _negotiate(target.signalingUrl, talk: false);
+  }
+
+  /// Negotiates a brand-new `RTCPeerConnection` against [signalingUrl] —
+  /// plain live view (`talk: false`) or with talk's sendrecv audio leg
+  /// (`talk: true`, captures the phone's mic and attaches it before the
+  /// offer is even created). **Always builds a fresh peer connection —
+  /// never renegotiates an existing one.** `module_webrtc.c` holds exactly
+  /// one `RTCPeerConnection` per signaling port and tears down whatever
+  /// connection currently exists on every accepted offer before rebuilding
+  /// it server-side (STREAMING_GUIDE.md §2.3). Sending a second offer over
+  /// the *phone's own already-connected* `RTCPeerConnection` (the original
+  /// [startTalk] approach) reliably completes the SDP handshake — offer and
+  /// answer both say `sendrecv` — but the connection then dies a few
+  /// seconds later, because the local ICE agent is still holding
+  /// candidates/consent state for a server-side session the camera already
+  /// discarded the moment the second offer arrived (confirmed via
+  /// real-device log capture, 2026-08-17: every talk attempt reconnected
+  /// cleanly then closed ~5s later, exactly matching this app's own
+  /// `_iceDisconnectGrace` timeout). The fix, matching the sibling
+  /// `vizenlinkvms/nuraeye-rt` app's `WebRtcLiveViewSession.connect`: treat
+  /// every negotiation — including toggling talk — as a full replacement,
+  /// so the local and remote sides always start ICE in lockstep. Callers
+  /// ([_connectLan], [startTalk]) must have already torn down any previous
+  /// [_pc] (and told the camera so via `POST /webrtc/stop`, for the talk
+  /// case) before calling this. Returns true on success.
+  Future<bool> _negotiate(Uri signalingUrl, {required bool talk}) async {
+    MediaStream? localStream;
+    if (talk) {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        'audio': true,
+        'video': false,
+      });
+    } else {
+      // iOS-only (no-op elsewhere, see AppleNativeAudioManagement's own
+      // platform check): configures AVAudioSession for receive-only remote
+      // audio playback before the peer connection exists. Without this,
+      // the native WebRTC audio engine renders against an unconfigured
+      // session — reproduced as a real SIGSEGV inside WebRTC's own audio
+      // unit callback (crash report 2026-08-14, iOS Simulator) once the
+      // remote audio track went live. Talk's `localAndRemote` equivalent
+      // is set further below, once the mic track is actually attached —
+      // that ordering was already what [startTalk] did before this and is
+      // not implicated in that crash.
+      await AppleNativeAudioManagement.setAppleAudioConfiguration(
+        AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
+          AppleAudioIOMode.remoteOnly,
+        ),
+      );
+    }
+    if (_disposed) {
+      if (localStream != null) {
+        for (final track in localStream.getTracks()) {
+          await track.stop();
+        }
+      }
+      return false;
+    }
 
     try {
       // No STUN/TURN — this is a same-LAN connection with host candidates
@@ -234,6 +296,11 @@ class LiveViewController extends ChangeNotifier {
       final pc = await createPeerConnection({'iceServers': <dynamic>[]});
       if (_disposed) {
         await pc.close();
+        if (localStream != null) {
+          for (final track in localStream.getTracks()) {
+            await track.stop();
+          }
+        }
         return false;
       }
       _pc = pc;
@@ -246,64 +313,140 @@ class LiveViewController extends ChangeNotifier {
       };
       pc.onIceConnectionState = _handleIceConnectionState;
 
-      // recvonly on both to start — plain live view never sends. [startTalk]
-      // renegotiates the audio one to sendrecv (fetched fresh from the pc
-      // at that point, not held onto from here) rather than adding a
-      // second transceiver.
       await pc.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
-      await pc.addTransceiver(
+      final audioTransceiver = await pc.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+        init: RTCRtpTransceiverInit(
+          direction: talk
+              ? TransceiverDirection.SendRecv
+              : TransceiverDirection.RecvOnly,
+        ),
       );
+      if (talk && localStream != null) {
+        await audioTransceiver.sender.replaceTrack(
+          localStream.getAudioTracks().first,
+        );
+        _localAudioStream = localStream;
+        // Sending *and* receiving audio now — reconfigure the iOS session
+        // accordingly (see the `remoteOnly` call above for why this
+        // matters at all; `localAndRemote` is talk's equivalent).
+        await AppleNativeAudioManagement.setAppleAudioConfiguration(
+          AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
+            AppleAudioIOMode.localAndRemote,
+            preferSpeakerOutput: speakerphoneOn,
+          ),
+        );
+      }
 
       final offer = await pc.createOffer();
+      if (talk) {
+        // ignore: avoid_print
+        print(
+          '[Talk] offer audio direction line: '
+          '${_extractAudioDirection(offer.sdp)}',
+        );
+      }
       await pc.setLocalDescription(offer);
 
       final response = await _http
           .post(
-            target.signalingUrl,
+            signalingUrl,
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'type': 'offer',
-              'sdp': offer.sdp,
-              'talk': false,
-            }),
+            body: jsonEncode({'type': 'offer', 'sdp': offer.sdp, 'talk': talk}),
           )
           .timeout(const Duration(seconds: 10));
       if (_disposed) return false;
+      if (talk) {
+        // ignore: avoid_print
+        print('[Talk] signaling response: ${response.statusCode}');
+      }
 
-      if (response.statusCode != 200) {
-        errorMessage =
-            'Camera rejected the connection (${response.statusCode})';
+      // TWO_WAY_TALK_GUIDE.md §4 — a 409 means another talk session already
+      // holds the camera's speaker; nothing to roll back locally since this
+      // is always a fresh pc/offer now, just report busy (talk) or a
+      // generic rejection (plain connect, though 409 shouldn't occur there).
+      if (response.statusCode == 409) {
+        if (talk) {
+          talkStatus = TalkStatus.busy;
+          notifyListeners();
+        } else {
+          errorMessage = 'Camera rejected the connection (409)';
+        }
         await _teardownPeerConnection();
+        await _releaseLocalAudio();
+        return false;
+      }
+      if (response.statusCode != 200) {
+        final reason =
+            'Camera rejected the connection (${response.statusCode})';
+        if (talk) {
+          _failTalk(reason);
+        } else {
+          errorMessage = reason;
+        }
+        await _teardownPeerConnection();
+        await _releaseLocalAudio();
         return false;
       }
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       final answerSdp = body['sdp'] as String?;
       final answerType = body['type'] as String?;
       if (answerSdp == null || answerType == null) {
-        errorMessage = 'Malformed answer from camera';
+        const reason = 'Malformed answer from camera';
+        if (talk) {
+          _failTalk(reason);
+        } else {
+          errorMessage = reason;
+        }
         await _teardownPeerConnection();
+        await _releaseLocalAudio();
         return false;
+      }
+      if (talk) {
+        // ignore: avoid_print
+        print(
+          '[Talk] answer audio direction line: '
+          '${_extractAudioDirection(answerSdp)}',
+        );
       }
       await pc.setRemoteDescription(
         RTCSessionDescription(answerSdp, answerType),
       );
       if (_disposed) return false;
 
+      _signalingUrl = signalingUrl;
       transport = LiveViewTransport.lan;
       status = LiveViewStatus.connected;
       _retryAttempt = 0;
       _startStatsPolling();
+      if (talk) {
+        talkStatus = TalkStatus.talking;
+        talkErrorMessage = null;
+      }
+      // See _applySpeakerphoneRoute's doc comment — a single call right
+      // after signaling isn't reliable, the native audio device module can
+      // reset the route once media actually starts flowing.
+      unawaited(_applySpeakerphoneRoute());
+      unawaited(
+        Future.delayed(
+          const Duration(milliseconds: 800),
+          _applySpeakerphoneRoute,
+        ),
+      );
       notifyListeners();
       return true;
     } catch (e) {
       if (_disposed) return false;
-      errorMessage = e.toString();
+      if (talk) {
+        _failTalk(e.toString());
+      } else {
+        errorMessage = e.toString();
+      }
       await _teardownPeerConnection();
+      await _releaseLocalAudio();
       return false;
     }
   }
@@ -395,6 +538,23 @@ class LiveViewController extends ChangeNotifier {
 
   Future<void> _reconnect() async {
     if (_disposed) return;
+    // An ICE failure/close tears down this exact peer connection — the talk
+    // leg (if any) dies with it, and the fresh connection `connect()` below
+    // creates is recvonly-only (talk is only ever added via a later
+    // `startTalk()` renegotiation, same as TWO_WAY_TALK_GUIDE.md §3's
+    // "`/webrtc/stop` tears down the entire connection, not just the talk
+    // leg"). Without resetting `talkStatus` here, the TALK-001 status bar
+    // would keep showing "Talking" indefinitely after an automatic
+    // reconnect even though the mic leg is gone and nothing is actually
+    // being sent — silently stuck, not just briefly wrong. Landing on
+    // [TalkStatus.error] rather than [TalkStatus.idle] keeps the status bar
+    // visible with an explanation instead of it just vanishing, same as any
+    // other talk failure — the user dismisses it via TALK-005 same as usual.
+    if (talkStatus != TalkStatus.idle) {
+      await _releaseLocalAudio();
+      talkStatus = TalkStatus.error;
+      talkErrorMessage = 'Talk ended: connection was interrupted';
+    }
     status = LiveViewStatus.reconnecting;
     notifyListeners();
     await _teardownPeerConnection();
@@ -793,14 +953,21 @@ class LiveViewController extends ChangeNotifier {
     }
   }
 
-  /// Starts a two-way-talk session by renegotiating the existing connection
-  /// (`TWO_WAY_TALK_GUIDE.md` §2/§3) — grabs the phone mic, attaches it to
-  /// the audio transceiver (switched from recvonly to sendrecv), and sends
-  /// a fresh offer with `talk: true`. Requires [status] to already be
-  /// [LiveViewStatus.connected]; no-op otherwise.
+  /// Starts a two-way-talk session. Requires [status] to already be
+  /// [LiveViewStatus.connected] over LAN; no-op otherwise.
+  ///
+  /// **Does not renegotiate the existing connection in place** — explicitly
+  /// ends it (`POST /webrtc/stop`) and negotiates a completely fresh one
+  /// with `talk: true` baked into the very first offer, via [_negotiate].
+  /// See [_negotiate]'s doc comment for why: this camera's firmware tears
+  /// down and rebuilds its side on every accepted offer regardless, so a
+  /// second in-place offer over the phone's already-connected pc leaves the
+  /// two sides' ICE state out of sync — it was found to reconnect at the
+  /// SDP level but then die a few seconds later, every single time.
   Future<void> startTalk() async {
     if (_disposed ||
         status != LiveViewStatus.connected ||
+        transport != LiveViewTransport.lan ||
         _pc == null ||
         _signalingUrl == null) {
       return;
@@ -810,154 +977,18 @@ class LiveViewController extends ChangeNotifier {
     talkErrorMessage = null;
     notifyListeners();
 
-    try {
-      final localStream = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
-        'video': false,
-      });
-      if (_disposed) {
-        for (final track in localStream.getTracks()) {
-          await track.stop();
-        }
-        return;
-      }
+    final signalingUrl = _signalingUrl!;
+    await _postStop(signalingUrl);
+    await _teardownPeerConnection();
+    if (_disposed) return;
 
-      final pc = _pc;
-      final signalingUrl = _signalingUrl;
-      if (pc == null ||
-          signalingUrl == null ||
-          status != LiveViewStatus.connected) {
-        for (final track in localStream.getTracks()) {
-          await track.stop();
-        }
-        _failTalk('Connection changed — try again');
-        return;
-      }
-
-      // Fetch the audio transceiver fresh from the peer connection right
-      // now, rather than trusting any `RTCRtpTransceiver` object stored
-      // earlier (from `connect()`'s `addTransceiver` call, potentially
-      // minutes ago) — holding onto that Dart-side handle across time hit a
-      // real crash on Android ("RtpTransceiver has been disposed" from
-      // `setDirection`, native-side object churn `flutter_webrtc` doesn't
-      // guarantee survives). A transceiver's `receiver.track.kind` is fixed
-      // for its lifetime, so this reliably finds "the audio one" without
-      // relying on list order.
-      RTCRtpTransceiver? audioTransceiver;
-      for (final transceiver in await pc.getTransceivers()) {
-        if (transceiver.receiver.track?.kind == 'audio') {
-          audioTransceiver = transceiver;
-          break;
-        }
-      }
-      if (audioTransceiver == null) {
-        for (final track in localStream.getTracks()) {
-          await track.stop();
-        }
-        _failTalk('No audio channel on this connection — try again');
-        return;
-      }
-      _localAudioStream = localStream;
-
-      final localAudioTrack = localStream.getAudioTracks().first;
-      // ignore: avoid_print
-      print(
-        '[Talk] local mic track: id=${localAudioTrack.id} '
-        'enabled=${localAudioTrack.enabled} muted=${localAudioTrack.muted}',
-      );
-
-      await audioTransceiver.sender.replaceTrack(localAudioTrack);
-      await audioTransceiver.setDirection(TransceiverDirection.SendRecv);
-      // ignore: avoid_print
-      print(
-        '[Talk] transceiver direction after setDirection: '
-        '${await audioTransceiver.getDirection()}, '
-        'sender track id=${audioTransceiver.sender.track?.id}',
-      );
-
-      // Now sending *and* receiving audio — reconfigure the iOS session
-      // accordingly (see `connect()`'s own comment on why this matters at
-      // all).
-      await AppleNativeAudioManagement.setAppleAudioConfiguration(
-        AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
-          AppleAudioIOMode.localAndRemote,
-          preferSpeakerOutput: speakerphoneOn,
-        ),
-      );
-
-      final offer = await pc.createOffer();
-      // ignore: avoid_print
-      print(
-        '[Talk] offer audio direction line: '
-        '${_extractAudioDirection(offer.sdp)}',
-      );
-      await pc.setLocalDescription(offer);
-
-      final response = await _http
-          .post(
-            signalingUrl,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'type': 'offer', 'sdp': offer.sdp, 'talk': true}),
-          )
-          .timeout(const Duration(seconds: 10));
-      if (_disposed) return;
-      // ignore: avoid_print
-      print('[Talk] signaling response: ${response.statusCode}');
-
-      // TWO_WAY_TALK_GUIDE.md §4 — a 409 means another talk session already
-      // holds the camera's speaker; the *existing* live-view connection is
-      // left untouched server-side, but our own local offer was never
-      // answered, so roll it back to the last stable state rather than
-      // leaving this peer connection's signaling state stuck.
-      if (response.statusCode == 409) {
-        await pc.setLocalDescription(RTCSessionDescription(null, 'rollback'));
-        await _releaseLocalAudio();
-        talkStatus = TalkStatus.busy;
-        notifyListeners();
-        return;
-      }
-      if (response.statusCode != 200) {
-        await pc.setLocalDescription(RTCSessionDescription(null, 'rollback'));
-        await _releaseLocalAudio();
-        _failTalk('Camera rejected the request (${response.statusCode})');
-        return;
-      }
-      final body = jsonDecode(response.body) as Map<String, dynamic>;
-      final answerSdp = body['sdp'] as String?;
-      final answerType = body['type'] as String?;
-      if (answerSdp == null || answerType == null) {
-        await pc.setLocalDescription(RTCSessionDescription(null, 'rollback'));
-        await _releaseLocalAudio();
-        _failTalk('Malformed answer from camera');
-        return;
-      }
-      // ignore: avoid_print
-      print(
-        '[Talk] answer audio direction line: '
-        '${_extractAudioDirection(answerSdp)}',
-      );
-      await pc.setRemoteDescription(
-        RTCSessionDescription(answerSdp, answerType),
-      );
-      if (_disposed) return;
-
-      // See _applySpeakerphoneRoute's doc comment — a single call right
-      // after signaling isn't reliable, the native audio device module can
-      // reset the route once media actually starts flowing.
-      unawaited(_applySpeakerphoneRoute());
-      unawaited(
-        Future.delayed(
-          const Duration(milliseconds: 800),
-          _applySpeakerphoneRoute,
-        ),
-      );
-      talkStatus = TalkStatus.talking;
-      notifyListeners();
-    } catch (e) {
-      if (!_disposed) {
-        await _releaseLocalAudio();
-        _failTalk(e.toString());
-      }
+    final succeeded = await _negotiate(signalingUrl, talk: true);
+    // Whatever the outcome, the old connection is already gone (stopped
+    // above) — on failure, [_negotiate] has already set talkStatus to
+    // busy/error, but live view itself is now dead too unless a fresh
+    // plain reconnect is kicked off.
+    if (!succeeded && !_disposed) {
+      unawaited(connect());
     }
   }
 
@@ -1016,20 +1047,25 @@ class LiveViewController extends ChangeNotifier {
     talkStatus = TalkStatus.idle;
     await _teardownPeerConnection();
     final signalingUrl = _signalingUrl;
-    if (signalingUrl != null) {
-      try {
-        await _http
-            .post(signalingUrl.replace(path: '${signalingUrl.path}/stop'))
-            .timeout(const Duration(seconds: 5));
-      } catch (_) {
-        // Best-effort — nothing more to do if the camera is already
-        // unreachable at teardown time.
-      }
-    }
+    if (signalingUrl != null) await _postStop(signalingUrl);
     await _stopWanIfNeeded();
     if (_disposed) return;
     status = LiveViewStatus.stopped;
     notifyListeners();
+  }
+
+  /// Best-effort `POST /webrtc/stop` — tells the camera to release the
+  /// signaling slot immediately rather than waiting for it to notice the
+  /// connection died on its own. Failures here don't block local teardown.
+  Future<void> _postStop(Uri signalingUrl) async {
+    try {
+      await _http
+          .post(signalingUrl.replace(path: '${signalingUrl.path}/stop'))
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Best-effort — nothing more to do if the camera is already
+      // unreachable at teardown time.
+    }
   }
 
   @override

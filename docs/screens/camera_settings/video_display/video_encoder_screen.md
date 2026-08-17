@@ -22,6 +22,9 @@
 | ENC-015 | Unsaved-changes dialog | AlertDialog (shared, `confirmDiscardOnLeave` in `lib/widgets/navigation_leave_guard.dart`) | shown when leaving (back gesture or bottom-nav tap, via the shared `LeaveGuard` widget) while dirty |
 | ENC-016 | Discard button (in ENC-015) | TextButton | discards the change and leaves |
 | ENC-017 | Save button (in ENC-015) | FilledButton | saves via `_save()` before leaving |
+| ENC-018 | Reload settings button (AppBar action) | `ReloadSettingsButton` (shared widget, `lib/widgets/reload_settings_button.dart`) | re-runs `getVideoEncoderSettings`/`getVideoEncoderSettingsOptions` (same LAN/WAN logic as the initial load) to refresh every field from the camera's current state, for a change made elsewhere (another client, the camera's own web UI) that hasn't shown up here yet; disabled while a load or save is already in flight; shows a snackbar instead if the camera has no saved connection yet |
+
+While the camera's `getVideoEncoderSettings`/`getVideoEncoderSettingsOptions` calls are in flight (saved connection only, whether on initial open or via ENC-018), the whole screen is blocked by the same `SavingOverlay` used for Save, showing "Loading…" instead of "Saving…" — this also prevents the codec/resolution/bitrate-mode fields from briefly showing their fallback choice list before narrowing to the camera's real one.
 
 ENC-004 (previously Frame Rate radio 15/24/30 fps), ENC-005 (previously Bitrate radio Low/Medium/High), and ENC-006 (previously Codec radio) are retired — ENC-006 is replaced by ENC-007 above.
 

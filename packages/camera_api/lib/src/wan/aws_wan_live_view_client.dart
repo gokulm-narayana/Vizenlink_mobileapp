@@ -15,10 +15,20 @@ import 'wan_live_view_client.dart';
 ///
 /// **Not yet hardware/cloud-verified** — see `IotCommandClient`/`KvsPlaybackClient`'s own docs.
 class AwsWanLiveViewClient implements WanLiveViewClient {
-  AwsWanLiveViewClient(String thingName)
-    : _iot = IotCommandClient(thingName),
-      _kvs = KvsPlaybackClient(),
-      _thingName = thingName;
+  /// [iotCommandClient]/[kvsPlaybackClient] are overridable for tests — default to real
+  /// instances, matching every other `Wan*Client` in this package (e.g.
+  /// `WanNightVisionClient`). **Added 2026-08-14** — this class previously had no way to inject
+  /// a fake `IotCommandClient` at all, so nothing could unit-test it directly; every existing
+  /// test exercised it only through `_FakeWanClient`-style hand-written fakes of the
+  /// `WanLiveViewClient` *interface*, which never actually ran this class's own logic (including
+  /// the missing-`try`/`catch` bug on `getCloudStreamingStatus` this fixed).
+  AwsWanLiveViewClient(
+    String thingName, {
+    IotCommandClient? iotCommandClient,
+    KvsPlaybackClient? kvsPlaybackClient,
+  }) : _iot = iotCommandClient ?? IotCommandClient(thingName),
+       _kvs = kvsPlaybackClient ?? KvsPlaybackClient(),
+       _thingName = thingName;
 
   final String _thingName;
   final IotCommandClient _iot;
@@ -49,28 +59,40 @@ class AwsWanLiveViewClient implements WanLiveViewClient {
   /// a single immediate query would read that transient window as a hard "idle" failure rather
   /// than genuine unavailability. `degraded`/`notCompiled` are stable negative signals (not a
   /// startup-timing artifact) and are returned immediately, not retried.
+  ///
+  /// **Wrapped in `try`/`catch` 2026-08-14** — this was the one method on this class missing it
+  /// (its three siblings all had it from day one); `IotCommandClient.sendCommandWithResponse()`
+  /// throws on a genuine relay/network failure (documented on that method), and with nothing to
+  /// catch it here that exception propagated straight out of this `Future` past every caller's
+  /// `CameraResult` switch, crashing on a plain transient network failure (observed on a real
+  /// device as an uncaught `SocketException`). See `../../../bugs/` mobile-app team report,
+  /// 2026-08-14.
   @override
   Future<CameraResult<StreamStatus>> getCloudStreamingStatus() async {
-    for (var attempt = 0; attempt < 3; attempt++) {
-      final output = await _iot.sendCommandWithResponse(IotCommandClient.getCloudStreamingStatus);
-      if (output == null) return const CameraTimeout();
+    try {
+      for (var attempt = 0; attempt < 3; attempt++) {
+        final output = await _iot.sendCommandWithResponse(IotCommandClient.getCloudStreamingStatus);
+        if (output == null) return const CameraTimeout();
 
-      final status = switch (output['stream_status'] as String?) {
-        'active' => StreamStatus.active,
-        'idle' => StreamStatus.idle,
-        'degraded' => StreamStatus.degraded,
-        'not_compiled' => StreamStatus.notCompiled,
-        _ => null,
-      };
-      if (status == null) {
-        return CameraFailure('Unrecognized stream_status: ${output['stream_status']}');
+        final status = switch (output['stream_status'] as String?) {
+          'active' => StreamStatus.active,
+          'idle' => StreamStatus.idle,
+          'degraded' => StreamStatus.degraded,
+          'not_compiled' => StreamStatus.notCompiled,
+          _ => null,
+        };
+        if (status == null) {
+          return CameraFailure('Unrecognized stream_status: ${output['stream_status']}');
+        }
+        if (status != StreamStatus.idle || attempt == 2) {
+          return CameraSuccess(status);
+        }
+        await Future<void>.delayed(const Duration(seconds: 2));
       }
-      if (status != StreamStatus.idle || attempt == 2) {
-        return CameraSuccess(status);
-      }
-      await Future<void>.delayed(const Duration(seconds: 2));
+      return const CameraTimeout();
+    } catch (e) {
+      return CameraFailure(e.toString());
     }
-    return const CameraTimeout();
   }
 
   @override

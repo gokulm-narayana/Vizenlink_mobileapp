@@ -190,7 +190,7 @@ void main() {
   ) async {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
-    final alertsController = AlertsController();
+    final alertsController = AlertsController(homesController: homesController);
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
@@ -234,7 +234,7 @@ void main() {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
     final cameras = _seedDemoCameras(homesController);
-    final alertsController = AlertsController();
+    final alertsController = AlertsController(homesController: homesController);
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
@@ -267,7 +267,7 @@ void main() {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
     final cameras = _seedDemoCameras(homesController);
-    final alertsController = AlertsController();
+    final alertsController = AlertsController(homesController: homesController);
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
@@ -305,7 +305,7 @@ void main() {
     final homesController = HomesController();
     addTearDown(homesController.dispose);
     _seedDemoCameras(homesController);
-    final alertsController = AlertsController();
+    final alertsController = AlertsController(homesController: homesController);
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);

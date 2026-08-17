@@ -10,37 +10,31 @@ import 'package:test/test.dart';
 // until 2026-08-11 — see that class's doc comment for the full history. Mirrors
 // `wan_night_vision_client_test.dart`'s shape.
 void main() {
-  test(
-    'isAudioRecordingEnabled parses enabled from GetAudioRecording',
-    () async {
-      http.Request? captured;
-      final iot = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response('{"output":{"enabled":true}}', 200);
-        }),
-      );
+  test('isAudioRecordingEnabled parses enabled from GetAudioRecording', () async {
+    http.Request? captured;
+    final iot = IotCommandClient(
+      'VZL-CAM-000001',
+      idTokenProvider: () => 'fake-id-token',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return http.Response('{"output":{"enabled":true}}', 200);
+      }),
+    );
 
-      final client = WanAudioVolumeClient(
-        'VZL-CAM-000001',
-        iotCommandClient: iot,
-      );
-      final result = await client.isAudioRecordingEnabled();
+    final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
+    final result = await client.isAudioRecordingEnabled();
 
-      final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['action'], 'commandWithResponse');
-      expect(body['command'], IotCommandClient.getAudioRecording);
+    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
+    expect(body['action'], 'commandWithResponse');
+    expect(body['command'], IotCommandClient.getAudioRecording);
 
-      switch (result) {
-        case CameraSuccess(:final value):
-          expect(value, true);
-        default:
-          fail('Expected CameraSuccess, got $result');
-      }
-    },
-  );
+    switch (result) {
+      case CameraSuccess(:final value):
+        expect(value, true);
+      default:
+        fail('Expected CameraSuccess, got $result');
+    }
+  });
 
   test(
     'setAudioRecordingEnabled sends the enabled flag and reports success once the camera replies',
@@ -55,10 +49,7 @@ void main() {
         }),
       );
 
-      final client = WanAudioVolumeClient(
-        'VZL-CAM-000001',
-        iotCommandClient: iot,
-      );
+      final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
       final result = await client.setAudioRecordingEnabled(false);
 
       final body = jsonDecode(captured!.body) as Map<String, dynamic>;
@@ -68,27 +59,18 @@ void main() {
     },
   );
 
-  test(
-    'a Lambda-reported camera timeout surfaces as CameraFailure, not a thrown exception',
-    () async {
-      final iot = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient(
-          (request) async => http.Response(
-            '{"error":"No response from camera (timed out)"}',
-            504,
-          ),
-        ),
-      );
+  test('a Lambda-reported camera timeout surfaces as CameraFailure, not a thrown exception', () async {
+    final iot = IotCommandClient(
+      'VZL-CAM-000001',
+      idTokenProvider: () => 'fake-id-token',
+      httpClient: MockClient(
+        (request) async => http.Response('{"error":"No response from camera (timed out)"}', 504),
+      ),
+    );
 
-      final client = WanAudioVolumeClient(
-        'VZL-CAM-000001',
-        iotCommandClient: iot,
-      );
-      final result = await client.isAudioRecordingEnabled();
+    final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
+    final result = await client.isAudioRecordingEnabled();
 
-      expect(result, isA<CameraFailure<bool>>());
-    },
-  );
+    expect(result, isA<CameraFailure<bool>>());
+  });
 }

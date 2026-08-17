@@ -155,6 +155,28 @@ class IotCommandClient {
   static const getEventResponseActions = 60;
   static const setEventResponseActions = 61;
 
+  /// `FR-NE-082`/`083`: manual deterrence trigger — WAN mirror of the LAN `/nuraeye/deterrence`
+  /// REST resource. No `duration_seconds` param (`FEAT-236`, 2026-08-14) — the camera applies
+  /// its own persisted, per-action duration instead, see [getDeterrenceDurations]/
+  /// [setDeterrenceDurations] below. No WAN "capabilities" command — `siren_capable`/
+  /// `spotlight_capable`/`warning_capable` are a LAN-only `GetCapabilities` field, same
+  /// Options/capability-reads-are-LAN-only convention as event preferences above. See
+  /// `WanDeterrenceClient`.
+  static const activateDeterrence = 20;
+  static const deactivateDeterrence = 21;
+  static const getDeterrenceStatus = 22;
+
+  /// `FR-NE-113`: persisted, per-action auto-stop duration — WAN mirror of the LAN
+  /// `GetDeterrenceDurations`/`SetDeterrenceDurations` REST resource (`FEAT-236`, 2026-08-14).
+  /// Shared by both this manual trigger and the camera's own automatic detection response
+  /// (`FR-CF-144`) — one configured duration per action, not per-trigger-path.
+  static const getDeterrenceDurations = 62;
+  static const setDeterrenceDurations = 63;
+
+  /// Camera-reported min/max range for each duration/count key (`FEAT-236`, 2026-08-15) — WAN
+  /// mirror of the LAN `GET /nuraeye/deterrence/durations/options` REST resource.
+  static const getDeterrenceDurationOptions = 64;
+
   /// [isRetry] is internal — set by the one-shot retry below, never pass it explicitly.
   ///
   /// **One-shot retry on a Lambda-side timeout (HTTP 504), added 2026-08-08**: confirmed via

@@ -198,6 +198,25 @@ class NuraeyeClient {
         // encrypt WAN preview snapshots to it. LAN-only, called once over the already-
         // authenticated pairing channel.
         return _post('/nuraeye/preview-key', {'public_key': p['public_key']}, timeout);
+      case 'GetDeterrenceStatus':
+        return _get('/nuraeye/deterrence', timeout);
+      case 'ActivateDeterrence':
+        // FEAT-236: no duration_seconds -- the camera applies its own persisted, per-action
+        // duration (GetDeterrenceDurations/SetDeterrenceDurations below) instead.
+        return _post('/nuraeye/deterrence', {'action': p['action'], 'active': true}, timeout);
+      case 'DeactivateDeterrence':
+        return _post('/nuraeye/deterrence', {'action': p['action'], 'active': false}, timeout);
+      case 'GetDeterrenceDurations':
+        return _get('/nuraeye/deterrence/durations', timeout);
+      case 'GetDeterrenceDurationOptions':
+        // FEAT-236, 2026-08-15: camera-reported min/max range per key — never hardcode this
+        // range client-side (real-hardware finding: an earlier version did, and let the UI set
+        // a degenerate 0-second duration the camera hadn't actually validated).
+        return _get('/nuraeye/deterrence/durations/options', timeout);
+      case 'SetDeterrenceDurations':
+        // Partial update -- p is the caller's {siren_seconds/spotlight_seconds/warning_seconds:
+        // int, ...} map, passed straight through, same shape convention as SetEventPreferences.
+        return _post('/nuraeye/deterrence/durations', p, timeout);
       default:
         return Future.value(CameraFailure('Unknown NuraEye REST action: $action'));
     }

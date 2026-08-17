@@ -82,6 +82,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   LiveViewController? _liveViewController;
   bool _isMuted = false;
   bool _isSpotlightOn = false;
+  bool _isSpotlightShortcutBusy = false;
   bool _isPrivacyShortcutBusy = false;
   bool _isVideoModeShortcutBusy = false;
 
@@ -686,6 +687,60 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
     }
   }
 
+  /// Quick Spotlight shortcut (LIVE-018) — triggers/stops the camera's
+  /// physical spotlight via `DeterrenceClient`/`WanDeterrenceClient`
+  /// (`ActivateDeterrence`/`DeactivateDeterrence`, action `"spotlight"`),
+  /// applied immediately (same instant-apply reasoning as
+  /// [_togglePrivacyShortcut]). No duration is sent — the camera applies
+  /// its own configured auto-stop duration (`FEAT-236`). Doesn't gate on
+  /// `CameraCapabilities.spotlightCapable` the way a dedicated deterrence
+  /// settings screen would — same reasoning as [_cycleVideoModeShortcut]:
+  /// a camera that doesn't support it will surface that as a failed
+  /// activate instead. Purely momentary hardware state, not a persisted
+  /// camera setting — nothing written to `HomesController` on success.
+  Future<void> _toggleSpotlight(Camera camera) async {
+    final turningOn = !_isSpotlightOn;
+    setState(() => _isSpotlightShortcutBusy = true);
+
+    final connection = camera.connection;
+    final bool succeeded;
+    if (connection != null) {
+      final nuraeye = NuraeyeClient(connection);
+      final client = DeterrenceClient(nuraeye);
+      var result = turningOn
+          ? await client.activateDeterrence('spotlight')
+          : await client.deactivateDeterrence('spotlight');
+      nuraeye.close();
+      // A failed LAN Apply/Set retries over WAN before surfacing an error,
+      // per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final thingName = connection.thingName;
+      if (result is! CameraSuccess && thingName != null) {
+        final wanClient = WanDeterrenceClient(thingName);
+        result = turningOn
+            ? await wanClient.activateDeterrence('spotlight')
+            : await wanClient.deactivateDeterrence('spotlight');
+      }
+      succeeded = result is CameraSuccess;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
+    if (!mounted) return;
+    setState(() => _isSpotlightShortcutBusy = false);
+    if (succeeded) {
+      setState(() => _isSpotlightOn = turningOn);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Failed to ${turningOn ? 'turn on' : 'turn off'} spotlight. '
+            'Try again.',
+          ),
+        ),
+      );
+    }
+  }
+
   /// Quick Privacy Mode shortcut (LIVE-041) — toggles Off<->Full only, same
   /// as tapping the Off/Full tiles on `privacy_mode_screen.dart` (PRIV-002)
   /// but applied immediately, no draft/Apply step, matching Mute/Fullscreen's
@@ -1047,6 +1102,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                               TalkStatus.idle) !=
                           TalkStatus.idle,
                       isSpotlightOn: _isSpotlightOn,
+                      isSpotlightShortcutBusy: _isSpotlightShortcutBusy,
                       privacyMode: camera.privacyMode,
                       isPrivacyShortcutBusy: _isPrivacyShortcutBusy,
                       videoMode: camera.videoMode,
@@ -1054,8 +1110,7 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                       onSnapshot: _takeSnapshot,
                       onRecord: _toggleRecording,
                       onTalk: _toggleTalk,
-                      onSpotlight: () =>
-                          setState(() => _isSpotlightOn = !_isSpotlightOn),
+                      onSpotlight: () => _toggleSpotlight(camera),
                       onPrivacy: () => _togglePrivacyShortcut(camera),
                       onVideoMode: () => _cycleVideoModeShortcut(camera),
                       onAiMode: () => _openAiMode(camera),
@@ -1325,9 +1380,16 @@ class _HeroVideo extends StatelessWidget {
                 ],
               );
             }
-            return RTCVideoView(
-              controller.renderer,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            // Pinch-to-zoom via InteractiveViewer, same as _VideoSurface
+            // below — this is the LAN WebRTC path (the common case), which
+            // previously returned the bare renderer with no zoom wrapper at
+            // all, unlike the WAN/Playback paths.
+            return InteractiveViewer(
+              maxScale: 4,
+              child: RTCVideoView(
+                controller.renderer,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              ),
             );
           case LiveViewStatus.failed:
             return ColoredBox(
@@ -1398,6 +1460,7 @@ class _LiveControls extends StatelessWidget {
     required this.recordingElapsed,
     required this.isTalking,
     required this.isSpotlightOn,
+    required this.isSpotlightShortcutBusy,
     required this.privacyMode,
     required this.isPrivacyShortcutBusy,
     required this.videoMode,
@@ -1416,6 +1479,7 @@ class _LiveControls extends StatelessWidget {
   final Duration recordingElapsed;
   final bool isTalking;
   final bool isSpotlightOn;
+  final bool isSpotlightShortcutBusy;
   final CameraPrivacyMode privacyMode;
   final bool isPrivacyShortcutBusy;
   final CameraVideoMode videoMode;
@@ -1485,7 +1549,9 @@ class _LiveControls extends StatelessWidget {
                         ? Icons.flashlight_on
                         : Icons.flashlight_off_outlined,
                     color: isSpotlightOn ? Colors.amber : null,
-                    onPressed: isEnabled ? onSpotlight : null,
+                    onPressed: (isEnabled && !isSpotlightShortcutBusy)
+                        ? onSpotlight
+                        : null,
                   ),
                 ),
               ],
