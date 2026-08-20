@@ -11,6 +11,7 @@ import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_button.dart';
 import '../../widgets/live_status_badges.dart' show formatBitrate;
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/password_form_field.dart';
 import 'wifi_config_screen.dart';
 
 const _unassignedRoomLabel = 'Unassigned';
@@ -18,9 +19,11 @@ const _unassignedRoomLabel = 'Unassigned';
 /// User's choice in the unsaved-changes leave-confirmation dialog.
 enum _LeaveChoice { save, discard }
 
-/// Fallback timezone options — shown only when this camera has no saved
-/// connection yet, or its firmware predates `GetSupportedTimezones` (see
-/// `NetworkInfoClient.getSupportedTimezones`'s doc). Deliberately IANA-style
+/// Fallback timezone options — shown when this camera has no saved
+/// connection yet, its firmware predates `GetSupportedTimezones` (see
+/// `NetworkInfoClient.getSupportedTimezones`'s doc), or the catalog fetch
+/// hasn't succeeded yet (retried via "Sync from camera" —
+/// see [_CameraInfoScreenState._loadCameraTimezones]). Deliberately IANA-style
 /// labels, not POSIX codes: since these aren't camera-verified, Save leaves
 /// them local-only rather than guessing a POSIX string to push to the
 /// device (see `_confirmAndSave`).
@@ -128,7 +131,10 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
   }
 
   /// Loads the camera's real timezone catalog if it has a saved connection.
-  /// Left as [_dummyTimezones] (does nothing) if not — see that list's doc.
+  /// Leaves [_cameraTimezones] as null (picker shows [_dummyTimezones]) if
+  /// there's no connection yet or the call fails — also called from
+  /// [_syncFromCamera] so the user has a real retry path instead of being
+  /// stuck on the fallback list for the rest of the screen's life.
   Future<void> _loadCameraTimezones() async {
     final connection = _camera.connection;
     if (connection == null) return;
@@ -341,8 +347,11 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
   Future<void> _openModifyPasswordDialog() async {
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) =>
-          _ModifyPasswordDialog(key: const Key('CAMINFO-016')),
+      builder: (dialogContext) => _ModifyPasswordDialog(
+        key: const Key('CAMINFO-016'),
+        camera: _camera,
+        homesController: widget.homesController,
+      ),
     );
   }
 
@@ -370,6 +379,13 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
       cameraId: widget.camera.id,
       connection: connection,
     );
+    // Also (re)fetch the camera's own timezone catalog here — this is the
+    // retry path for a connection that wasn't available yet at initState,
+    // or a getSupportedTimezones call that failed transiently the first
+    // time. Without this, a failed initial fetch left the picker stuck on
+    // _dummyTimezones for the rest of the screen's life with no way for the
+    // user to force a real retry.
+    await _loadCameraTimezones();
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -569,12 +585,16 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                     DropdownButtonFormField<String>(
                       key: const Key('CAMINFO-004'),
                       initialValue: _homeId,
+                      isExpanded: true,
                       decoration: const InputDecoration(labelText: 'Home'),
                       items: [
                         for (final home in homes)
                           DropdownMenuItem(
                             value: home.id,
-                            child: Text(home.name),
+                            child: Text(
+                              home.name,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                       ],
                       onChanged: _onHomeChanged,
@@ -583,16 +603,20 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                     DropdownButtonFormField<String?>(
                       key: const Key('CAMINFO-005'),
                       initialValue: _room,
+                      isExpanded: true,
                       decoration: const InputDecoration(labelText: 'Room'),
                       items: [
                         const DropdownMenuItem<String?>(
                           value: null,
-                          child: Text(_unassignedRoomLabel),
+                          child: Text(
+                            _unassignedRoomLabel,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
                         for (final room in rooms)
                           DropdownMenuItem<String?>(
                             value: room,
-                            child: Text(room),
+                            child: Text(room, overflow: TextOverflow.ellipsis),
                           ),
                       ],
                       onChanged: _onRoomChanged,
@@ -609,6 +633,7 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                           initialValue: codes.contains(_timezone)
                               ? _timezone
                               : codes.first,
+                          isExpanded: true,
                           decoration: const InputDecoration(
                             labelText: 'Timezone',
                           ),
@@ -619,6 +644,7 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                                       value: tz.code,
                                       child: Text(
                                         _formatTimezoneLabel(tz.name),
+                                        overflow: TextOverflow.ellipsis,
                                       ),
                                     ),
                                 ]
@@ -626,7 +652,10 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                                   for (final zone in _dummyTimezones)
                                     DropdownMenuItem(
                                       value: zone,
-                                      child: Text(zone),
+                                      child: Text(
+                                        zone,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                     ),
                                 ],
                           onChanged: _onTimezoneChanged,
@@ -754,19 +783,37 @@ class _InfoRow extends StatelessWidget {
 }
 
 /// Change-password dialog: current, new, confirm password + Cancel/Save.
-/// Validates fields and shows a success snackbar — there is no camera
-/// credential backend yet, so Save does not perform a real change.
+/// Real `camera_api` call (`OnvifDeviceClient.setUserPassword`, the camera's
+/// single WSSE-digest device account — not the app-level Cognito account
+/// [ChangePasswordScreen] changes), retried over
+/// `WanDeviceIdentityClient.setUserPassword` if the LAN call fails and
+/// `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// "Current password" is checked against the saved `CameraConnection
+/// .password` locally before attempting anything — the ONVIF request itself
+/// authenticates via WSSE digest using that same saved password regardless,
+/// so this is purely a user-facing "did you type the right one" check, not
+/// something sent on the wire.
 class _ModifyPasswordDialog extends StatefulWidget {
-  const _ModifyPasswordDialog({super.key});
+  const _ModifyPasswordDialog({
+    super.key,
+    required this.camera,
+    required this.homesController,
+  });
+
+  final Camera camera;
+  final HomesController homesController;
 
   @override
   State<_ModifyPasswordDialog> createState() => _ModifyPasswordDialogState();
 }
 
 class _ModifyPasswordDialogState extends State<_ModifyPasswordDialog> {
+  final _formKey = GlobalKey<FormState>();
   final _currentController = TextEditingController();
   final _newController = TextEditingController();
   final _confirmController = TextEditingController();
+  bool _isSubmitting = false;
   String? _errorText;
 
   @override
@@ -777,23 +824,61 @@ class _ModifyPasswordDialogState extends State<_ModifyPasswordDialog> {
     super.dispose();
   }
 
-  void _save() {
-    if (_currentController.text.isEmpty) {
-      setState(() => _errorText = 'Enter the current password');
+  Future<void> _save() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    final connection = widget.camera.connection;
+    if (connection == null) {
+      setState(() => _errorText = 'This camera has no saved connection yet.');
       return;
     }
-    if (_newController.text.length < 8) {
-      setState(() => _errorText = 'New password must be at least 8 characters');
+    if (_currentController.text != connection.password) {
+      setState(() => _errorText = 'Current password is incorrect.');
       return;
     }
-    if (_newController.text != _confirmController.text) {
-      setState(() => _errorText = 'Passwords do not match');
-      return;
+
+    setState(() {
+      _isSubmitting = true;
+      _errorText = null;
+    });
+
+    final newPassword = _newController.text;
+    final lanClient = OnvifDeviceClient(connection);
+    var result = await lanClient.setUserPassword(
+      connection.username,
+      newPassword,
+    );
+    lanClient.close();
+
+    final thingName = connection.thingName;
+    if (result is! CameraSuccess && thingName != null) {
+      result = await WanDeviceIdentityClient(
+        thingName,
+      ).setUserPassword(connection.username, newPassword);
     }
-    Navigator.of(context).pop();
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Password updated')));
+
+    if (!mounted) return;
+    switch (result) {
+      case CameraSuccess():
+        widget.homesController.updateCameraPassword(
+          widget.camera.id,
+          newPassword,
+        );
+        Navigator.of(context).pop();
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Password updated')));
+      case CameraFailure(:final reason):
+        setState(() {
+          _isSubmitting = false;
+          _errorText = reason;
+        });
+      case CameraTimeout():
+        setState(() {
+          _isSubmitting = false;
+          _errorText = 'Camera did not respond. Try again.';
+        });
+    }
   }
 
   @override
@@ -804,64 +889,81 @@ class _ModifyPasswordDialogState extends State<_ModifyPasswordDialog> {
       child: GlassCard(
         padding: const EdgeInsets.all(24),
         child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                'Modify Password',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                key: const Key('CAMINFO-017'),
-                controller: _currentController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Current password',
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                key: const Key('CAMINFO-018'),
-                controller: _newController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'New password',
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                key: const Key('CAMINFO-019'),
-                controller: _confirmController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Confirm password',
-                  prefixIcon: Icon(Icons.lock_outline),
-                ),
-              ),
-              if (_errorText != null) ...[
-                const SizedBox(height: 8),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
                 Text(
-                  _errorText!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                  'Modify Password',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 16),
+                PasswordFormField(
+                  key: const Key('CAMINFO-017'),
+                  controller: _currentController,
+                  labelText: 'Current password',
+                  textInputAction: TextInputAction.next,
+                  validator: (value) => (value == null || value.isEmpty)
+                      ? 'Enter the current password'
+                      : null,
+                ),
+                const SizedBox(height: 16),
+                PasswordFormField(
+                  key: const Key('CAMINFO-018'),
+                  controller: _newController,
+                  labelText: 'New password',
+                  textInputAction: TextInputAction.next,
+                  validator: (value) => (value == null || value.length < 8)
+                      ? 'New password must be at least 8 characters'
+                      : null,
+                ),
+                const SizedBox(height: 16),
+                PasswordFormField(
+                  key: const Key('CAMINFO-019'),
+                  controller: _confirmController,
+                  labelText: 'Confirm password',
+                  textInputAction: TextInputAction.done,
+                  onFieldSubmitted: (_) => _save(),
+                  validator: (value) => value != _newController.text
+                      ? 'Passwords do not match'
+                      : null,
+                ),
+                if (_errorText != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _errorText!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 24),
+                GradientButton(
+                  key: const Key('CAMINFO-021'),
+                  onPressed: _isSubmitting ? null : _save,
+                  child: _isSubmitting
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation(Colors.white),
+                          ),
+                        )
+                      : const Text('Save'),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  key: const Key('CAMINFO-020'),
+                  onPressed: _isSubmitting
+                      ? null
+                      : () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
                 ),
               ],
-              const SizedBox(height: 24),
-              GradientButton(
-                key: const Key('CAMINFO-021'),
-                onPressed: _save,
-                child: const Text('Save'),
-              ),
-              const SizedBox(height: 8),
-              TextButton(
-                key: const Key('CAMINFO-020'),
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Cancel'),
-              ),
-            ],
+            ),
           ),
         ),
       ),

@@ -5,10 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../../app_state/camera_scan.dart';
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/scanned_camera.dart';
-import '../../theme/app_colors.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_button.dart';
@@ -160,6 +160,7 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
     String? verifiedMacAddress;
     String? verifiedThingName;
     String? verifiedName;
+    CameraCapabilities? verifiedCapabilities;
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -167,180 +168,214 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (dialogContext, setDialogState) {
-            return _GlassDialog(
-              key: const Key('SCAN-010'),
-              title: camera.name,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  TextField(
-                    controller: usernameController,
-                    decoration: const InputDecoration(
-                      labelText: 'Username',
-                      prefixIcon: Icon(Icons.person_outline),
+            // Blocks the system/gesture back button while a Connect
+            // attempt is in flight — `barrierDismissible: false` above only
+            // stops tap-outside-to-dismiss, not back navigation, so without
+            // this a user could back out mid-verification and leave the
+            // async credential check running against a dialog that looks
+            // closed.
+            return PopScope(
+              canPop: !verifying,
+              child: _GlassDialog(
+                key: const Key('SCAN-010'),
+                title: camera.name,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: usernameController,
+                      decoration: const InputDecoration(
+                        labelText: 'Username',
+                        prefixIcon: Icon(Icons.person_outline),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: passwordController,
-                    obscureText: true,
-                    decoration: InputDecoration(
-                      labelText: requireConfirm ? 'New password' : 'Password',
-                      prefixIcon: const Icon(Icons.lock_outline),
-                    ),
-                  ),
-                  if (requireConfirm) ...[
                     const SizedBox(height: 16),
                     TextField(
-                      controller: confirmPasswordController,
+                      controller: passwordController,
                       obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Confirm password',
-                        prefixIcon: Icon(Icons.lock_outline),
+                      decoration: InputDecoration(
+                        labelText: requireConfirm ? 'New password' : 'Password',
+                        prefixIcon: const Icon(Icons.lock_outline),
                       ),
                     ),
-                  ],
-                  const SizedBox(height: 16),
-                  if (rooms.isEmpty)
-                    Text(
-                      'This home has no rooms yet. The camera will be added without a room.',
-                      style: Theme.of(dialogContext).textTheme.bodySmall,
-                    )
-                  else
-                    DropdownButtonFormField<String?>(
-                      initialValue: selectedRoom,
-                      decoration: const InputDecoration(
-                        labelText: 'Room',
-                        prefixIcon: Icon(Icons.meeting_room_outlined),
+                    if (requireConfirm) ...[
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: confirmPasswordController,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Confirm password',
+                          prefixIcon: Icon(Icons.lock_outline),
+                        ),
                       ),
-                      items: [
-                        for (final room in rooms)
-                          DropdownMenuItem<String?>(
-                            value: room,
-                            child: Text(room),
-                          ),
-                      ],
-                      onChanged: (value) =>
-                          setDialogState(() => selectedRoom = value),
-                    ),
-                  if (errorText != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      errorText!,
-                      style: TextStyle(
-                        color: Theme.of(dialogContext).colorScheme.error,
-                      ),
-                    ),
-                  ],
-                  if (verifying) ...[
+                    ],
                     const SizedBox(height: 16),
-                    const Center(
-                      child: SizedBox(
-                        key: Key('SCAN-012'),
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                    if (rooms.isEmpty)
+                      Text(
+                        'This home has no rooms yet. The camera will be added without a room.',
+                        style: Theme.of(dialogContext).textTheme.bodySmall,
+                      )
+                    else
+                      DropdownButtonFormField<String?>(
+                        initialValue: selectedRoom,
+                        isExpanded: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Room',
+                          prefixIcon: Icon(Icons.meeting_room_outlined),
+                        ),
+                        items: [
+                          for (final room in rooms)
+                            DropdownMenuItem<String?>(
+                              value: room,
+                              child: Text(
+                                room,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                        onChanged: (value) =>
+                            setDialogState(() => selectedRoom = value),
                       ),
+                    if (errorText != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        errorText!,
+                        style: TextStyle(
+                          color: Theme.of(dialogContext).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                    if (verifying) ...[
+                      const SizedBox(height: 16),
+                      const Center(
+                        child: SizedBox(
+                          key: Key('SCAN-012'),
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 24),
+                    GradientButton(
+                      onPressed: verifying
+                          ? null
+                          : () async {
+                              if (requireConfirm &&
+                                  passwordController.text !=
+                                      confirmPasswordController.text) {
+                                setDialogState(
+                                  () => errorText = 'Passwords do not match',
+                                );
+                                return;
+                              }
+
+                              setDialogState(() {
+                                verifying = true;
+                                errorText = null;
+                              });
+
+                              final connection = CameraConnection(
+                                host: camera.ipAddress,
+                                username: usernameController.text,
+                                password: passwordController.text,
+                              );
+                              final deviceClient = OnvifDeviceClient(
+                                connection,
+                                httpClient: widget.httpClient,
+                              );
+                              final infoResult = await deviceClient
+                                  .getDeviceInformation();
+
+                              final failureMessage = switch (infoResult) {
+                                CameraSuccess(:final value) => () {
+                                  verifiedInfo = value;
+                                  return null;
+                                }(),
+                                CameraFailure(:final reason) => reason,
+                                CameraTimeout() =>
+                                  'Camera did not respond. Check the '
+                                      'username/password and try again.',
+                              };
+
+                              if (failureMessage != null) {
+                                deviceClient.close();
+                                if (!dialogContext.mounted) return;
+                                setDialogState(() {
+                                  verifying = false;
+                                  errorText = failureMessage;
+                                });
+                                return;
+                              }
+
+                              // Best-effort — a WAN thing name or MAC address
+                              // isn't required for the camera to be usable over
+                              // LAN, so a failure here doesn't block setup.
+                              switch (await deviceClient.getSerialNumber()) {
+                                case CameraSuccess(:final value):
+                                  verifiedThingName = value;
+                                case CameraFailure() || CameraTimeout():
+                                  break;
+                              }
+                              switch (await deviceClient
+                                  .getNetworkInterfaceInfo()) {
+                                case CameraSuccess(:final value):
+                                  verifiedMacAddress = value.macAddress;
+                                case CameraFailure() || CameraTimeout():
+                                  break;
+                              }
+                              // Read before the camera is added (not deferred
+                              // to the post-add `syncCameraFromDevice` sync)
+                              // so capability-gated UI (e.g. the Spotlight
+                              // tile on Live View) already knows what this
+                              // camera supports the moment it first renders,
+                              // instead of showing/hiding a tile a beat later
+                              // once background sync catches up. Best-effort,
+                              // same reasoning as the two calls above.
+                              final nuraeyeClient = NuraeyeClient(
+                                connection,
+                                httpClient: widget.httpClient,
+                              );
+                              switch (await CapabilitiesClient(
+                                nuraeyeClient,
+                              ).getCapabilities()) {
+                                case CameraSuccess(:final value):
+                                  verifiedCapabilities = value;
+                                case CameraFailure() || CameraTimeout():
+                                  break;
+                              }
+                              nuraeyeClient.close();
+                              // The camera's actually-configured display name
+                              // (ONVIF GetScopes) — falls back to whatever name
+                              // was already showing (the scan-list entry, or
+                              // this dialog's title) if the camera has none set
+                              // yet (empty scope) or this call fails.
+                              switch (await deviceClient.getDeviceIdentity()) {
+                                case CameraSuccess(:final value)
+                                    when value.name.isNotEmpty:
+                                  verifiedName = value.name;
+                                case CameraSuccess() ||
+                                    CameraFailure() ||
+                                    CameraTimeout():
+                                  break;
+                              }
+                              deviceClient.close();
+
+                              if (!dialogContext.mounted) return;
+                              Navigator.of(dialogContext).pop(true);
+                            },
+                      child: const Text('Connect'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextButton(
+                      onPressed: verifying
+                          ? null
+                          : () => Navigator.of(dialogContext).pop(false),
+                      child: const Text('Cancel'),
                     ),
                   ],
-                  const SizedBox(height: 24),
-                  GradientButton(
-                    onPressed: verifying
-                        ? null
-                        : () async {
-                            if (requireConfirm &&
-                                passwordController.text !=
-                                    confirmPasswordController.text) {
-                              setDialogState(
-                                () => errorText = 'Passwords do not match',
-                              );
-                              return;
-                            }
-
-                            setDialogState(() {
-                              verifying = true;
-                              errorText = null;
-                            });
-
-                            final connection = CameraConnection(
-                              host: camera.ipAddress,
-                              username: usernameController.text,
-                              password: passwordController.text,
-                            );
-                            final deviceClient = OnvifDeviceClient(
-                              connection,
-                              httpClient: widget.httpClient,
-                            );
-                            final infoResult = await deviceClient
-                                .getDeviceInformation();
-
-                            final failureMessage = switch (infoResult) {
-                              CameraSuccess(:final value) => () {
-                                verifiedInfo = value;
-                                return null;
-                              }(),
-                              CameraFailure(:final reason) => reason,
-                              CameraTimeout() =>
-                                'Camera did not respond. Check the '
-                                    'username/password and try again.',
-                            };
-
-                            if (failureMessage != null) {
-                              deviceClient.close();
-                              if (!dialogContext.mounted) return;
-                              setDialogState(() {
-                                verifying = false;
-                                errorText = failureMessage;
-                              });
-                              return;
-                            }
-
-                            // Best-effort — a WAN thing name or MAC address
-                            // isn't required for the camera to be usable over
-                            // LAN, so a failure here doesn't block setup.
-                            switch (await deviceClient.getSerialNumber()) {
-                              case CameraSuccess(:final value):
-                                verifiedThingName = value;
-                              case CameraFailure() || CameraTimeout():
-                                break;
-                            }
-                            switch (await deviceClient
-                                .getNetworkInterfaceInfo()) {
-                              case CameraSuccess(:final value):
-                                verifiedMacAddress = value.macAddress;
-                              case CameraFailure() || CameraTimeout():
-                                break;
-                            }
-                            // The camera's actually-configured display name
-                            // (ONVIF GetScopes) — falls back to whatever name
-                            // was already showing (the scan-list entry, or
-                            // this dialog's title) if the camera has none set
-                            // yet (empty scope) or this call fails.
-                            switch (await deviceClient.getDeviceIdentity()) {
-                              case CameraSuccess(:final value)
-                                  when value.name.isNotEmpty:
-                                verifiedName = value.name;
-                              case CameraSuccess() ||
-                                  CameraFailure() ||
-                                  CameraTimeout():
-                                break;
-                            }
-                            deviceClient.close();
-
-                            if (!dialogContext.mounted) return;
-                            Navigator.of(dialogContext).pop(true);
-                          },
-                    child: const Text('Connect'),
-                  ),
-                  const SizedBox(height: 8),
-                  TextButton(
-                    onPressed: verifying
-                        ? null
-                        : () => Navigator.of(dialogContext).pop(false),
-                    child: const Text('Cancel'),
-                  ),
-                ],
+                ),
               ),
             );
           },
@@ -381,6 +416,11 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
       hardwareId: verifiedInfo?.hardwareId,
       macAddress: verifiedMacAddress,
       thingName: verifiedThingName,
+      wanLiveViewCapable: verifiedCapabilities?.wanLiveViewCapable,
+      wanCommandCapable: verifiedCapabilities?.wanCommandCapable,
+      sirenCapable: verifiedCapabilities?.sirenCapable,
+      spotlightCapable: verifiedCapabilities?.spotlightCapable,
+      warningCapable: verifiedCapabilities?.warningCapable,
     );
 
     // Fire-and-forget: enriches the camera with fields the Connect-time
@@ -397,6 +437,12 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
           connection: syncConnection,
         ),
       );
+      // Also fire-and-forget: warms every settings screen's Options cache
+      // (imaging, OSD, video encoder, mask, timezone catalog) so the first
+      // real visit to one of those screens doesn't pay a cold LAN round
+      // trip — see prefetchAndCache's doc for what this does and doesn't
+      // cover.
+      unawaited(prefetchAndCache(syncConnection));
     }
 
     if (!mounted) return;
@@ -451,9 +497,6 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
       itemCount: _found.length,
       itemBuilder: (context, index) {
         final camera = _found[index];
-        final statusColor = camera.isConfigured
-            ? AppColors.online
-            : Colors.amber;
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 12),
@@ -481,24 +524,6 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
                 ),
                 title: Text(camera.name),
                 subtitle: Text(camera.ipAddress),
-                trailing: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Text(
-                    camera.isConfigured ? 'Configured' : 'Unconfigured',
-                    style: TextStyle(
-                      color: statusColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
               ),
             ),
           ),

@@ -8,6 +8,7 @@ import '../../models/camera.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/live_status_badges.dart' show barsForRssi;
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart' show simulateCameraSave;
 
@@ -141,6 +142,22 @@ class _WifiConfigScreenState extends State<WifiConfigScreen> {
     });
   }
 
+  /// Manual reload — re-fetches the current network info from the camera,
+  /// for when a change made elsewhere (another client, the camera's own web
+  /// UI) hasn't shown up here yet.
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    setState(() => _loading = true);
+    await _loadCurrentNetwork();
+  }
+
   /// Scans for nearby Wi-Fi networks with the *phone's* own radio (Android
   /// only — see [_supportsNetworkScan]). `startScan` only triggers an async
   /// OS-level scan and returns once that request is accepted, not once
@@ -253,6 +270,13 @@ class _WifiConfigScreenState extends State<WifiConfigScreen> {
         appBar: AppBar(
           key: const Key('WIFI-001'),
           title: const Text('Configure Wi-Fi'),
+          actions: [
+            ReloadSettingsButton(
+              settingsKey: const Key('WIFI-017'),
+              isBusy: _loading || _isConnecting,
+              onPressed: _reloadSettings,
+            ),
+          ],
         ),
         body: SavingOverlay(
           isSaving: _isConnecting,

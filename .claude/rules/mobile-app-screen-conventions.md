@@ -175,8 +175,8 @@ rather than a bare `TextFormField` with `obscureText: true`, so the show/hide (e
 consistent everywhere instead of each screen reimplementing its own toggle state.
 
 **Not yet extracted in this repo** — `login_screen.dart`, `signup_screen.dart`,
-`scanned_devices_screen.dart`, `account_settings_screen.dart`, `create_user_screen.dart`,
-`wifi_config_screen.dart`, and `camera_info_screen.dart` each currently use a bare
-`TextFormField(obscureText: ...)` with their own local toggle state. Worth factoring out into a
-shared widget next time one of these screens is touched, rather than adding an eighth copy of the
-same toggle logic.
+`scanned_devices_screen.dart`, `account_settings_screen.dart`, `create_user_screen.dart`, and
+`wifi_config_screen.dart` each currently use a bare `TextFormField(obscureText: ...)` with their
+own local toggle state. Worth factoring out into a shared widget next time one of these screens is
+touched, rather than adding a seventh copy of the same toggle logic. (`camera_info_screen.dart`'s
+Modify Password dialog now uses `PasswordFormField`.)

@@ -65,6 +65,10 @@ Map<String, dynamic> _persistedCameraJson(String homeId, Camera camera) => {
   'macAddress': camera.macAddress,
   'thingName': camera.thingName,
   'wanLiveViewCapable': camera.wanLiveViewCapable,
+  'wanCommandCapable': camera.wanCommandCapable,
+  'sirenCapable': camera.sirenCapable,
+  'spotlightCapable': camera.spotlightCapable,
+  'warningCapable': camera.warningCapable,
   'thumbnailUrl': _persistableThumbnailUrl(camera.thumbnailUrl),
   'timezone': camera.timezone,
 };
@@ -94,6 +98,10 @@ Map<String, dynamic> _persistedCameraJson(String homeId, Camera camera) => {
       macAddress: json['macAddress'] as String? ?? '—',
       thingName: json['thingName'] as String?,
       wanLiveViewCapable: json['wanLiveViewCapable'] as bool?,
+      wanCommandCapable: json['wanCommandCapable'] as bool?,
+      sirenCapable: json['sirenCapable'] as bool?,
+      spotlightCapable: json['spotlightCapable'] as bool?,
+      warningCapable: json['warningCapable'] as bool?,
       thumbnailUrl: json['thumbnailUrl'] as String?,
       timezone: json['timezone'] as String? ?? 'UTC',
     ),
@@ -318,6 +326,23 @@ class HomesController extends ValueNotifier<HomesState> {
     value = value.copyWith(homes: updated);
   }
 
+  /// Persists a camera's device-account password after a successful
+  /// `OnvifDeviceClient.setUserPassword`/`WanDeviceIdentityClient
+  /// .setUserPassword` call — updates the in-memory [Camera.password] (so
+  /// [Camera.connection] immediately reflects it for any client constructed
+  /// from here on) and the secure-storage copy [CameraCredentialsStore]
+  /// keeps separately (see [addCamera]'s doc for why password isn't in
+  /// [_persistedCameraJson]). Callers must do this immediately on success —
+  /// every client still holding the old password will start failing WSSE
+  /// auth otherwise, per `setUserPassword`'s own doc.
+  void updateCameraPassword(String cameraId, String newPassword) {
+    updateCamera(
+      cameraId,
+      (current) => current.copyWith(password: newPassword),
+    );
+    unawaited(_credentialsStore.savePassword(cameraId, newPassword));
+  }
+
   void updateCameraOsdSettings(
     String homeId,
     String cameraId, {
@@ -517,6 +542,11 @@ class HomesController extends ValueNotifier<HomesState> {
     String? hardwareId,
     String? macAddress,
     String? thingName,
+    bool? wanLiveViewCapable,
+    bool? wanCommandCapable,
+    bool? sirenCapable,
+    bool? spotlightCapable,
+    bool? warningCapable,
   }) {
     final cameraId = 'cam-${DateTime.now().microsecondsSinceEpoch}';
     final newCamera = Camera(
@@ -536,6 +566,11 @@ class HomesController extends ValueNotifier<HomesState> {
       hardwareId: hardwareId ?? '—',
       macAddress: macAddress ?? '—',
       thingName: thingName,
+      wanLiveViewCapable: wanLiveViewCapable,
+      wanCommandCapable: wanCommandCapable,
+      sirenCapable: sirenCapable,
+      spotlightCapable: spotlightCapable,
+      warningCapable: warningCapable,
     );
     final updated = [
       for (final home in value.homes)

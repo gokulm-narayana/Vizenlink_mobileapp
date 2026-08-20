@@ -13,6 +13,7 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/mode_tile.dart';
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -104,6 +105,7 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
   bool _isDirty = false;
   bool _isSaving = false;
   bool _isRefreshing = false;
+  bool _isLoading = false;
   int _previewReloadKey = 0;
 
   /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
@@ -135,15 +137,16 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     _loadRealPrivacy();
   }
 
-  Future<void> _loadRealPrivacy() async {
+  Future<void> _loadRealPrivacy({bool forceRefresh = false}) async {
     final connection = _camera.connection;
     if (connection == null) return;
+    setState(() => _isLoading = true);
     final nuraeye = NuraeyeClient(connection);
     final maskClient = MaskClient(connection);
     final results = await Future.wait([
       PrivacyModeClient(nuraeye).getPrivacyMode(),
       maskClient.getMasks(),
-      maskClient.getMaskOptions(),
+      maskClient.getMaskOptions(forceRefresh: forceRefresh),
     ]);
     nuraeye.close();
     maskClient.close();
@@ -187,6 +190,7 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
       if (optionsResult case CameraSuccess(:final value)) {
         _maskOptions = value;
       }
+      _isLoading = false;
     });
 
     widget.homesController.updateCamera(
@@ -194,6 +198,23 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
       (camera) =>
           camera.copyWith(privacyMode: _mode, privacyZones: [..._zones]),
     );
+  }
+
+  /// Manual reload — re-fetches mode/masks from the camera and force-refreshes
+  /// the cached mask options (bypassing `MaskClient.getMaskOptions`'s
+  /// process-lifetime cache, since this is exactly the explicit user-requested
+  /// case that cache's own doc calls out), for when a change made elsewhere
+  /// (another client, the camera's own web UI) hasn't shown up here yet.
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    await _loadRealPrivacy(forceRefresh: true);
   }
 
   void _markDirty(VoidCallback update) {
@@ -461,6 +482,11 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
             key: const Key('PRIV-001'),
             title: const Text('Privacy Mode'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('PRIV-015'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('PRIV-010'),
                 isDirty: _isDirty,
@@ -470,7 +496,8 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,

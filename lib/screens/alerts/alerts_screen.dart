@@ -9,6 +9,7 @@ import '../../theme/app_colors.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import 'alert_detail_screen.dart';
+import 'alert_settings_screen.dart';
 
 enum _ReadFilter { all, unread, read }
 
@@ -167,6 +168,16 @@ class _AlertsScreenState extends State<AlertsScreen> {
           // false` is the actual switch, otherwise it duplicates the filter
           // icon already placed in the toggle row below.
           automaticallyImplyActions: false,
+          actions: [
+            IconButton(
+              key: const Key('ALERT-022'),
+              tooltip: 'Alert Settings',
+              icon: const Icon(Icons.tune),
+              onPressed: () => context.push(
+                '${AlertsScreen.routeName}/${AlertSettingsScreen.routeName}',
+              ),
+            ),
+          ],
           bottom: PreferredSize(
             preferredSize: const Size.fromHeight(_segmentedButtonHeight),
             child: Padding(

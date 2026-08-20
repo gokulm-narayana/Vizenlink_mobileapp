@@ -13,6 +13,7 @@ import '../../widgets/gradient_background.dart';
 import '../../widgets/mode_tile.dart';
 import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/refresh_preview_button.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -63,6 +64,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
   bool _isDirty = false;
   bool _isSaving = false;
   bool _isRefreshing = false;
+  bool _isLoading = false;
   int _previewReloadKey = 0;
 
   /// A transient WAN preview fetched when [_refreshPreview]'s LAN attempt
@@ -87,6 +89,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
   Future<void> _loadRealVideoMode() async {
     final connection = _camera.connection;
     if (connection == null) return;
+    setState(() => _isLoading = true);
     final client = OnvifImagingClient(connection);
     final results = await Future.wait([
       client.getImagingSettings(),
@@ -121,6 +124,7 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
       if (optionsResult case CameraSuccess(:final value)) {
         _irCutFilterModes = value.irCutFilterModes;
       }
+      _isLoading = false;
     });
 
     if (settingsResult is CameraSuccess || wanMode != null) {
@@ -129,6 +133,21 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
         (camera) => camera.copyWith(videoMode: _mode),
       );
     }
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    await _loadRealVideoMode();
   }
 
   void _onModeChanged(CameraVideoMode? value) {
@@ -260,6 +279,11 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
             key: const Key('VIDMODE-001'),
             title: const Text('Video Mode'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('VIDMODE-011'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('VIDMODE-005'),
                 isDirty: _isDirty,
@@ -269,7 +293,8 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,

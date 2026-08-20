@@ -5,9 +5,11 @@ import 'package:auth_api/auth_api.dart';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:http/http.dart' as http;
 
 import 'app_state/ai_model_manager.dart';
 import 'app_state/alerts_controller.dart';
+import 'app_state/chat_controller.dart';
 import 'app_state/events_controller.dart';
 import 'app_state/homes_controller.dart';
 import 'app_state/preview_key_store.dart';
@@ -29,6 +31,7 @@ import 'screens/account/notification_preferences_screen.dart';
 import 'screens/account/help_support_screen.dart';
 import 'screens/account/users_invites_screen.dart';
 import 'screens/alerts/alert_detail_screen.dart';
+import 'screens/alerts/alert_settings_screen.dart';
 import 'screens/alerts/alerts_screen.dart';
 import 'screens/camera_live/camera_live_screen.dart';
 import 'screens/camera_settings/audio_screen.dart';
@@ -88,6 +91,31 @@ void main() {
         defaultValue: 'ap-south-1:5afc6818-10ed-498f-9106-fb190aa44976',
       ),
     ),
+    onSessionEstablished: (session) async {
+      // alerts_api's WAN alerts prerequisite (found 2026-08-17, comparing
+      // against the sibling vizenlinkvms/nuraeye-rt app, whose alerts
+      // actually work) — a fresh Cognito Identity has no AWS IoT Policy
+      // attached by default, so AWS IoT Core silently refuses to let its
+      // MQTT client receive on any topic even with otherwise-correct
+      // credentials/region/endpoint. This must happen server-side (the
+      // mobile client's own IAM role has no iot:AttachPolicy permission) —
+      // same deployed relay CameraAlertsHub/WanAuth already use for
+      // KVS playback. Best-effort/silent, matching this hook's own
+      // contract: a failure here just means alerts stay unavailable until
+      // a later sign-in succeeds, same as any other WAN capability gap.
+      try {
+        await http.post(
+          Uri.parse(WanAuth.kvsPlaybackLambdaUrl!),
+          headers: {
+            'Authorization': 'Bearer ${session.idToken}',
+            'Content-Type': 'application/json',
+          },
+          body: '{"action":"attachIotPolicy"}',
+        );
+      } catch (_) {
+        // Best-effort — see doc comment above.
+      }
+    },
   );
   // camera_api's WAN clients (packages/camera_api/lib/src/wan/wan_auth.dart)
   // fall back to these app-wide hooks instead of importing anything
@@ -149,6 +177,7 @@ class _MobileCctvAppState extends State<MobileCctvApp>
   final _profileController = ProfileController();
   final _navigationGuard = NavigationGuardController();
   final _aiModelManager = AiModelManager();
+  final _chatController = ChatController();
   late final GoRouter _router;
   late final Future<void> _appReady;
 
@@ -275,6 +304,7 @@ class _MobileCctvAppState extends State<MobileCctvApp>
                     alertsController: _alertsController,
                     eventsController: _eventsController,
                     aiModelManager: _aiModelManager,
+                    chatController: _chatController,
                   ),
                   routes: [
                     GoRoute(
@@ -487,6 +517,12 @@ class _MobileCctvAppState extends State<MobileCctvApp>
                       builder: (context, state) => AlertDetailScreen(
                         alert: state.extra as Alert,
                         alertsController: _alertsController,
+                        homesController: _homesController,
+                      ),
+                    ),
+                    GoRoute(
+                      path: AlertSettingsScreen.routeName,
+                      builder: (context, state) => AlertSettingsScreen(
                         homesController: _homesController,
                       ),
                     ),

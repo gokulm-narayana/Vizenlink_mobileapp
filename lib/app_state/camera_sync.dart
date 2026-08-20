@@ -147,6 +147,10 @@ Future<List<String>> syncCameraFromDevice({
         // clients for a camera onboarded via LAN.
         thingName: info?.serialNumber,
         wanLiveViewCapable: caps?.wanLiveViewCapable,
+        wanCommandCapable: caps?.wanCommandCapable,
+        sirenCapable: caps?.sirenCapable,
+        spotlightCapable: caps?.spotlightCapable,
+        warningCapable: caps?.warningCapable,
         // The camera's own POSIX-style TZ code (e.g. "IST-5:30"), not an
         // IANA name — CameraInfoScreen's timezone picker switches to the
         // camera's own GetSupportedTimezones catalog (same code

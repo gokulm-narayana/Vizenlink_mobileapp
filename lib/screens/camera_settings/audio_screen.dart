@@ -6,6 +6,7 @@ import '../../models/camera.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
@@ -52,6 +53,7 @@ class _AudioScreenState extends State<AudioScreen> {
   late bool _audioRecordingEnabled = _camera.audioRecordingEnabled;
   bool _isDirty = false;
   bool _isSaving = false;
+  bool _isLoading = false;
   bool _isPlayingTestSound = false;
 
   /// Hardware-presence gate from `AudioCapabilityClient.getAudioCapability()`
@@ -86,6 +88,7 @@ class _AudioScreenState extends State<AudioScreen> {
     final connection = _camera.connection;
     if (connection == null) return;
 
+    setState(() => _isLoading = true);
     final capabilityClient = AudioCapabilityClient(connection);
     final capabilityResult = await capabilityClient.getAudioCapability();
     capabilityClient.close();
@@ -105,6 +108,23 @@ class _AudioScreenState extends State<AudioScreen> {
       futures.add(_loadSpeakerState(connection));
     }
     await Future.wait(futures);
+    if (!mounted) return;
+    setState(() => _isLoading = false);
+  }
+
+  /// Manual reload — re-fetches this screen's fields from the camera, for
+  /// when a change made elsewhere (another client, the camera's own web UI)
+  /// hasn't shown up here yet. Distinct from [_save] (pushes local edits).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    await _loadRealAudio();
   }
 
   Future<void> _loadMicrophoneState(CameraConnection connection) async {
@@ -317,6 +337,11 @@ class _AudioScreenState extends State<AudioScreen> {
             key: const Key('AUD-001'),
             title: const Text('Audio'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('AUD-013'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('AUD-002'),
                 isDirty: _isDirty,
@@ -326,7 +351,8 @@ class _AudioScreenState extends State<AudioScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: ListView(
               padding: const EdgeInsets.all(16),
               children: [

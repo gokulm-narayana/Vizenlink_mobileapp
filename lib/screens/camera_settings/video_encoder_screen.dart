@@ -445,11 +445,15 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                     return DropdownButtonFormField<CameraResolution>(
                       key: const Key('ENC-003'),
                       initialValue: _resolution,
+                      isExpanded: true,
                       items: [
                         for (final res in available)
                           DropdownMenuItem(
                             value: res,
-                            child: Text(_resolutionLabel(res)),
+                            child: Text(
+                              _resolutionLabel(res),
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                       ],
                       onChanged: (value) =>
@@ -466,6 +470,7 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraEncoderType>(
                   key: const Key('ENC-007'),
                   initialValue: _encoder,
+                  isExpanded: true,
                   items: [
                     for (final type in _optionsOrFallback(
                       _encoderOptions?.availableEncodings.map(
@@ -478,6 +483,7 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                         value: type,
                         child: Text(
                           type == CameraEncoderType.h265 ? 'H.265' : 'H.264',
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                   ],
@@ -502,6 +508,7 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraEncoderProfile>(
                   key: const Key('ENC-008'),
                   initialValue: _profile,
+                  isExpanded: true,
                   items: [
                     for (final profile in _optionsOrFallback(
                       _currentEncodingOptions?.encoderProfiles
@@ -516,7 +523,7 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                           CameraEncoderProfile.baseline => 'Baseline',
                           CameraEncoderProfile.main => 'Main',
                           CameraEncoderProfile.high => 'High',
-                        }),
+                        }, overflow: TextOverflow.ellipsis),
                       ),
                   ],
                   onChanged: (value) => _markDirty(() => _profile = value!),
@@ -620,10 +627,14 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                 DropdownButtonFormField<CameraBitrateMode>(
                   key: const Key('ENC-012'),
                   initialValue: _bitrateMode,
+                  isExpanded: true,
                   items: [
                     const DropdownMenuItem(
                       value: CameraBitrateMode.vbr,
-                      child: Text('VBR (Variable)'),
+                      child: Text(
+                        'VBR (Variable)',
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     // Hidden, not just disabled, when the camera's own
                     // Options response says this encoding doesn't support
@@ -631,7 +642,10 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
                     if (_currentEncodingOptions?.supportsCbr ?? true)
                       const DropdownMenuItem(
                         value: CameraBitrateMode.cbr,
-                        child: Text('CBR (Constant)'),
+                        child: Text(
+                          'CBR (Constant)',
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
                   ],
                   onChanged: (value) => _markDirty(() => _bitrateMode = value!),

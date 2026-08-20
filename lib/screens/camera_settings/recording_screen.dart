@@ -122,10 +122,17 @@ class _RecordingScreenState extends State<RecordingScreen> {
               DropdownButtonFormField<RecordingScheduleDay>(
                 key: const Key('REC-008-day'),
                 initialValue: day,
+                isExpanded: true,
                 decoration: const InputDecoration(labelText: 'Day'),
                 items: [
                   for (final d in RecordingScheduleDay.values)
-                    DropdownMenuItem(value: d, child: Text(_dayLabels[d]!)),
+                    DropdownMenuItem(
+                      value: d,
+                      child: Text(
+                        _dayLabels[d]!,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
                 ],
                 onChanged: (value) => setDialogState(() => day = value ?? day),
               ),

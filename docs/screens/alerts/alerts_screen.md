@@ -29,6 +29,7 @@
 | ALERT-019 | Date filter button | `OutlinedButton.icon`, inside ALERT-015 | Shows "Any date" or the picked date. Opens `showDatePicker`; only dates that actually have at least one alert are selectable (`selectableDayPredicate`), others greyed out. `firstDate`/`lastDate` span the earliest to latest alert timestamp, not a fixed rolling window. A "Clear date" text button appears below once a date is picked |
 | ALERT-020 | "Clear all" button | `TextButton`, panel header, inside ALERT-015 | Shown only when any *staged* filter is active; resets the panel's staged Home/Camera/Type/Date back to defaults (does not close the panel or touch the applied filters until ALERT-021 is pressed) |
 | ALERT-021 | "Apply filter" button | `FilledButton`, full-width, pinned to the bottom of ALERT-015 | Commits the panel's staged Home/Camera/Type/Date into `AlertsScreen`'s real filter state (via `onApply`) and closes the drawer |
+| ALERT-022 | Alert Settings button | `IconButton` (AppBar action, tune icon) | Opens [alert_settings_screen.md](alert_settings_screen.md) via `context.push('/alerts/settings')` — per-camera, per-detection-type alert on/off toggles |
 
 ### Filter panel
 

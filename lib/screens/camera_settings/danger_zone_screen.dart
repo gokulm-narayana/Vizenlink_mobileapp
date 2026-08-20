@@ -1,3 +1,4 @@
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
@@ -7,14 +8,20 @@ import '../../theme/app_colors.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/saving_overlay.dart';
-import '../../widgets/settings_save_button.dart';
+import '../../widgets/settings_save_button.dart' show simulateCameraSave;
 import '../dashboard/dashboard_screen.dart';
 
-/// Danger Zone: Soft Reset and Hard Reset (both require the camera to be
-/// online, since they round-trip to the device) plus Delete Camera (allowed
-/// while offline — it only removes the camera from local app state via
-/// [HomesController.deleteCamera]). No CCTV protocol/backend is wired up
-/// yet (see CLAUDE.md), so the resets only simulate a round-trip.
+/// Danger Zone: Reboot, Reset Settings, and Factory Reset (all three require
+/// the camera to be online, since they round-trip to the device) plus
+/// Delete Camera (allowed while offline — it only removes the camera from
+/// local app state via [HomesController.deleteCamera]). The three device
+/// actions map onto exactly `OnvifDeviceClient`'s real surface —
+/// `reboot()` and `factoryReset(FactoryResetMode.soft/.hard)` — retried over
+/// `WanDeviceIdentityClient` if the LAN call fails and
+/// `connection.thingName` is known, per
+/// `.claude/rules/mobile-app-screen-conventions.md`'s LAN/WAN convention.
+/// Falls back to `simulateCameraSave` (local-only) for a camera with no
+/// saved connection yet.
 class DangerZoneScreen extends StatefulWidget {
   const DangerZoneScreen({
     super.key,
@@ -66,9 +73,9 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
     return confirmed ?? false;
   }
 
-  Future<void> _softReset() async {
+  Future<void> _reboot() async {
     final confirmed = await _confirm(
-      title: 'Soft reset camera?',
+      title: 'Reboot camera?',
       message: 'The camera will reboot. Settings and recordings are kept.',
       confirmLabel: 'Reboot',
     );
@@ -78,7 +85,24 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
       _isBusy = true;
       _busyLabel = 'Rebooting…';
     });
-    final succeeded = await simulateCameraSave();
+
+    final connection = widget.camera.connection;
+    final bool succeeded;
+    if (connection != null) {
+      final client = OnvifDeviceClient(connection);
+      final result = await client.reboot();
+      client.close();
+      var ok = result is CameraSuccess;
+      final thingName = connection.thingName;
+      if (!ok && thingName != null) {
+        final wanResult = await WanDeviceIdentityClient(thingName).reboot();
+        ok = wanResult is CameraSuccess;
+      }
+      succeeded = ok;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isBusy = false);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -92,31 +116,83 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
     );
   }
 
-  Future<void> _hardReset() async {
-    final confirmed = await _confirm(
-      title: 'Hard reset camera?',
-      message:
-          'This erases all settings on the camera and restores factory '
-          'defaults. This cannot be undone.',
-      confirmLabel: 'Erase & Reset',
-    );
-    if (!confirmed) return;
-
+  /// Shared `OnvifDeviceClient.factoryReset`/`WanDeviceIdentityClient.
+  /// factoryReset` call behind [_resetSettings]/[_factoryResetHard] — same
+  /// LAN-first-with-WAN-retry pattern as [_reboot].
+  Future<void> _factoryReset(
+    FactoryResetMode mode, {
+    required String busyLabel,
+    required String successMessage,
+    required String failureMessage,
+  }) async {
     setState(() {
       _isBusy = true;
-      _busyLabel = 'Resetting…';
+      _busyLabel = busyLabel;
     });
-    final succeeded = await simulateCameraSave();
+
+    final connection = widget.camera.connection;
+    final bool succeeded;
+    if (connection != null) {
+      final client = OnvifDeviceClient(connection);
+      final result = await client.factoryReset(mode);
+      client.close();
+      var ok = result is CameraSuccess;
+      final thingName = connection.thingName;
+      if (!ok && thingName != null) {
+        final wanResult = await WanDeviceIdentityClient(
+          thingName,
+        ).factoryReset(mode);
+        ok = wanResult is CameraSuccess;
+      }
+      succeeded = ok;
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isBusy = false);
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          succeeded
-              ? 'Camera has been reset to factory defaults'
-              : 'Failed to reset camera. Try again.',
-        ),
-      ),
+      SnackBar(content: Text(succeeded ? successMessage : failureMessage)),
+    );
+  }
+
+  Future<void> _resetSettings() async {
+    final confirmed = await _confirm(
+      title: 'Reset settings?',
+      message:
+          'This erases all camera settings (imaging, masks, OSD, and more) '
+          'and restores factory defaults. Wi-Fi stays connected — the '
+          'camera remains reachable on this network afterward. This cannot '
+          'be undone.',
+      confirmLabel: 'Erase & Reset',
+    );
+    if (!confirmed) return;
+    await _factoryReset(
+      FactoryResetMode.soft,
+      busyLabel: 'Resetting…',
+      successMessage: 'Camera settings have been reset to factory defaults',
+      failureMessage: 'Failed to reset camera. Try again.',
+    );
+  }
+
+  Future<void> _factoryResetHard() async {
+    final confirmed = await _confirm(
+      title: 'Factory reset camera?',
+      message:
+          'This erases ALL settings, including Wi-Fi credentials. The '
+          'camera will disconnect from this network and need to be fully '
+          're-onboarded (Wi-Fi re-entered, re-scanned) before it can be '
+          'used again. This cannot be undone.',
+      confirmLabel: 'Erase Everything',
+    );
+    if (!confirmed) return;
+    await _factoryReset(
+      FactoryResetMode.hard,
+      busyLabel: 'Factory resetting…',
+      successMessage:
+          'Camera has been factory reset — reconnect it to the network to '
+          'use it again',
+      failureMessage: 'Failed to factory reset camera. Try again.',
     );
   }
 
@@ -172,19 +248,34 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
                                 'are kept.'
                           : 'Camera is offline — reconnect it to reboot.',
                       enabled: isOnline && !_isBusy,
-                      onTap: _softReset,
+                      onTap: _reboot,
                     ),
                     const Divider(height: 1),
                     _DangerTile(
                       settingsKey: const Key('DANGER-005'),
                       icon: Icons.settings_backup_restore,
-                      label: 'Hard Reset',
+                      label: 'Reset Settings',
                       description: isOnline
-                          ? 'Erases all settings and restores factory '
-                                'defaults. This cannot be undone.'
+                          ? 'Erases camera settings and restores factory '
+                                'defaults. Wi-Fi stays connected. This '
+                                'cannot be undone.'
                           : 'Camera is offline — reconnect it to reset.',
                       enabled: isOnline && !_isBusy,
-                      onTap: _hardReset,
+                      onTap: _resetSettings,
+                    ),
+                    const Divider(height: 1),
+                    _DangerTile(
+                      settingsKey: const Key('DANGER-007'),
+                      icon: Icons.report_problem_outlined,
+                      label: 'Factory Reset',
+                      description: isOnline
+                          ? 'Erases everything, including Wi-Fi '
+                                'credentials — the camera disconnects from '
+                                'this network and needs full re-onboarding. '
+                                'This cannot be undone.'
+                          : 'Camera is offline — reconnect it to reset.',
+                      enabled: isOnline && !_isBusy,
+                      onTap: _factoryResetHard,
                     ),
                   ],
                 ),

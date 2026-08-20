@@ -22,6 +22,7 @@ const _defaultContrast = 50.0;
 const _defaultSaturation = 50.0;
 const _defaultSharpness = 50.0;
 const _defaultMirrorFlip = CameraMirrorFlip.off;
+const _defaultAntiFlickerMode = CameraAntiFlickerMode.auto;
 const _defaultWdrEnabled = false;
 const _defaultWdrLevel = 50.0;
 const _defaultWhiteBalance = CameraAutoManual.auto;
@@ -56,6 +57,22 @@ CameraMirrorFlip _fromWireMirrorFlip(MirrorFlipMode mode) => switch (mode) {
   MirrorFlipMode.both => CameraMirrorFlip.both,
 };
 
+/// `CameraAntiFlickerMode` <-> `AntiFlickerMode` — same 3 values, different
+/// enum types, same reasoning as [_toWireMirrorFlip]/[_fromWireMirrorFlip].
+AntiFlickerMode _toWireAntiFlicker(CameraAntiFlickerMode mode) =>
+    switch (mode) {
+      CameraAntiFlickerMode.hz50 => AntiFlickerMode.hz50,
+      CameraAntiFlickerMode.hz60 => AntiFlickerMode.hz60,
+      CameraAntiFlickerMode.auto => AntiFlickerMode.auto,
+    };
+
+CameraAntiFlickerMode _fromWireAntiFlicker(AntiFlickerMode mode) =>
+    switch (mode) {
+      AntiFlickerMode.hz50 => CameraAntiFlickerMode.hz50,
+      AntiFlickerMode.hz60 => CameraAntiFlickerMode.hz60,
+      AntiFlickerMode.auto => CameraAntiFlickerMode.auto,
+    };
+
 /// `CameraAutoManual` <-> ONVIF `"AUTO"`/`"MANUAL"` wire values, shared by
 /// both the white-balance and exposure mode fields.
 String _autoManualToWire(CameraAutoManual mode) => switch (mode) {
@@ -71,8 +88,8 @@ CameraAutoManual? _autoManualFromWire(String? wireValue) =>
     };
 
 /// Parsed from `NuraeyeClient.call('GetImageDefaults')`'s raw JSON — only the fields this
-/// screen's sliders/segmented buttons cover. Mirror/flip and WDR have no defaults endpoint, so
-/// [_resetToDefault] keeps this screen's local hardcoded fallback for those two.
+/// screen's sliders/segmented buttons cover. Mirror/flip, anti-flicker, and WDR have no defaults
+/// endpoint, so [_resetToDefault] keeps this screen's local hardcoded fallback for those three.
 class _ImageDefaults {
   const _ImageDefaults({
     this.brightness,
@@ -194,6 +211,7 @@ class ImagingScreen extends StatefulWidget {
 
 class _ImagingScreenState extends State<ImagingScreen> {
   late CameraMirrorFlip _mirrorFlip = _camera.mirrorFlip;
+  late CameraAntiFlickerMode _antiFlickerMode = _camera.antiFlickerMode;
   late double _brightness = _camera.brightness;
   late double _contrast = _camera.contrast;
   late double _saturation = _camera.saturation;
@@ -249,6 +267,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
       imagingClient.getImagingOptions(),
       MirrorFlipClient(nuraeye).getMirrorFlip(),
       nuraeye.call('GetImageDefaults'),
+      AntiFlickerClient(nuraeye).getAntiFlickerMode(),
     ]);
     imagingClient.close();
     nuraeye.close();
@@ -257,6 +276,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
     final optionsResult = results[1] as CameraResult<ImagingOptions>;
     var mirrorFlipResult = results[2] as CameraResult<MirrorFlipMode>;
     var defaultsResult = results[3] as CameraResult<Map<String, dynamic>>;
+    var antiFlickerResult = results[4] as CameraResult<AntiFlickerMode>;
 
     // Options are LAN-only on a normal load (see this class's doc comment)
     // — only current-value reads fall back to WAN here.
@@ -281,6 +301,11 @@ class _ImagingScreenState extends State<ImagingScreen> {
         defaultsResult = await WanImageQualityClient(
           thingName,
         ).getImageDefaults();
+      }
+      if (antiFlickerResult is! CameraSuccess) {
+        antiFlickerResult = await WanAntiFlickerClient(
+          thingName,
+        ).getAntiFlickerMode();
       }
     }
     if (!mounted) return;
@@ -334,6 +359,9 @@ class _ImagingScreenState extends State<ImagingScreen> {
       if (defaultsResult case CameraSuccess(:final value)) {
         _imageDefaults = _ImageDefaults.fromJson(value);
       }
+      if (antiFlickerResult case CameraSuccess(:final value)) {
+        _antiFlickerMode = _fromWireAntiFlicker(value);
+      }
       _isLoading = false;
     });
 
@@ -341,6 +369,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
       widget.camera.id,
       (camera) => camera.copyWith(
         mirrorFlip: _mirrorFlip,
+        antiFlickerMode: _antiFlickerMode,
         brightness: _brightness,
         contrast: _contrast,
         saturation: _saturation,
@@ -490,14 +519,25 @@ class _ImagingScreenState extends State<ImagingScreen> {
       var mirrorFlipResult = await MirrorFlipClient(
         nuraeye,
       ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
+      var antiFlickerResult = await AntiFlickerClient(
+        nuraeye,
+      ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
       nuraeye.close();
       if (mirrorFlipResult is! CameraSuccess && thingName != null) {
         mirrorFlipResult = await WanMirrorFlipClient(
           thingName,
         ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
       }
+      if (antiFlickerResult is! CameraSuccess && thingName != null) {
+        antiFlickerResult = await WanAntiFlickerClient(
+          thingName,
+        ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
+      }
 
-      succeeded = imagingSucceeded && mirrorFlipResult is CameraSuccess;
+      succeeded =
+          imagingSucceeded &&
+          mirrorFlipResult is CameraSuccess &&
+          antiFlickerResult is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();
     }
@@ -509,6 +549,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
         widget.camera.id,
         (camera) => camera.copyWith(
           mirrorFlip: _mirrorFlip,
+          antiFlickerMode: _antiFlickerMode,
           brightness: _brightness,
           contrast: _contrast,
           saturation: _saturation,
@@ -534,9 +575,10 @@ class _ImagingScreenState extends State<ImagingScreen> {
   void _resetToDefault() {
     final defaults = _imageDefaults;
     _markDirty(() {
-      // Mirror/flip and WDR have no camera-reported defaults endpoint — always this screen's
-      // own hardcoded fallback.
+      // Mirror/flip, anti-flicker, and WDR have no camera-reported defaults
+      // endpoint — always this screen's own hardcoded fallback.
       _mirrorFlip = _defaultMirrorFlip;
+      _antiFlickerMode = _defaultAntiFlickerMode;
       _wdrEnabled = _defaultWdrEnabled;
       _wdrLevel = _defaultWdrLevel;
       _brightness = defaults?.brightness ?? _defaultBrightness;
@@ -647,6 +689,32 @@ class _ImagingScreenState extends State<ImagingScreen> {
                   showSelectedIcon: false,
                   onSelectionChanged: (selection) =>
                       _markDirty(() => _mirrorFlip = selection.first),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Anti-Flicker',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 8),
+                SegmentedButton<CameraAntiFlickerMode>(
+                  key: const Key('IMG-022'),
+                  segments: const [
+                    ButtonSegment(
+                      value: CameraAntiFlickerMode.hz50,
+                      label: Text('50Hz'),
+                    ),
+                    ButtonSegment(
+                      value: CameraAntiFlickerMode.hz60,
+                      label: Text('60Hz'),
+                    ),
+                    ButtonSegment(
+                      value: CameraAntiFlickerMode.auto,
+                      label: Text('Auto'),
+                    ),
+                  ],
+                  selected: {_antiFlickerMode},
+                  onSelectionChanged: (selection) =>
+                      _markDirty(() => _antiFlickerMode = selection.first),
                 ),
                 const SizedBox(height: 16),
                 GlassCard(

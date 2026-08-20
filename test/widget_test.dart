@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:mobilecctvapp/app_state/ai_model_manager.dart';
 import 'package:mobilecctvapp/app_state/alerts_controller.dart';
+import 'package:mobilecctvapp/app_state/chat_controller.dart';
 import 'package:mobilecctvapp/app_state/events_controller.dart';
 import 'package:mobilecctvapp/app_state/homes_controller.dart';
 import 'package:mobilecctvapp/main.dart';
@@ -196,6 +197,8 @@ void main() {
     addTearDown(eventsController.dispose);
     final aiModelManager = AiModelManager();
     addTearDown(aiModelManager.dispose);
+    final chatController = ChatController();
+    addTearDown(chatController.dispose);
 
     await tester.pumpWidget(
       MaterialApp(
@@ -204,6 +207,7 @@ void main() {
           alertsController: alertsController,
           eventsController: eventsController,
           aiModelManager: aiModelManager,
+          chatController: chatController,
         ),
       ),
     );
@@ -240,6 +244,8 @@ void main() {
     addTearDown(eventsController.dispose);
     final aiModelManager = AiModelManager();
     addTearDown(aiModelManager.dispose);
+    final chatController = ChatController();
+    addTearDown(chatController.dispose);
 
     await tester.pumpWidget(
       MaterialApp(
@@ -248,6 +254,7 @@ void main() {
           alertsController: alertsController,
           eventsController: eventsController,
           aiModelManager: aiModelManager,
+          chatController: chatController,
         ),
       ),
     );
@@ -273,6 +280,8 @@ void main() {
     addTearDown(eventsController.dispose);
     final aiModelManager = AiModelManager();
     addTearDown(aiModelManager.dispose);
+    final chatController = ChatController();
+    addTearDown(chatController.dispose);
 
     await tester.pumpWidget(
       MaterialApp(
@@ -281,6 +290,7 @@ void main() {
           alertsController: alertsController,
           eventsController: eventsController,
           aiModelManager: aiModelManager,
+          chatController: chatController,
         ),
       ),
     );
@@ -311,6 +321,8 @@ void main() {
     addTearDown(eventsController.dispose);
     final aiModelManager = AiModelManager();
     addTearDown(aiModelManager.dispose);
+    final chatController = ChatController();
+    addTearDown(chatController.dispose);
 
     await tester.pumpWidget(
       MaterialApp(
@@ -319,6 +331,7 @@ void main() {
           alertsController: alertsController,
           eventsController: eventsController,
           aiModelManager: aiModelManager,
+          chatController: chatController,
         ),
       ),
     );
@@ -485,7 +498,7 @@ void main() {
       final camerasBefore = homesController.value.selectedHome.cameras.length;
 
       // Configured cameras skip straight to the setup form.
-      await tester.tap(find.text('Configured').first);
+      await tester.tap(find.text('Camera at 192.168.1.50'));
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('SCAN-010')), findsOneWidget);
@@ -519,7 +532,7 @@ void main() {
 
       final camerasBefore = homesController.value.selectedHome.cameras.length;
 
-      await tester.tap(find.text('Unconfigured').first);
+      await tester.tap(find.text('VZL-CAM'));
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('SCAN-007')), findsOneWidget);
@@ -557,7 +570,7 @@ void main() {
 
       final camerasBefore = homesController.value.selectedHome.cameras.length;
 
-      await tester.tap(find.text('Unconfigured').first);
+      await tester.tap(find.text('VZL-CAM'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Change credentials'));
       await tester.pumpAndSettle();

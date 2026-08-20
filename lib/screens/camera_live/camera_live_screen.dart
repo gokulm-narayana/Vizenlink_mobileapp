@@ -41,6 +41,24 @@ String _videoModeToIrCutFilter(CameraVideoMode mode) => switch (mode) {
   CameraVideoMode.auto => 'AUTO',
 };
 
+/// Reverse of [_videoModeToIrCutFilter] — mirrors `video_mode_screen.dart`'s
+/// private mapping of the same name, same "small local copy, Dart privacy
+/// means it can't be imported directly" reasoning.
+CameraVideoMode? _irCutFilterToVideoMode(String? wireValue) =>
+    switch (wireValue?.toUpperCase()) {
+      'ON' => CameraVideoMode.day,
+      'OFF' => CameraVideoMode.night,
+      'AUTO' => CameraVideoMode.auto,
+      _ => null,
+    };
+
+/// Mirrors `privacy_mode_screen.dart`'s private mapping of the same name.
+CameraPrivacyMode _fromWirePrivacyMode(PrivacyMode mode) => switch (mode) {
+  PrivacyMode.none => CameraPrivacyMode.off,
+  PrivacyMode.full => CameraPrivacyMode.full,
+  PrivacyMode.zone => CameraPrivacyMode.zone,
+};
+
 const _recordingLimit = Duration(minutes: 5);
 const _continuePromptCountdown = Duration(seconds: 5);
 const _cellularReminderInterval = Duration(minutes: 5);
@@ -83,6 +101,10 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   bool _isMuted = false;
   bool _isSpotlightOn = false;
   bool _isSpotlightShortcutBusy = false;
+  bool _isSirenOn = false;
+  bool _isSirenShortcutBusy = false;
+  bool _isWarningOn = false;
+  bool _isWarningShortcutBusy = false;
   bool _isPrivacyShortcutBusy = false;
   bool _isVideoModeShortcutBusy = false;
 
@@ -130,8 +152,62 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
         (_) => unawaited(_pollSignalStrength()),
       );
       unawaited(_loadRealBitrate());
+      unawaited(_loadShortcutState());
     }
     _initConnectivity();
+  }
+
+  /// Refreshes the Privacy Mode/Video Mode/Siren/Spotlight/Warning shortcut
+  /// tiles with the camera's actual current state on screen open — without
+  /// this, they only ever reflected whatever this app itself last set (via
+  /// these same tiles, or a sync elsewhere), silently drifting out of date
+  /// if changed by another client, the camera's own web UI, or (for
+  /// deterrence) a Response Action auto-triggered by a detection event (see
+  /// `alert_settings_screen.dart`). LAN-only, no WAN fallback — same
+  /// "current-value read, best-effort" treatment as [_loadRealBitrate]/
+  /// [_pollSignalStrength]; a failed fetch just leaves the tiles showing
+  /// whatever they already had rather than blocking the screen.
+  Future<void> _loadShortcutState() async {
+    final connection = widget.camera.connection;
+    if (connection == null) return;
+
+    final nuraeye = NuraeyeClient(connection);
+    final imagingClient = OnvifImagingClient(connection);
+    final results = await Future.wait([
+      PrivacyModeClient(nuraeye).getPrivacyMode(),
+      imagingClient.getImagingSettings(),
+      DeterrenceClient(nuraeye).getDeterrenceStatus(),
+    ]);
+    nuraeye.close();
+    imagingClient.close();
+    if (!mounted) return;
+
+    final privacyResult = results[0] as CameraResult<PrivacyMode>;
+    final imagingResult = results[1] as CameraResult<ImagingSettings>;
+    final statusResult = results[2] as CameraResult<DeterrenceStatus>;
+
+    if (privacyResult case CameraSuccess(:final value)) {
+      widget.homesController.updateCamera(
+        widget.camera.id,
+        (current) => current.copyWith(privacyMode: _fromWirePrivacyMode(value)),
+      );
+    }
+    if (imagingResult case CameraSuccess(:final value)) {
+      final mode = _irCutFilterToVideoMode(value.irCutFilterMode);
+      if (mode != null) {
+        widget.homesController.updateCamera(
+          widget.camera.id,
+          (current) => current.copyWith(videoMode: mode),
+        );
+      }
+    }
+    if (statusResult case CameraSuccess(:final value)) {
+      setState(() {
+        _isSpotlightOn = value.spotlight;
+        _isSirenOn = value.siren;
+        _isWarningOn = value.warning;
+      });
+    }
   }
 
   /// Real configured encoder bitrate (LIVE-029's badge) — a stable
@@ -692,39 +768,20 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   /// (`ActivateDeterrence`/`DeactivateDeterrence`, action `"spotlight"`),
   /// applied immediately (same instant-apply reasoning as
   /// [_togglePrivacyShortcut]). No duration is sent — the camera applies
-  /// its own configured auto-stop duration (`FEAT-236`). Doesn't gate on
-  /// `CameraCapabilities.spotlightCapable` the way a dedicated deterrence
-  /// settings screen would — same reasoning as [_cycleVideoModeShortcut]:
-  /// a camera that doesn't support it will surface that as a failed
-  /// activate instead. Purely momentary hardware state, not a persisted
+  /// its own configured auto-stop duration (`FEAT-236`). The tile itself is
+  /// hidden when `Camera.spotlightCapable == false` (build widget, below) —
+  /// this method only runs when the camera is already known to support it,
+  /// or capability is still unknown (not yet synced). Purely momentary
+  /// hardware state, not a persisted
   /// camera setting — nothing written to `HomesController` on success.
   Future<void> _toggleSpotlight(Camera camera) async {
     final turningOn = !_isSpotlightOn;
     setState(() => _isSpotlightShortcutBusy = true);
-
-    final connection = camera.connection;
-    final bool succeeded;
-    if (connection != null) {
-      final nuraeye = NuraeyeClient(connection);
-      final client = DeterrenceClient(nuraeye);
-      var result = turningOn
-          ? await client.activateDeterrence('spotlight')
-          : await client.deactivateDeterrence('spotlight');
-      nuraeye.close();
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention.
-      final thingName = connection.thingName;
-      if (result is! CameraSuccess && thingName != null) {
-        final wanClient = WanDeterrenceClient(thingName);
-        result = turningOn
-            ? await wanClient.activateDeterrence('spotlight')
-            : await wanClient.deactivateDeterrence('spotlight');
-      }
-      succeeded = result is CameraSuccess;
-    } else {
-      succeeded = await simulateCameraSave();
-    }
-
+    final succeeded = await _sendDeterrenceAction(
+      camera,
+      'spotlight',
+      turningOn: turningOn,
+    );
     if (!mounted) return;
     setState(() => _isSpotlightShortcutBusy = false);
     if (succeeded) {
@@ -739,6 +796,93 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
         ),
       );
     }
+  }
+
+  /// Quick Siren shortcut (LIVE-045) — same instant-apply, momentary,
+  /// non-persisted pattern as [_toggleSpotlight], just a different
+  /// `DeterrenceClient`/`WanDeterrenceClient` action string ("siren").
+  /// Hidden when `Camera.sirenCapable == false` (build widget, below).
+  Future<void> _toggleSiren(Camera camera) async {
+    final turningOn = !_isSirenOn;
+    setState(() => _isSirenShortcutBusy = true);
+    final succeeded = await _sendDeterrenceAction(
+      camera,
+      'siren',
+      turningOn: turningOn,
+    );
+    if (!mounted) return;
+    setState(() => _isSirenShortcutBusy = false);
+    if (succeeded) {
+      setState(() => _isSirenOn = turningOn);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Failed to ${turningOn ? 'turn on' : 'turn off'} siren. '
+            'Try again.',
+          ),
+        ),
+      );
+    }
+  }
+
+  /// Quick Warning shortcut (LIVE-046) — same pattern as [_toggleSpotlight]/
+  /// [_toggleSiren], action string "warning". Hidden when
+  /// `Camera.warningCapable == false` (build widget, below).
+  Future<void> _toggleWarning(Camera camera) async {
+    final turningOn = !_isWarningOn;
+    setState(() => _isWarningShortcutBusy = true);
+    final succeeded = await _sendDeterrenceAction(
+      camera,
+      'warning',
+      turningOn: turningOn,
+    );
+    if (!mounted) return;
+    setState(() => _isWarningShortcutBusy = false);
+    if (succeeded) {
+      setState(() => _isWarningOn = turningOn);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Failed to ${turningOn ? 'turn on' : 'turn off'} warning. '
+            'Try again.',
+          ),
+        ),
+      );
+    }
+  }
+
+  /// Shared `DeterrenceClient`/`WanDeterrenceClient`
+  /// `ActivateDeterrence`/`DeactivateDeterrence` call behind
+  /// [_toggleSpotlight]/[_toggleSiren]/[_toggleWarning] — applied
+  /// immediately, no duration sent (the camera applies its own configured
+  /// auto-stop duration, `FEAT-236`), retried over WAN on a LAN failure per
+  /// `mobile-app-screen-conventions.md`'s LAN/WAN convention. Purely
+  /// momentary hardware state, not a persisted camera setting — nothing
+  /// written to `HomesController` on success.
+  Future<bool> _sendDeterrenceAction(
+    Camera camera,
+    String action, {
+    required bool turningOn,
+  }) async {
+    final connection = camera.connection;
+    if (connection == null) return simulateCameraSave();
+
+    final nuraeye = NuraeyeClient(connection);
+    final client = DeterrenceClient(nuraeye);
+    var result = turningOn
+        ? await client.activateDeterrence(action)
+        : await client.deactivateDeterrence(action);
+    nuraeye.close();
+    final thingName = connection.thingName;
+    if (result is! CameraSuccess && thingName != null) {
+      final wanClient = WanDeterrenceClient(thingName);
+      result = turningOn
+          ? await wanClient.activateDeterrence(action)
+          : await wanClient.deactivateDeterrence(action);
+    }
+    return result is CameraSuccess;
   }
 
   /// Quick Privacy Mode shortcut (LIVE-041) — toggles Off<->Full only, same
@@ -1103,6 +1247,13 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                           TalkStatus.idle,
                       isSpotlightOn: _isSpotlightOn,
                       isSpotlightShortcutBusy: _isSpotlightShortcutBusy,
+                      spotlightCapable: camera.spotlightCapable,
+                      isSirenOn: _isSirenOn,
+                      isSirenShortcutBusy: _isSirenShortcutBusy,
+                      sirenCapable: camera.sirenCapable,
+                      isWarningOn: _isWarningOn,
+                      isWarningShortcutBusy: _isWarningShortcutBusy,
+                      warningCapable: camera.warningCapable,
                       privacyMode: camera.privacyMode,
                       isPrivacyShortcutBusy: _isPrivacyShortcutBusy,
                       videoMode: camera.videoMode,
@@ -1111,6 +1262,8 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
                       onRecord: _toggleRecording,
                       onTalk: _toggleTalk,
                       onSpotlight: () => _toggleSpotlight(camera),
+                      onSiren: () => _toggleSiren(camera),
+                      onWarning: () => _toggleWarning(camera),
                       onPrivacy: () => _togglePrivacyShortcut(camera),
                       onVideoMode: () => _cycleVideoModeShortcut(camera),
                       onAiMode: () => _openAiMode(camera),
@@ -1250,9 +1403,18 @@ class _OfflineOverlay extends StatelessWidget {
 /// can be zoomed digitally in both the Live and Playback tabs, and in
 /// fullscreen.
 class _VideoSurface extends StatelessWidget {
-  const _VideoSurface({required this.controller});
+  const _VideoSurface({required this.controller, this.fit = BoxFit.cover});
 
   final VideoPlayerController controller;
+
+  /// `BoxFit.cover` (default) fills the available box edge-to-edge, cropping
+  /// any part of the frame that doesn't match the box's aspect ratio — fine
+  /// inline where the box is already pinned to the camera's own 16:9 ratio
+  /// (see the `AspectRatio` wrapper in `CameraLiveScreen.build`). Fullscreen
+  /// has no such matching box (it fills the phone's own screen ratio), so
+  /// `_FullscreenVideo` passes `BoxFit.contain` there instead to letterbox
+  /// rather than crop.
+  final BoxFit fit;
 
   @override
   Widget build(BuildContext context) {
@@ -1264,10 +1426,9 @@ class _VideoSurface extends StatelessWidget {
     }
     return ColoredBox(
       color: Colors.black,
-      child: InteractiveViewer(
-        maxScale: 4,
+      child: _ZoomableVideo(
         child: FittedBox(
-          fit: BoxFit.cover,
+          fit: fit,
           child: SizedBox(
             width: controller.value.size.width,
             height: controller.value.size.height,
@@ -1275,6 +1436,95 @@ class _VideoSurface extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Wraps [child] in pinch-to-zoom (via [InteractiveViewer], same `maxScale`
+/// every pre-existing call site used) and overlays a transient "1.0x"/"2.3x"
+/// zoom-level badge (LIVE-044) while the user is actively pinching, fading
+/// out shortly after the gesture ends rather than staying pinned on screen
+/// indefinitely — see docs/screens/camera_live/camera_live_screen.md.
+class _ZoomableVideo extends StatefulWidget {
+  const _ZoomableVideo({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_ZoomableVideo> createState() => _ZoomableVideoState();
+}
+
+class _ZoomableVideoState extends State<_ZoomableVideo> {
+  final _transformationController = TransformationController();
+  double _scale = 1;
+  bool _showBadge = false;
+  Timer? _hideTimer;
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    _transformationController.dispose();
+    super.dispose();
+  }
+
+  void _onInteractionUpdate(ScaleUpdateDetails details) {
+    setState(() {
+      _scale = _transformationController.value.getMaxScaleOnAxis();
+      _showBadge = true;
+    });
+  }
+
+  void _onInteractionEnd(ScaleEndDetails details) {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 1), () {
+      if (mounted) setState(() => _showBadge = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        InteractiveViewer(
+          transformationController: _transformationController,
+          maxScale: 4,
+          onInteractionUpdate: _onInteractionUpdate,
+          onInteractionEnd: _onInteractionEnd,
+          child: widget.child,
+        ),
+        Positioned(
+          top: 8,
+          right: 8,
+          child: IgnorePointer(
+            child: AnimatedOpacity(
+              opacity: _showBadge ? 1 : 0,
+              duration: const Duration(milliseconds: 200),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  child: Text(
+                    'Digital Zoom: ${_scale.toStringAsFixed(1)}x',
+                    key: const Key('LIVE-044'),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1328,17 +1578,22 @@ class _HeroVideo extends StatelessWidget {
     required this.videoController,
     required this.liveViewController,
     required this.showLiveView,
+    this.fit = BoxFit.cover,
   });
 
   final VideoPlayerController videoController;
   final LiveViewController? liveViewController;
   final bool showLiveView;
 
+  /// See [_VideoSurface.fit]'s doc — threaded through to whichever surface
+  /// (WAN `_VideoSurface` or LAN `RTCVideoView`) ends up rendering.
+  final BoxFit fit;
+
   @override
   Widget build(BuildContext context) {
     final controller = liveViewController;
     if (!showLiveView || controller == null) {
-      return _VideoSurface(controller: videoController);
+      return _VideoSurface(controller: videoController, fit: fit);
     }
     return AnimatedBuilder(
       animation: controller,
@@ -1371,7 +1626,7 @@ class _HeroVideo extends StatelessWidget {
               return Stack(
                 fit: StackFit.expand,
                 children: [
-                  _VideoSurface(controller: wanController),
+                  _VideoSurface(controller: wanController, fit: fit),
                   const Positioned(
                     top: 8,
                     left: 8,
@@ -1380,15 +1635,16 @@ class _HeroVideo extends StatelessWidget {
                 ],
               );
             }
-            // Pinch-to-zoom via InteractiveViewer, same as _VideoSurface
-            // below — this is the LAN WebRTC path (the common case), which
+            // Pinch-to-zoom via _ZoomableVideo, same as _VideoSurface below
+            // — this is the LAN WebRTC path (the common case), which
             // previously returned the bare renderer with no zoom wrapper at
             // all, unlike the WAN/Playback paths.
-            return InteractiveViewer(
-              maxScale: 4,
+            return _ZoomableVideo(
               child: RTCVideoView(
                 controller.renderer,
-                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                objectFit: fit == BoxFit.contain
+                    ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+                    : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
               ),
             );
           case LiveViewStatus.failed:
@@ -1461,6 +1717,13 @@ class _LiveControls extends StatelessWidget {
     required this.isTalking,
     required this.isSpotlightOn,
     required this.isSpotlightShortcutBusy,
+    required this.spotlightCapable,
+    required this.isSirenOn,
+    required this.isSirenShortcutBusy,
+    required this.sirenCapable,
+    required this.isWarningOn,
+    required this.isWarningShortcutBusy,
+    required this.warningCapable,
     required this.privacyMode,
     required this.isPrivacyShortcutBusy,
     required this.videoMode,
@@ -1469,6 +1732,8 @@ class _LiveControls extends StatelessWidget {
     required this.onRecord,
     required this.onTalk,
     required this.onSpotlight,
+    required this.onSiren,
+    required this.onWarning,
     required this.onPrivacy,
     required this.onVideoMode,
     required this.onAiMode,
@@ -1480,6 +1745,24 @@ class _LiveControls extends StatelessWidget {
   final bool isTalking;
   final bool isSpotlightOn;
   final bool isSpotlightShortcutBusy;
+
+  /// Whether this camera reports spotlight hardware, per `Camera`'s onboarding
+  /// `CameraCapabilities` snapshot. Null means unknown (not yet synced) — only
+  /// a definitive `false` hides the tile, same `!= false` treatment
+  /// `wanLiveViewCapable` gets in `LiveViewController`.
+  final bool? spotlightCapable;
+  final bool isSirenOn;
+  final bool isSirenShortcutBusy;
+
+  /// Same "definitive `false` only" hide rule as [spotlightCapable], for
+  /// the camera's siren hardware.
+  final bool? sirenCapable;
+  final bool isWarningOn;
+  final bool isWarningShortcutBusy;
+
+  /// Same "definitive `false` only" hide rule as [spotlightCapable], for
+  /// the camera's warning light/sound hardware.
+  final bool? warningCapable;
   final CameraPrivacyMode privacyMode;
   final bool isPrivacyShortcutBusy;
   final CameraVideoMode videoMode;
@@ -1488,6 +1771,8 @@ class _LiveControls extends StatelessWidget {
   final VoidCallback onRecord;
   final VoidCallback onTalk;
   final VoidCallback onSpotlight;
+  final VoidCallback onSiren;
+  final VoidCallback onWarning;
   final VoidCallback onPrivacy;
   final VoidCallback onVideoMode;
   final VoidCallback onAiMode;
@@ -1500,6 +1785,12 @@ class _LiveControls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Only a definitive `false` hides the tile — `null` (not yet synced)
+    // still shows it so a camera mid-onboarding isn't wrongly stripped of a
+    // control it may well support.
+    final showSpotlight = spotlightCapable != false;
+    final showSiren = sirenCapable != false;
+    final showWarning = warningCapable != false;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       child: Align(
@@ -1540,20 +1831,22 @@ class _LiveControls extends StatelessWidget {
                     onPressed: isEnabled ? onTalk : null,
                   ),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _ControlTile(
-                    key: const Key('LIVE-018'),
-                    label: isSpotlightOn ? 'Spotlight off' : 'Spotlight',
-                    icon: isSpotlightOn
-                        ? Icons.flashlight_on
-                        : Icons.flashlight_off_outlined,
-                    color: isSpotlightOn ? Colors.amber : null,
-                    onPressed: (isEnabled && !isSpotlightShortcutBusy)
-                        ? onSpotlight
-                        : null,
+                if (showSpotlight) ...[
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _ControlTile(
+                      key: const Key('LIVE-018'),
+                      label: isSpotlightOn ? 'Spotlight off' : 'Spotlight',
+                      icon: isSpotlightOn
+                          ? Icons.flashlight_on
+                          : Icons.flashlight_off_outlined,
+                      color: isSpotlightOn ? Colors.amber : null,
+                      onPressed: (isEnabled && !isSpotlightShortcutBusy)
+                          ? onSpotlight
+                          : null,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
             const SizedBox(height: 12),
@@ -1601,6 +1894,44 @@ class _LiveControls extends StatelessWidget {
                 ),
               ],
             ),
+            if (showSiren || showWarning) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  if (showSiren) ...[
+                    Expanded(
+                      child: _ControlTile(
+                        key: const Key('LIVE-045'),
+                        label: isSirenOn ? 'Siren off' : 'Siren',
+                        icon: isSirenOn
+                            ? Icons.campaign
+                            : Icons.campaign_outlined,
+                        color: isSirenOn ? AppColors.offline : null,
+                        onPressed: (isEnabled && !isSirenShortcutBusy)
+                            ? onSiren
+                            : null,
+                      ),
+                    ),
+                  ],
+                  if (showSiren && showWarning) const SizedBox(width: 12),
+                  if (showWarning) ...[
+                    Expanded(
+                      child: _ControlTile(
+                        key: const Key('LIVE-046'),
+                        label: isWarningOn ? 'Warning off' : 'Warning',
+                        icon: isWarningOn
+                            ? Icons.warning
+                            : Icons.warning_amber_outlined,
+                        color: isWarningOn ? Colors.amber : null,
+                        onPressed: (isEnabled && !isWarningShortcutBusy)
+                            ? onWarning
+                            : null,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
             const SizedBox(height: 12),
             Row(
               children: [
@@ -2218,6 +2549,12 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
                 videoController: widget.controller,
                 liveViewController: widget.liveViewController,
                 showLiveView: widget.showLiveView,
+                // Letterbox instead of crop: fullscreen has no box pinned to
+                // the camera's own aspect ratio (unlike the inline 16:9
+                // AspectRatio wrapper), so `cover` here would crop the frame
+                // to match the phone's screen ratio instead of showing all
+                // of it.
+                fit: BoxFit.contain,
               ),
             ),
             Positioned(

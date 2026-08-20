@@ -69,6 +69,10 @@ enum CameraPrivacyMode { off, full, zone }
 /// Imaging screen — mirror/flip orientation.
 enum CameraMirrorFlip { off, mirror, flip, both }
 
+/// Imaging screen — anti-flicker (mains-frequency) compensation mode.
+/// Mirrors `camera_api`'s `AntiFlickerMode` wire enum.
+enum CameraAntiFlickerMode { hz50, hz60, auto }
+
 /// Imaging screen — auto vs. manual control, shared by white balance and
 /// exposure.
 enum CameraAutoManual { auto, manual }
@@ -123,6 +127,7 @@ class Camera {
     this.privacyMode = CameraPrivacyMode.off,
     this.privacyZones = const [],
     this.mirrorFlip = CameraMirrorFlip.off,
+    this.antiFlickerMode = CameraAntiFlickerMode.auto,
     this.brightness = 50,
     this.contrast = 50,
     this.saturation = 50,
@@ -172,6 +177,10 @@ class Camera {
     this.password,
     this.thingName,
     this.wanLiveViewCapable,
+    this.wanCommandCapable,
+    this.sirenCapable,
+    this.spotlightCapable,
+    this.warningCapable,
   });
 
   final String id;
@@ -246,6 +255,7 @@ class Camera {
   final CameraPrivacyMode privacyMode;
   final List<DrawableZone> privacyZones;
   final CameraMirrorFlip mirrorFlip;
+  final CameraAntiFlickerMode antiFlickerMode;
   final double brightness;
   final double contrast;
   final double saturation;
@@ -331,6 +341,20 @@ class Camera {
   /// `CameraConnection.wanLiveViewCapable`'s doc for why that distinction
   /// matters to live-view fallback logic.
   final bool? wanLiveViewCapable;
+
+  /// Whether this camera can receive AWS IoT/MQTT commands at all, per
+  /// `CapabilitiesClient` (queried once at onboarding, same as
+  /// [wanLiveViewCapable]). Null means unknown, not unsupported.
+  final bool? wanCommandCapable;
+
+  /// Hardware deterrence capability flags from `CapabilitiesClient`, queried
+  /// once at onboarding. Null means unknown (not yet synced), not
+  /// unsupported — UI that gates on these should only hide/disable a control
+  /// when the flag is definitively `false`, the same `!= false` treatment
+  /// [wanLiveViewCapable] already gets in `LiveViewController`.
+  final bool? sirenCapable;
+  final bool? spotlightCapable;
+  final bool? warningCapable;
 
   /// Builds a [CameraConnection] from this camera's saved credentials, or
   /// null if it doesn't have any yet (see [host]'s doc).
@@ -419,6 +443,10 @@ class Camera {
     String? password,
     String? thingName,
     bool? wanLiveViewCapable,
+    bool? wanCommandCapable,
+    bool? sirenCapable,
+    bool? spotlightCapable,
+    bool? warningCapable,
     bool? bitrateOsdEnabled,
     OsdCorner? bitrateOsdPosition,
     bool? signalStrengthOsdEnabled,
@@ -431,6 +459,7 @@ class Camera {
     CameraPrivacyMode? privacyMode,
     List<DrawableZone>? privacyZones,
     CameraMirrorFlip? mirrorFlip,
+    CameraAntiFlickerMode? antiFlickerMode,
     double? brightness,
     double? contrast,
     double? saturation,
@@ -504,6 +533,10 @@ class Camera {
       password: password ?? this.password,
       thingName: thingName ?? this.thingName,
       wanLiveViewCapable: wanLiveViewCapable ?? this.wanLiveViewCapable,
+      wanCommandCapable: wanCommandCapable ?? this.wanCommandCapable,
+      sirenCapable: sirenCapable ?? this.sirenCapable,
+      spotlightCapable: spotlightCapable ?? this.spotlightCapable,
+      warningCapable: warningCapable ?? this.warningCapable,
       bitrateOsdEnabled: bitrateOsdEnabled ?? this.bitrateOsdEnabled,
       bitrateOsdPosition: bitrateOsdPosition ?? this.bitrateOsdPosition,
       signalStrengthOsdEnabled:
@@ -520,6 +553,7 @@ class Camera {
       privacyMode: privacyMode ?? this.privacyMode,
       privacyZones: privacyZones ?? this.privacyZones,
       mirrorFlip: mirrorFlip ?? this.mirrorFlip,
+      antiFlickerMode: antiFlickerMode ?? this.antiFlickerMode,
       brightness: brightness ?? this.brightness,
       contrast: contrast ?? this.contrast,
       saturation: saturation ?? this.saturation,

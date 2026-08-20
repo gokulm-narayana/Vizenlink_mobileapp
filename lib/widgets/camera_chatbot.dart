@@ -5,39 +5,47 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
 import 'package:go_router/go_router.dart';
+import 'package:llamadart/llamadart.dart' show ToolDefinition;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../app_state/ai_model_manager.dart';
-import '../app_state/events_controller.dart';
+import '../app_state/chat_controller.dart';
+import '../app_state/chatbot_tools.dart';
 import '../app_state/homes_controller.dart';
-import '../models/event.dart';
-import '../models/event_type_display.dart';
-import '../screens/events/event_detail_screen.dart';
-import '../screens/events/events_screen.dart';
-import 'camera_thumbnail_image.dart';
+import '../models/camera.dart';
+import '../models/scanned_camera.dart';
+import '../screens/camera_live/camera_live_screen.dart';
+import '../screens/dashboard/dashboard_screen.dart';
+import '../screens/scan/scanned_devices_screen.dart';
 
 const _quickPrompts = [
-  "Today's events",
-  'Any motion alerts?',
-  'Show recent snapshots',
-  'Show me videos',
+  'List my cameras',
+  'Scan for cameras',
+  'Take a snapshot',
+  'Open live view',
 ];
 
 /// Opens the camera assistant. The chat itself (CHAT-001) only opens once
 /// the on-device AI model (Qwen3.5-0.8B via `AiModelManager`) is ready — the
 /// user is asked for consent first (CHAT-019), and declining closes the
 /// whole flow instead of falling back to a canned-reply chat, since the
-/// chatbot's whole purpose is the AI. Event/video/image result cards are
-/// still built from existing local data (`EventsController`,
-/// `HomesController`) via keyword matching once chatting. Downloading the
-/// model is strictly opt-in (see CLAUDE.md: no backend/AI dependency without
-/// explicit confirmation).
+/// chatbot's whole purpose is the AI. Every reply and every action the
+/// chatbot takes comes from the model's own real tool-calling
+/// (`chatbot_tools.dart`'s `buildCameraTools()`) — there is no keyword-
+/// matched shortcut standing in for a tool call. Downloading the model is
+/// strictly opt-in (see CLAUDE.md: no backend/AI dependency without
+/// explicit confirmation). The conversation itself lives in [chatController]
+/// (owned by the caller, instantiated once in `main.dart`) rather than this
+/// sheet's own `State` — this bottom sheet's `State` is destroyed every time
+/// it's closed (including an accidental back-gesture dismiss), so a
+/// message list stored here alone would silently lose the whole
+/// conversation on every close/reopen.
 Future<void> showCameraChatbot(
   BuildContext context, {
   required HomesController homesController,
-  required EventsController eventsController,
   required AiModelManager aiModelManager,
+  required ChatController chatController,
 }) async {
   if (aiModelManager.status != AiChatStatus.ready) {
     final ready = await _resolveAiGate(context, aiModelManager);
@@ -49,8 +57,8 @@ Future<void> showCameraChatbot(
     backgroundColor: Colors.transparent,
     builder: (context) => _CameraChatbotSheet(
       homesController: homesController,
-      eventsController: eventsController,
       aiModelManager: aiModelManager,
+      chatController: chatController,
     ),
   );
 }
@@ -213,43 +221,16 @@ class _AiDownloadGateSheetState extends State<_AiDownloadGateSheet> {
   }
 }
 
-typedef _ResultData = ({
-  List<RecordedEvent> events,
-  List<RecordedEvent> videos,
-  List<String> images,
-});
-
-class _ChatMessage {
-  const _ChatMessage.user(this.text)
-    : isUser = true,
-      events = const [],
-      videos = const [],
-      images = const [];
-
-  const _ChatMessage.assistant(
-    this.text, {
-    this.events = const [],
-    this.videos = const [],
-    this.images = const [],
-  }) : isUser = false;
-
-  final bool isUser;
-  final String text;
-  final List<RecordedEvent> events;
-  final List<RecordedEvent> videos;
-  final List<String> images;
-}
-
 class _CameraChatbotSheet extends StatefulWidget {
   const _CameraChatbotSheet({
     required this.homesController,
-    required this.eventsController,
     required this.aiModelManager,
+    required this.chatController,
   });
 
   final HomesController homesController;
-  final EventsController eventsController;
   final AiModelManager aiModelManager;
+  final ChatController chatController;
 
   @override
   State<_CameraChatbotSheet> createState() => _CameraChatbotSheetState();
@@ -258,12 +239,98 @@ class _CameraChatbotSheet extends StatefulWidget {
 class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
   final _inputController = TextEditingController();
   final _scrollController = ScrollController();
-  final _messages = <_ChatMessage>[];
   bool _isListening = false;
   Timer? _listeningTimer;
 
+  List<ChatMessage> get _messages => widget.chatController.value;
+
+  @override
+  void initState() {
+    super.initState();
+    // The conversation lives in `widget.chatController`, not local State —
+    // rebuild whenever it changes (a new message, a streamed token, a
+    // confirm card resolving) since Flutter has no other way to know.
+    widget.chatController.addListener(_onChatControllerChanged);
+  }
+
+  void _onChatControllerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// True while a reply (including any tool calls it triggers) is in
+  /// flight. Gates [_send] — without this, sending a second message before
+  /// the first finishes let two `_streamAiReply` calls run concurrently,
+  /// both sharing the single [_activeEffects]/[_activeMessageIndex]
+  /// pointer below. A slow tool call from the *first* request (e.g.
+  /// `take_snapshot`, which can take real seconds) could then complete
+  /// after the second request had already repointed those fields at its
+  /// own newer message — attaching the first request's (older) result to
+  /// the second (newer) message. That's what made a fresh snapshot request
+  /// appear to show a stale/previous snapshot.
+  bool _isReplying = false;
+
+  /// Built once — resolves camera names against the same [HomesController]
+  /// this sheet already has, and routes any tool-call side effect
+  /// (snapshot/live-view/confirm card) to [_handleToolEffect].
+  late final List<ToolDefinition> _tools = buildCameraTools(
+    homesController: widget.homesController,
+    onEffect: (effect) => _handleToolEffect(effect),
+  );
+
+  /// Which in-flight assistant message/effect-list a tool-call effect
+  /// should attach to — set for the duration of one [_streamAiReply] call,
+  /// since a tool's handler can fire [ChatToolEffect]s while the model is
+  /// still generating, not only after it finishes.
+  List<ChatToolEffect>? _activeEffects;
+  int? _activeMessageIndex;
+
+  void _handleToolEffect(ChatToolEffect effect) {
+    final effects = _activeEffects;
+    final index = _activeMessageIndex;
+    if (effects == null || index == null || !mounted) return;
+    effects.add(effect);
+    final msg = _messages[index];
+    widget.chatController.updateAt(
+      index,
+      ChatMessage.assistant(msg.text, effects: List.of(effects)),
+    );
+    _scrollToBottom();
+  }
+
+  Future<void> _confirmEffect(ConfirmEffect effect) async {
+    widget.chatController.markConfirmationInProgress(effect);
+    final resultText = await effect.onConfirm();
+    if (!mounted) return;
+    widget.chatController.markConfirmationResolved(effect);
+    widget.chatController.addAssistantMessage(resultText);
+    _scrollToBottom();
+  }
+
+  void _cancelEffect(ConfirmEffect effect) {
+    widget.chatController.markConfirmationResolved(effect);
+    widget.chatController.addAssistantMessage('Cancelled.');
+    _scrollToBottom();
+  }
+
+  void _openLiveViewEffect(Camera camera) {
+    Navigator.of(context).pop();
+    context.push(
+      '${DashboardScreen.routeName}/${CameraLiveScreen.routeName}/${camera.id}',
+      extra: camera,
+    );
+  }
+
+  void _openScanResultsEffect(List<ScannedCamera> cameras) {
+    Navigator.of(context).pop();
+    context.push(
+      '${DashboardScreen.routeName}/${ScannedDevicesScreen.routeName}',
+      extra: cameras,
+    );
+  }
+
   @override
   void dispose() {
+    widget.chatController.removeListener(_onChatControllerChanged);
     _inputController.dispose();
     _scrollController.dispose();
     _listeningTimer?.cancel();
@@ -282,149 +349,89 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
   }
 
   void _send(String rawText) {
+    if (_isReplying) return;
     final text = rawText.trim();
     if (text.isEmpty) return;
-    setState(() => _messages.add(_ChatMessage.user(text)));
+    widget.chatController.addUserMessage(text);
+    setState(() => _isReplying = true);
     _inputController.clear();
     _scrollToBottom();
 
-    final data = _computeResultData(text);
-    final aiStream = widget.aiModelManager.reply(text);
+    final aiStream = widget.aiModelManager.reply(
+      text,
+      tools: selectRelevantTools(text, _tools),
+    );
     if (aiStream != null) {
-      _streamAiReply(
-        aiStream,
-        data,
-        fallbackText: () => _cannedReplyText(text, data),
-      );
+      _streamAiReply(aiStream);
       return;
     }
 
     // Defensive fallback — shouldn't normally happen, since the chat only
     // opens once the model is ready (see _resolveAiGate).
-    setState(() {
-      _messages.add(
-        _ChatMessage.assistant(
-          _cannedReplyText(text, data),
-          events: data.events,
-          videos: data.videos,
-          images: data.images,
-        ),
-      );
-    });
+    setState(() => _isReplying = false);
+    widget.chatController.addAssistantMessage(_fallbackReplyText);
     _scrollToBottom();
   }
 
-  Future<void> _streamAiReply(
-    Stream<String> stream,
-    _ResultData data, {
-    required String Function() fallbackText,
-  }) async {
+  static const _fallbackReplyText =
+      "Sorry, I couldn't process that — please try again.";
+
+  Future<void> _streamAiReply(Stream<String> stream) async {
     final index = _messages.length;
-    setState(() {
-      _messages.add(
-        _ChatMessage.assistant(
-          '',
-          events: data.events,
-          videos: data.videos,
-          images: data.images,
-        ),
-      );
-    });
-    var buffer = '';
+    final effects = <ChatToolEffect>[];
+    widget.chatController.addAssistantMessage('');
+    // Any tool call this reply triggers should attach its effect (snapshot/
+    // live-view/scan-results/confirm card) to this same message, even
+    // mid-stream — see _handleToolEffect. Cleared in `finally` below on
+    // every exit path (including an early return from unmounting
+    // mid-stream) — previously an early `!mounted` return skipped this
+    // reset, and separately nothing stopped a second `_send()` from
+    // starting a concurrent request that would repoint these fields at its
+    // own message while this one's tool call (e.g. a slow `take_snapshot`)
+    // was still in flight — see `_isReplying`'s doc for the exact failure
+    // this caused (a stale/previous snapshot appearing on a fresh request).
+    _activeEffects = effects;
+    _activeMessageIndex = index;
+
     try {
-      await for (final delta in stream) {
-        buffer += delta;
-        if (!mounted) return;
-        setState(() {
-          _messages[index] = _ChatMessage.assistant(
-            buffer,
-            events: data.events,
-            videos: data.videos,
-            images: data.images,
+      var buffer = '';
+      try {
+        await for (final delta in stream) {
+          buffer += delta;
+          if (!mounted) return;
+          widget.chatController.updateAt(
+            index,
+            ChatMessage.assistant(buffer, effects: List.of(effects)),
           );
-        });
-        _scrollToBottom();
+          _scrollToBottom();
+        }
+      } catch (e, st) {
+        // Logged (not swallowed silently) — the user only ever sees the
+        // generic fallback text below, so without this, a real failure
+        // here (an `llamadart`/model-side exception, a version-upgrade
+        // regression, etc.) leaves no trace anywhere to diagnose from.
+        debugPrint('[camera_chatbot] reply stream failed: $e\n$st');
+        if (!mounted) return;
+        widget.chatController.updateAt(
+          index,
+          ChatMessage.assistant(
+            buffer.isEmpty ? _fallbackReplyText : buffer,
+            effects: List.of(effects),
+          ),
+        );
       }
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _messages[index] = _ChatMessage.assistant(
-          buffer.isEmpty ? fallbackText() : buffer,
-          events: data.events,
-          videos: data.videos,
-          images: data.images,
+      if (buffer.isEmpty && effects.isEmpty && mounted) {
+        widget.chatController.updateAt(
+          index,
+          const ChatMessage.assistant(_fallbackReplyText),
         );
-      });
+      }
+      _scrollToBottom();
+    } finally {
+      _activeEffects = null;
+      _activeMessageIndex = null;
+      if (mounted) setState(() => _isReplying = false);
     }
-    if (buffer.isEmpty && mounted) {
-      setState(() {
-        _messages[index] = _ChatMessage.assistant(
-          fallbackText(),
-          events: data.events,
-          videos: data.videos,
-          images: data.images,
-        );
-      });
-    }
-    _scrollToBottom();
-  }
-
-  _ResultData _computeResultData(String text) {
-    final query = text.toLowerCase();
-    final events = [...widget.eventsController.value]
-      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
-
-    if (query.contains('video') ||
-        query.contains('clip') ||
-        query.contains('record')) {
-      return (
-        events: const [],
-        videos: events.take(2).toList(),
-        images: const [],
-      );
-    }
-    if (query.contains('image') ||
-        query.contains('photo') ||
-        query.contains('snapshot') ||
-        query.contains('picture')) {
-      final images = widget.homesController.value.selectedHome.cameras
-          .map((camera) => camera.thumbnailUrl)
-          .whereType<String>()
-          .take(3)
-          .toList();
-      return (events: const [], videos: const [], images: images);
-    }
-    if (events.isNotEmpty &&
-        (query.contains('event') ||
-            query.contains('motion') ||
-            query.contains('alert') ||
-            query.contains('today') ||
-            events.any((e) => query.contains(e.cameraName.toLowerCase())))) {
-      final matchingCamera = events
-          .where((e) => query.contains(e.cameraName.toLowerCase()))
-          .toList();
-      final results = (matchingCamera.isNotEmpty ? matchingCamera : events)
-          .take(3)
-          .toList();
-      return (events: results, videos: const [], images: const []);
-    }
-    return (events: const [], videos: const [], images: const []);
-  }
-
-  String _cannedReplyText(String text, _ResultData data) {
-    if (data.videos.isNotEmpty) return 'Here are some recent clips:';
-    if (data.images.isNotEmpty) return 'Here are some recent snapshots:';
-    if (data.events.isNotEmpty) return "Here's what I found:";
-    final query = text.toLowerCase();
-    if (query.contains('image') ||
-        query.contains('photo') ||
-        query.contains('snapshot') ||
-        query.contains('picture')) {
-      return "I don't have any camera snapshots to show yet.";
-    }
-    return 'I can help you check recent events, video clips, and snapshots '
-        'from your cameras. Try asking things like "today\'s events" or '
-        '"show me snapshots".';
   }
 
   void _toggleListening() {
@@ -438,131 +445,6 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
         const SnackBar(content: Text("Voice input isn't available yet")),
       );
     });
-  }
-
-  void _openEvent(RecordedEvent event) {
-    Navigator.of(context).pop();
-    context.push(
-      '${EventsScreen.routeName}/${EventDetailScreen.routeName}',
-      extra: event,
-    );
-  }
-
-  /// [url] is either an `http(s)://` placeholder image or a local file path
-  /// (a real camera snapshot written to disk by `syncCameraFromDevice`) —
-  /// same dual meaning as `CameraThumbnailImage`'s `thumbnailUrl`.
-  Future<Uint8List> _fetchImageBytes(String url) async {
-    if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      return File(url).readAsBytes();
-    }
-    final request = await HttpClient().getUrl(Uri.parse(url));
-    final response = await request.close();
-    return Uint8List.fromList(
-      await response.fold<List<int>>(
-        <int>[],
-        (previous, chunk) => previous..addAll(chunk),
-      ),
-    );
-  }
-
-  Future<void> _shareImage(String url) async {
-    try {
-      final bytes = await _fetchImageBytes(url);
-      final tempDir = await getTemporaryDirectory();
-      final file = File(
-        '${tempDir.path}/cctv_chat_share_${DateTime.now().millisecondsSinceEpoch}.jpg',
-      );
-      await file.writeAsBytes(bytes);
-      await SharePlus.instance.share(ShareParams(files: [XFile(file.path)]));
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Could not share image')));
-    }
-  }
-
-  Future<void> _saveImage(String url) async {
-    try {
-      final bytes = await _fetchImageBytes(url);
-      await Gal.putImageBytes(
-        bytes,
-        name: 'cctv_chat_snapshot_${DateTime.now().millisecondsSinceEpoch}',
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Snapshot saved')));
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Could not save snapshot')));
-    }
-  }
-
-  void _openImage(String url) {
-    showDialog<void>(
-      context: context,
-      barrierColor: Colors.black87,
-      builder: (dialogContext) => Dialog.fullscreen(
-        key: const Key('CHAT-015'),
-        backgroundColor: Colors.black,
-        child: Stack(
-          children: [
-            Center(
-              child: InteractiveViewer(
-                minScale: 1,
-                maxScale: 4,
-                child: CameraThumbnailImage(
-                  thumbnailUrl: url,
-                  fit: BoxFit.contain,
-                  placeholderBuilder: () => const SizedBox.shrink(),
-                ),
-              ),
-            ),
-            SafeArea(
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  IconButton(
-                    key: const Key('CHAT-016'),
-                    icon: const Icon(Icons.close, color: Colors.white),
-                    onPressed: () => Navigator.of(dialogContext).pop(),
-                  ),
-                  Row(
-                    children: [
-                      IconButton(
-                        key: const Key('CHAT-017'),
-                        icon: const Icon(
-                          Icons.share_outlined,
-                          color: Colors.white,
-                        ),
-                        onPressed: () => _shareImage(url),
-                      ),
-                      IconButton(
-                        key: const Key('CHAT-018'),
-                        icon: const Icon(
-                          Icons.download_outlined,
-                          color: Colors.white,
-                        ),
-                        onPressed: () => _saveImage(url),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _openVideoStub() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Playback preview not available yet')),
-    );
   }
 
   @override
@@ -639,7 +521,8 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Try asking about your cameras\' events, videos, or snapshots.',
+              'Try asking about your cameras — list them, scan for new ones, '
+              'take a snapshot, or open live view.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
@@ -671,7 +554,7 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
     );
   }
 
-  Widget _buildMessageBubble(BuildContext context, _ChatMessage msg, int i) {
+  Widget _buildMessageBubble(BuildContext context, ChatMessage msg, int i) {
     final colorScheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -699,70 +582,128 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
               ),
             ),
           ),
-          if (msg.events.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            _buildResultRow(
-              height: 100,
-              count: msg.events.length,
-              itemBuilder: (context, j) {
-                final event = msg.events[j];
-                return _EventResultCard(
-                  key: Key('CHAT-009-$i-$j'),
-                  event: event,
-                  onTap: () => _openEvent(event),
-                );
-              },
-            ),
-          ],
-          if (msg.videos.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            _buildResultRow(
-              height: 90,
-              count: msg.videos.length,
-              itemBuilder: (context, j) {
-                final video = msg.videos[j];
-                return _VideoResultCard(
-                  key: Key('CHAT-010-$i-$j'),
-                  video: video,
-                  onTap: _openVideoStub,
-                );
-              },
-            ),
-          ],
-          if (msg.images.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            _buildResultRow(
-              height: 90,
-              count: msg.images.length,
-              itemBuilder: (context, j) {
-                final url = msg.images[j];
-                return _ImageResultCard(
-                  key: Key('CHAT-011-$i-$j'),
-                  url: url,
-                  onTap: () => _openImage(url),
-                );
-              },
-            ),
-          ],
+          for (final effect in msg.effects) _buildToolEffect(context, effect),
         ],
       ),
     );
   }
 
-  Widget _buildResultRow({
-    required double height,
-    required int count,
-    required Widget Function(BuildContext, int) itemBuilder,
-  }) {
-    return SizedBox(
-      height: height,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        itemCount: count,
-        separatorBuilder: (context, index) => const SizedBox(width: 8),
-        itemBuilder: itemBuilder,
+  /// Renders a real tool-call side effect — the only source of any card
+  /// shown alongside a reply, from a `chatbot_tools.dart` handler that
+  /// actually called `camera_api`.
+  Widget _buildToolEffect(BuildContext context, ChatToolEffect effect) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: switch (effect) {
+        SnapshotEffect() => _SnapshotEffectCard(
+          effect: effect,
+          onTap: () => _openSnapshot(effect),
+        ),
+        LiveViewEffect() => _LiveViewEffectCard(
+          effect: effect,
+          onOpen: () => _openLiveViewEffect(effect.camera),
+        ),
+        ScanResultsEffect() => _ScanResultsEffectCard(
+          effect: effect,
+          onOpen: () => _openScanResultsEffect(effect.cameras),
+        ),
+        ConfirmEffect() => _ConfirmEffectCard(
+          effect: effect,
+          resolved: widget.chatController.resolvedConfirmations.contains(
+            effect,
+          ),
+          inProgress: widget.chatController.inProgressConfirmations.contains(
+            effect,
+          ),
+          onConfirm: () => _confirmEffect(effect),
+          onCancel: () => _cancelEffect(effect),
+        ),
+      },
+    );
+  }
+
+  void _openSnapshot(SnapshotEffect effect) {
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black87,
+      builder: (dialogContext) => Dialog.fullscreen(
+        backgroundColor: Colors.black,
+        child: Stack(
+          children: [
+            Center(
+              child: InteractiveViewer(
+                minScale: 1,
+                maxScale: 4,
+                child: Image.memory(effect.bytes, fit: BoxFit.contain),
+              ),
+            ),
+            SafeArea(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                  ),
+                  Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(
+                          Icons.share_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => _shareSnapshotBytes(effect.bytes),
+                      ),
+                      IconButton(
+                        icon: const Icon(
+                          Icons.download_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => _saveSnapshotBytes(effect.bytes),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  Future<void> _shareSnapshotBytes(Uint8List bytes) async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final file = File(
+        '${tempDir.path}/cctv_chat_snapshot_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
+      await file.writeAsBytes(bytes);
+      await SharePlus.instance.share(ShareParams(files: [XFile(file.path)]));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Could not share image')));
+    }
+  }
+
+  Future<void> _saveSnapshotBytes(Uint8List bytes) async {
+    try {
+      await Gal.putImageBytes(
+        bytes,
+        name: 'cctv_chat_snapshot_${DateTime.now().millisecondsSinceEpoch}',
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Snapshot saved')));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Could not save snapshot')));
+    }
   }
 
   Widget _buildInputBar(BuildContext context) {
@@ -782,12 +723,15 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
             child: TextField(
               key: const Key('CHAT-012'),
               controller: _inputController,
-              decoration: const InputDecoration(
-                hintText: 'Ask a question…',
-                border: OutlineInputBorder(
+              enabled: !_isReplying,
+              decoration: InputDecoration(
+                hintText: _isReplying
+                    ? 'Waiting for a reply…'
+                    : 'Ask a question…',
+                border: const OutlineInputBorder(
                   borderRadius: BorderRadius.all(Radius.circular(24)),
                 ),
-                contentPadding: EdgeInsets.symmetric(
+                contentPadding: const EdgeInsets.symmetric(
                   horizontal: 16,
                   vertical: 10,
                 ),
@@ -798,7 +742,7 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
           IconButton(
             key: const Key('CHAT-014'),
             icon: const Icon(Icons.send),
-            onPressed: () => _send(_inputController.text),
+            onPressed: _isReplying ? null : () => _send(_inputController.text),
           ),
         ],
       ),
@@ -806,54 +750,118 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
   }
 }
 
-class _EventResultCard extends StatelessWidget {
-  const _EventResultCard({super.key, required this.event, required this.onTap});
+/// A real, freshly-captured snapshot from `take_snapshot`.
+class _SnapshotEffectCard extends StatelessWidget {
+  const _SnapshotEffectCard({required this.effect, required this.onTap});
 
-  final RecordedEvent event;
+  final SnapshotEffect effect;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
+      key: const Key('CHAT-027'),
       borderRadius: BorderRadius.circular(12),
       onTap: onTap,
-      child: Container(
-        width: 140,
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surface,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Theme.of(context).dividerColor),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: SizedBox(
+          height: 90,
+          width: 120,
+          child: Image.memory(effect.bytes, fit: BoxFit.cover),
         ),
+      ),
+    );
+  }
+}
+
+/// A card for `open_live_view`, deep-linking to the real `CameraLiveScreen`
+/// rather than embedding a player in the chat bubble.
+class _LiveViewEffectCard extends StatelessWidget {
+  const _LiveViewEffectCard({required this.effect, required this.onOpen});
+
+  final LiveViewEffect effect;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return OutlinedButton.icon(
+      key: const Key('CHAT-028'),
+      onPressed: onOpen,
+      icon: const Icon(Icons.videocam_outlined),
+      label: Text('Open ${effect.camera.name} Live View'),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: colorScheme.onSurface,
+        alignment: Alignment.centerLeft,
+      ),
+    );
+  }
+}
+
+/// A card for `scan_for_cameras` — summarizes a real LAN scan and
+/// deep-links to the real `ScannedDevicesScreen` (passing the already-
+/// fetched results) rather than reimplementing the add-camera flow inline.
+class _ScanResultsEffectCard extends StatelessWidget {
+  const _ScanResultsEffectCard({required this.effect, required this.onOpen});
+
+  final ScanResultsEffect effect;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cameras = effect.cameras;
+    return Card(
+      key: const Key('CHAT-032'),
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Row(
-              children: [
-                Icon(
-                  event.type.icon,
-                  size: 16,
-                  color: event.type.timelineColor,
-                ),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Text(
-                    event.type.label,
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w600,
-                      fontSize: 12,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
             Text(
-              event.cameraName,
-              style: Theme.of(context).textTheme.bodySmall,
-              overflow: TextOverflow.ellipsis,
+              cameras.isEmpty
+                  ? 'No cameras found on the network.'
+                  : 'Found ${cameras.length} camera(s):',
+              style: theme.textTheme.titleSmall,
             ),
+            for (final camera in cameras.take(5))
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Row(
+                  children: [
+                    Icon(
+                      camera.isConfigured
+                          ? Icons.check_circle_outline
+                          : Icons.videocam_outlined,
+                      size: 18,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text('${camera.name} (${camera.ipAddress})'),
+                    ),
+                    if (!camera.isConfigured)
+                      Text(
+                        'New',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.primary,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            if (cameras.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                key: const Key('CHAT-033'),
+                onPressed: onOpen,
+                icon: const Icon(Icons.add_to_queue_outlined),
+                label: const Text('Add cameras'),
+              ),
+            ],
           ],
         ),
       ),
@@ -861,90 +869,89 @@ class _EventResultCard extends StatelessWidget {
   }
 }
 
-class _VideoResultCard extends StatelessWidget {
-  const _VideoResultCard({super.key, required this.video, required this.onTap});
+/// Confirm/Cancel card for a destructive tool (reboot/reset/factory-reset/
+/// delete) — the real `camera_api` call only fires from [onConfirm]'s tap,
+/// never from the model's own tool call, per this session's design
+/// discussion on destructive-action safety.
+class _ConfirmEffectCard extends StatelessWidget {
+  const _ConfirmEffectCard({
+    required this.effect,
+    required this.resolved,
+    required this.inProgress,
+    required this.onConfirm,
+    required this.onCancel,
+  });
 
-  final RecordedEvent video;
-  final VoidCallback onTap;
+  final ConfirmEffect effect;
+  final bool resolved;
+
+  /// True from the moment Confirm is tapped until [effect]'s real
+  /// `camera_api` call actually finishes — distinct from [resolved], so the
+  /// card can't claim "Handled" while the reboot/reset/delete is still in
+  /// flight.
+  final bool inProgress;
+  final VoidCallback onConfirm;
+  final VoidCallback onCancel;
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: onTap,
-      child: ClipRRect(
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      key: const Key('CHAT-029'),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: colorScheme.errorContainer.withValues(alpha: 0.4),
         borderRadius: BorderRadius.circular(12),
-        child: SizedBox(
-          width: 140,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              if (video.thumbnailUrl != null)
-                Image.network(video.thumbnailUrl!, fit: BoxFit.cover)
-              else
-                Container(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                ),
-              const Center(
-                child: Icon(
-                  Icons.play_circle_fill,
-                  color: Colors.white,
-                  size: 32,
-                ),
-              ),
-              Positioned(
-                right: 4,
-                bottom: 4,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                    vertical: 1,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    '${video.duration.inSeconds}s',
-                    style: const TextStyle(color: Colors.white, fontSize: 10),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
+        border: Border.all(color: colorScheme.error.withValues(alpha: 0.4)),
       ),
-    );
-  }
-}
-
-class _ImageResultCard extends StatelessWidget {
-  const _ImageResultCard({super.key, required this.url, required this.onTap});
-
-  final String url;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(12),
-      onTap: onTap,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
-        child: SizedBox(
-          width: 90,
-          child: CameraThumbnailImage(
-            thumbnailUrl: url,
-            fit: BoxFit.cover,
-            placeholderBuilder: () => ColoredBox(
-              color: Theme.of(context).colorScheme.surfaceContainerHighest,
-              child: Icon(
-                Icons.image_outlined,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            effect.title,
+            style: const TextStyle(fontWeight: FontWeight.w700),
           ),
-        ),
+          const SizedBox(height: 4),
+          Text(effect.message, style: Theme.of(context).textTheme.bodySmall),
+          const SizedBox(height: 8),
+          if (inProgress)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Working…',
+                  style: Theme.of(context).textTheme.labelMedium,
+                ),
+              ],
+            )
+          else if (resolved)
+            Text('Handled', style: Theme.of(context).textTheme.labelMedium)
+          else
+            Row(
+              children: [
+                TextButton(
+                  key: const Key('CHAT-030'),
+                  onPressed: onCancel,
+                  child: const Text('Cancel'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  key: const Key('CHAT-031'),
+                  onPressed: onConfirm,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: colorScheme.error,
+                  ),
+                  child: Text(effect.confirmLabel),
+                ),
+              ],
+            ),
+        ],
       ),
     );
   }

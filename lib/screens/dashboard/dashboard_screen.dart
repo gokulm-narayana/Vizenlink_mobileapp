@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../../app_state/ai_model_manager.dart';
 import '../../app_state/alerts_controller.dart';
 import '../../app_state/camera_sync.dart';
+import '../../app_state/chat_controller.dart';
 import '../../app_state/events_controller.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
@@ -46,6 +47,7 @@ class DashboardScreen extends StatefulWidget {
     required this.alertsController,
     required this.eventsController,
     required this.aiModelManager,
+    required this.chatController,
   });
 
   static const routeName = '/dashboard';
@@ -54,6 +56,7 @@ class DashboardScreen extends StatefulWidget {
   final AlertsController alertsController;
   final EventsController eventsController;
   final AiModelManager aiModelManager;
+  final ChatController chatController;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -381,8 +384,8 @@ class _DashboardScreenState extends State<DashboardScreen>
           onPressed: () => showCameraChatbot(
             context,
             homesController: widget.homesController,
-            eventsController: widget.eventsController,
             aiModelManager: widget.aiModelManager,
+            chatController: widget.chatController,
           ),
           icon: const Icon(Icons.smart_toy_outlined),
           label: const Text('Ask AI'),
