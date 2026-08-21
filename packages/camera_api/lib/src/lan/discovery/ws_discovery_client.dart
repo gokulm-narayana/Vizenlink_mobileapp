@@ -68,9 +68,22 @@ class WsDiscoveryClient {
   /// partially, see `discovery_screen.dart`'s doc comment). Mirrors
   /// `WSDiscoveryScanner.startScanUnicast()`'s single-shared-socket send+receive pattern and
   /// timing (15s overall cap, 5s straggler wait after the last probe is sent).
+  ///
+  /// **Sends are paced, not fired in a tight loop — found and fixed 2026-08-20.** Firing all
+  /// ~253 unicast probes back-to-back (the original behavior) triggers an ARP-resolution storm:
+  /// most destination addresses in a `/24` sweep don't exist, and the kernel has to ARP-resolve
+  /// (broadcast + wait) every one of them before it can actually queue the send, which was found
+  /// via a real reproduction (a Python mirror of this exact algorithm) to bury/delay replies from
+  /// the few real cameras mixed in — a burst sweep against a LAN with 6 known-live cameras found
+  /// only 1; the same sweep paced at [sendInterval] found all 6-7 reliably, repeatably. This
+  /// applies regardless of transport (WiFi or Ethernet) — it's local network/ARP congestion from
+  /// the sweep itself, not a WiFi-specific issue (that's a separate, real gap: this camera's
+  /// WiFi radio driver doesn't deliver *multicast* WS-Discovery frames at all, unrelated to this
+  /// unicast path — see `kb/raw/2026-08-20-wifi-country-code-and-ws-discovery-multicast-gap.md`).
   Future<List<WsDiscoveryCandidate>> scanUnicast({
     Duration overallCap = const Duration(seconds: 15),
     Duration stragglerWait = const Duration(seconds: 5),
+    Duration sendInterval = const Duration(milliseconds: 50),
   }) async {
     final hostAddresses = await _localSubnetHostAddresses();
     if (hostAddresses.isEmpty) return const [];
@@ -91,6 +104,7 @@ class WsDiscoveryClient {
       final probeBytes = utf8.encode(_buildProbeMessage());
       for (final ip in hostAddresses) {
         socket.send(probeBytes, InternetAddress(ip), port);
+        await Future<void>.delayed(sendInterval);
       }
       final elapsed = DateTime.now().difference(startTime);
       final remainingCap = overallCap - elapsed;

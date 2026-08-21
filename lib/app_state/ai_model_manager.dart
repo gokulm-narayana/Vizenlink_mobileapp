@@ -119,6 +119,7 @@ class AiModelManager extends ChangeNotifier {
     String userText, {
     List<ToolDefinition>? tools,
     ToolChoice? toolChoice,
+    void Function(String status)? onStatus,
   }) {
     final session = _chatSession;
     if (status != AiChatStatus.ready || session == null) return null;
@@ -127,6 +128,7 @@ class AiModelManager extends ChangeNotifier {
       userText,
       tools: tools,
       toolChoice: toolChoice,
+      onStatus: onStatus,
     );
   }
 
@@ -137,6 +139,7 @@ class AiModelManager extends ChangeNotifier {
     String userText, {
     List<ToolDefinition>? tools,
     ToolChoice? toolChoice,
+    void Function(String status)? onStatus,
   }) async* {
     final userParts = <LlamaContentPart>[LlamaTextContent(userText)];
     var isFirstTurn = true;
@@ -160,6 +163,7 @@ class AiModelManager extends ChangeNotifier {
       // content through this filter so a leak like that can never reach
       // the chat bubble again, independent of whatever causes it upstream.
       final markupFilter = _ToolCallMarkupFilter();
+      onStatus?.call('Thinking…');
       // Qwen3.5 always emits a <think>...</think> reasoning block by
       // default; llamadart splits that into delta.thinking separately from
       // delta.content, so disabling it keeps replies fast and free of raw
@@ -175,7 +179,10 @@ class AiModelManager extends ChangeNotifier {
         final content = delta.content ?? '';
         if (content.isNotEmpty) {
           final visible = markupFilter.feed(content);
-          if (visible.isNotEmpty) yield visible;
+          if (visible.isNotEmpty) {
+            onStatus?.call('');
+            yield visible;
+          }
         }
 
         final toolCalls = delta.toolCalls;
@@ -298,6 +305,7 @@ class AiModelManager extends ChangeNotifier {
 
         Object? result;
         try {
+          onStatus?.call('Calling ${_friendlyToolLabel(name)}…');
           final argsJson = call.arguments.toString().trim();
           final args = argsJson.isEmpty
               ? <String, dynamic>{}
@@ -325,6 +333,13 @@ class AiModelManager extends ChangeNotifier {
     super.dispose();
   }
 }
+
+/// e.g. "take_snapshot" -> "Take Snapshot", for the "Calling X…" status text.
+String _friendlyToolLabel(String toolName) => toolName
+    .split('_')
+    .where((w) => w.isNotEmpty)
+    .map((w) => w[0].toUpperCase() + w.substring(1))
+    .join(' ');
 
 // Kept deliberately terse — every sentence here is sent as part of the
 // prompt on every single turn, tool call or not, so length is a real

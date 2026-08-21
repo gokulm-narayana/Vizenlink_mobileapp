@@ -69,16 +69,30 @@ is the actual, current, correct configuration to build with.
 **Not implemented in this package (documented known limitations, not oversights):**
 - **Local-only sign-out.** `signOut()` always invalidates the session globally (every device).
   There's no variant that only clears the local session without the server call.
-- **Friendly Cognito throttling messages.** `LimitExceededException`/`TooManyRequestsException`
-  surface via `CognitoAuthException` with Cognito's raw message text — no mapped-to-friendly-copy
-  handling exists for them specifically.
 
 ## Result/error shape
 
 Every method either completes normally or throws `CognitoAuthException(code, message)` — `code`
 is Cognito's raw exception name (e.g. `UsernameExistsException`, `NotAuthorizedException`,
-`UserNotConfirmedException`, `CodeMismatchException`, `InvalidPasswordException`), useful for a
-caller that wants to branch on a specific failure beyond what `lastError` already maps.
+`UserNotConfirmedException`, `CodeMismatchException`, `InvalidPasswordException`,
+`LimitExceededException`, `TooManyRequestsException`), useful for a caller that wants to branch
+on a specific failure beyond what `lastError` already maps.
+
+**`CognitoAuthException.friendlyMessage`** — added 2026-08-14 after a real "limit exceed" report
+on repeated `changePassword` attempts turned out to be Cognito's own `LimitExceededException`
+throttle surfacing its raw AWS message text verbatim in the UI. Maps `LimitExceededException`/
+`TooManyRequestsException` to `"Too many attempts. Please wait a few minutes and try again."`;
+falls back to the raw `message` for every other code. **Every screen in this app that catches
+`CognitoAuthException` and shows text to the user calls `.friendlyMessage`, never raw `.message`
+directly** — new screens should follow the same rule. This is throttling-only, not a full
+per-code copy table: call-specific overrides (anti-enumeration text for a wrong sign-in password,
+"email already exists" for sign-up) still take priority at the call site and should check their
+own codes *before* falling back to `.friendlyMessage`, so a throttle during one of those flows
+doesn't lose its specific copy to the generic fallback — `AuthController.signIn`'s `lastError`
+mapping is the reference pattern (`UserNotConfirmedException` → its own copy,
+`LimitExceededException`/`TooManyRequestsException` → `.friendlyMessage`, everything else →
+the anti-enumeration `"Incorrect email or password."`). `AuthController.signUp`/`changePassword`
+already route their `lastError` through it too.
 
 ## Shared types
 

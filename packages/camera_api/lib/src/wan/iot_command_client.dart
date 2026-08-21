@@ -1,39 +1,44 @@
-import 'dart:convert';
+import 'dart:math';
 
-import 'package:http/http.dart' as http;
-
-import 'wan_auth.dart';
+import 'iot_mqtt_transport.dart';
 
 /// AWS IoT command channel — `mobile-app-android-3-video-image-pipeline/DESIGN.md` §7 item 1.
 ///
-/// **2026-07-31 rewrite**: this used to call AWS IoT directly (SigV4-signed HTTPS publish +
-/// MQTT-over-WSS) using this app's own Cognito Identity Pool-federated credentials. Real-device
-/// testing found AWS rejects those credentials for `iot-data:Publish`/MQTT-over-WSS with
-/// `ForbiddenException`, regardless of IAM policy — isolated by testing the identical role+policy
-/// with root/plain-IAM credentials (succeeded) vs. the Cognito-federated session (failed); see
-/// `kb/raw/2026-07-31-fix-iot-command-lambda-relay.md`. Same failure class already documented for
-/// KVS in `kb/wiki/kvs-viewer-read-permissions-cognito-role.md`. Now goes through
-/// `cloud_backend/kvs_playback_lambda` (extended, not a second Lambda) instead — same Cognito ID
-/// token this app already uses everywhere else, no AWS credentials needed client-side at all for
-/// this path anymore.
+/// **2026-07-31 rewrite (superseded 2026-08-18, see below)**: this used to call AWS IoT directly
+/// (SigV4-signed HTTPS publish + MQTT-over-WSS) using this app's own Cognito Identity
+/// Pool-federated credentials. Real-device testing found AWS rejects those credentials for
+/// `iot-data:Publish`/MQTT-over-WSS with `ForbiddenException`, regardless of IAM policy —
+/// isolated by testing the identical role+policy with root/plain-IAM credentials (succeeded) vs.
+/// the Cognito-federated session (failed); see
+/// `kb/raw/2026-07-31-fix-iot-command-lambda-relay.md`. Went through
+/// `cloud_backend/kvs_playback_lambda` (extended, not a second Lambda) instead for a while — same
+/// Cognito ID token this app already uses everywhere else, no AWS credentials needed
+/// client-side.
 ///
-/// **Moved into `camera_api` 2026-08-11** — [idTokenProvider] and the relay URL used to default
-/// to this app's own `AuthController`/`AwsConfig`; now they default to [WanAuth]'s static hooks
-/// instead, so this package never imports anything app-specific. Set `WanAuth.idTokenProvider`/
-/// `WanAuth.kvsPlaybackLambdaUrl` once at app startup — see [WanAuth]'s own doc.
+/// **2026-08-18: reverted back to direct MQTT.** A latency report (the relay's
+/// `_publish_and_wait()` costs up to ~12s per command — a brand-new MQTT connection on every
+/// single invocation) prompted re-testing the original restriction live; it no longer
+/// reproduces (`kb/raw/2026-08-18-fix-direct-iot-mqtt-restored.md` — a real `GetVideoMode` round
+/// trip over direct, persistent MQTT completed in 0.43s). See [IotMqttTransport] for the
+/// connection itself; this class is now a thin command-catalog + retry wrapper over it, same
+/// role `_post()` played over HTTP before.
+///
+/// **Moved into `camera_api` 2026-08-11** — [idTokenProvider] and related hooks used to default
+/// to this app's own `AuthController`/`AwsConfig`; now they default to `WanAuth`'s static hooks
+/// instead, so this package never imports anything app-specific. Set
+/// `WanAuth.awsCredentialsProvider`/`WanAuth.awsIotEndpoint`/`WanAuth.awsRegion` once at app
+/// startup — see `WanAuth`'s own doc.
 class IotCommandClient {
-  /// [idTokenProvider] and [httpClient] are overridable for tests — default to
-  /// [WanAuth.idTokenProvider] / `http.Client()`.
-  IotCommandClient(
-    this.thingName, {
-    String? Function()? idTokenProvider,
-    http.Client? httpClient,
-  }) : _idTokenProvider = idTokenProvider ?? WanAuth.idTokenProvider ?? (() => null),
-       _http = httpClient ?? http.Client();
+  /// [transport] is overridable for tests — defaults to [IotMqttTransport.instance], the single
+  /// shared, persistent MQTT connection every `IotCommandClient` in the app reuses.
+  IotCommandClient(this.thingName, {IotTransport? transport})
+    : _transport = transport ?? IotMqttTransport.instance;
 
   final String thingName;
-  final String? Function() _idTokenProvider;
-  final http.Client _http;
+  final IotTransport _transport;
+
+  static String _newRequestId() =>
+      '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1 << 32)}';
 
   // Renamed 2026-08-06 from startLiveStream/stopLiveStream/getStreamStatus — numeric command
   // values unchanged, symbol names only (unified with the new LAN CloudStreaming actions).
@@ -177,86 +182,82 @@ class IotCommandClient {
   /// mirror of the LAN `GET /nuraeye/deterrence/durations/options` REST resource.
   static const getDeterrenceDurationOptions = 64;
 
-  /// [isRetry] is internal — set by the one-shot retry below, never pass it explicitly.
-  ///
-  /// **One-shot retry on a Lambda-side timeout (HTTP 504), added 2026-08-08**: confirmed via
-  /// direct testing (`GetMirrorFlip` read-back immediately after a reported app-side timeout)
-  /// that the camera routinely applies a `Set*` command correctly even when this relay reports
-  /// 504 — the command/response round trip is real, it's the *reply* that occasionally misses
-  /// `_publish_and_wait()`'s ~12s wait window inside the Lambda (each invocation opens a brand
-  /// new MQTT-over-WSS session, so this is transient session/subscribe jitter, not a stuck
-  /// camera). ~5% observed failure rate across repeated `Set`/`Get` pairs in manual testing, not
-  /// reproducible on demand — a fresh Lambda invocation is a real second chance, not a repeat of
-  /// the same failure, so one retry is worth it before surfacing an error to the user. Every
-  /// `Wan*Client` gets this for free since they all route through this method. A genuine camera-
-  /// side failure (502, `status != "ok"`) is a different, non-retried case — only 504 (no reply
-  /// at all) is worth retrying.
-  Future<Map<String, dynamic>> _post(Map<String, dynamic> body, {bool isRetry = false}) async {
-    final idToken = _idTokenProvider();
-    if (idToken == null) {
-      throw StateError('IotCommandClient called while unauthenticated');
-    }
-    // Empty string (not yet set) parses to a relative empty Uri — matches the pre-move
-    // `AwsConfig.kvsPlaybackLambdaUrl` default exactly (`String.fromEnvironment` with no
-    // `--dart-define` supplied), so this introduces no new failure mode.
-    final response = await _http.post(
-      Uri.parse(WanAuth.kvsPlaybackLambdaUrl ?? ''),
-      headers: {'Authorization': 'Bearer $idToken', 'Content-Type': 'application/json'},
-      body: jsonEncode(body),
-    );
-    if (response.statusCode == 504 && !isRetry) {
-      return _post(body, isRetry: true);
-    }
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
-    if (response.statusCode != 200) {
-      throw Exception(
-        decoded['error'] as String? ?? 'IoT command relay failed (${response.statusCode})',
-      );
-    }
-    return decoded;
-  }
-
   /// `StartCloudStreaming`/`StopCloudStreaming` — fire-and-forget, no `request_id` (older command
   /// shape, predates `FR-NE-053`'s request/response pattern — matches the reference exactly).
-  Future<void> _publish(int command) => _post({
-    'action': 'publishCommand',
-    'thingName': thingName,
-    'command': command,
-  });
+  Future<void> _publish(int command) => _transport.publish(thingName, {'command': command});
 
   Future<void> sendStartCloudStreaming() => _publish(startCloudStreaming);
 
   Future<void> sendStopCloudStreaming() => _publish(stopCloudStreaming);
 
-  /// Generic relay for any `NuraeyeAwsIotCommand` that replies on the response topic
-  /// (`nuraeye.c`'s `prvPublishMqttResponse()`) — added for `FR-MOB-068` (Night Vision Type over
-  /// WAN, `getNightVisionType`/`setNightVisionType` above) but not specific to it. Used for
-  /// `GetCloudStreamingStatus` (`FR-NE-068`) too — a dedicated `getCloudStreamingStatus` Lambda
-  /// action used to exist for that specifically, **removed 2026-08-06** per direct user question
-  /// ("why does the Lambda hardcode getStreamStatus — shouldn't it be independent of the camera
-  /// firmware?"): the Lambda has no business knowing what any particular command number means,
-  /// only the app and firmware need to agree on that (`nuraeye_types.h`'s
-  /// `NuraeyeAwsIotCommandEnum`), so this generic path is now the only request/response relay.
-  /// The Lambda does the full publish + MQTT-over-WSS subscribe/wait server-side (it has the same
-  /// problem this client used to have, minus the Cognito-federation rejection, since it runs
-  /// under a plain execution role) and returns the `output` object directly, or `null` on a
-  /// server-side timeout (camera didn't respond).
-  /// [timeoutSeconds], if given, overrides the Lambda relay's default ~12s wait for the
-  /// camera's reply — for a command known to legitimately take longer (e.g.
-  /// [getPreviewSnapshot]'s on-device capture + RSA-2048 encrypt), not a general escape hatch.
-  /// Server-side clamped to 25s regardless of what's passed.
+  /// [isRetry] is internal — set by the one-shot retry below, never pass it explicitly.
+  ///
+  /// **One-shot retry on no reply within [timeout], added 2026-08-08 (originally for the Lambda
+  /// relay's HTTP 504, carried forward 2026-08-18 for the direct-MQTT transport's equivalent
+  /// "no reply" case)**: confirmed via direct testing (`GetMirrorFlip` read-back immediately
+  /// after a reported app-side timeout) that the camera routinely applies a `Set*` command
+  /// correctly even when the reply itself goes missing — transient session/subscribe jitter, not
+  /// a stuck camera. A second attempt is a real second chance, not a repeat of the same failure,
+  /// so one retry is worth it before surfacing an error to the user. Every `Wan*Client` gets this
+  /// for free since they all route through this method. A genuine camera-side failure
+  /// (`status != "ok"`) is a different, non-retried case — only a bare timeout (no reply at all)
+  /// is worth retrying.
+  Future<Map<String, dynamic>?> _publishAndWait(
+    int command, {
+    Map<String, dynamic>? params,
+    Duration timeout = const Duration(seconds: 12),
+    bool isRetry = false,
+  }) async {
+    final requestId = _newRequestId();
+    final reply = await _transport.publishAndWait(thingName, {
+      'command': command,
+      'request_id': requestId,
+      if (params != null) 'params': params,
+    }, timeout: timeout);
+
+    if (reply == null) {
+      if (isRetry) {
+        throw Exception('No response from camera (timed out)');
+      }
+      return _publishAndWait(command, params: params, timeout: timeout, isRetry: true);
+    }
+    if (reply['status'] != 'ok') {
+      throw Exception('Command $command failed on camera');
+    }
+    return reply;
+  }
+
+  /// Generic request/response path for any `NuraeyeAwsIotCommand` that replies on the response
+  /// topic (`nuraeye.c`'s `prvPublishMqttResponse()`) — added for `FR-MOB-068` (Night Vision Type
+  /// over WAN, `getNightVisionType`/`setNightVisionType` above) but not specific to it. Used for
+  /// `GetCloudStreamingStatus` (`FR-NE-068`) too — the app and firmware are the only two parties
+  /// that need to agree on what a command number means (`nuraeye_types.h`'s
+  /// `NuraeyeAwsIotCommandEnum`), so one generic path covers every command.
+  /// [timeoutSeconds], if given, overrides the default ~12s wait for the camera's reply — for a
+  /// command known to legitimately take longer (e.g. [getPreviewSnapshot]'s on-device capture +
+  /// RSA-2048 encrypt), not a general escape hatch.
   Future<Map<String, dynamic>?> sendCommandWithResponse(
     int command, {
     Map<String, dynamic>? params,
     double? timeoutSeconds,
   }) async {
-    final result = await _post({
-      'action': 'commandWithResponse',
-      'thingName': thingName,
-      'command': command,
-      'params': ?params,
-      'timeoutSeconds': ?timeoutSeconds,
-    });
-    return result['output'] as Map<String, dynamic>?;
+    final reply = await _publishAndWait(
+      command,
+      params: params,
+      timeout: timeoutSeconds != null
+          ? Duration(milliseconds: (timeoutSeconds * 1000).round())
+          : const Duration(seconds: 12),
+    );
+    if (reply == null) return null; // genuine timeout — no reply arrived at all
+    // [AI Fix] Get/Set response asymmetry (see `.claude/rules/cloud-components.md` — the exact
+    // rule BUG-006 established for the old Lambda relay, which used to enforce this same
+    // defaulting server-side): every Get* reply carries an `output` object, but every Set*/
+    // Delete* success reply omits it entirely (`nuraeye.c`'s `prvPublishMqttResponse(request_id,
+    // success, NULL)`) — real, hardware-confirmed here too, not just historically: a Set command
+    // over the direct-MQTT transport got its reply in well under a second, but every caller's
+    // `output == null` timeout check couldn't tell that apart from no reply ever arriving. Default
+    // to an empty map on any successful reply with no `output` key, so only a genuine "no reply"
+    // is ever reported as null.
+    return (reply['output'] as Map<String, dynamic>?) ?? const {};
   }
 }

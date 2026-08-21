@@ -1,202 +1,186 @@
-import 'dart:convert';
-
 import 'package:camera_api/camera_api.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
+class _FakeTransport implements IotTransport {
+  final List<Map<String, dynamic>> published = [];
+  final List<Map<String, dynamic>> publishedAndWaited = [];
+
+  /// Queue of responses `publishAndWait` returns, in call order — `null` means "no reply"
+  /// (timeout). Defaults to a single `{"status": "ok"}` reply if left empty.
+  final List<Map<String, dynamic>?> replies = [];
+
+  @override
+  Future<void> publish(String thingName, Map<String, dynamic> body) async {
+    published.add(body);
+  }
+
+  @override
+  Future<Map<String, dynamic>?> publishAndWait(
+    String thingName,
+    Map<String, dynamic> body, {
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    publishedAndWaited.add(body);
+    if (replies.isEmpty) return {'status': 'ok'};
+    return replies.removeAt(0);
+  }
+}
+
 void main() {
-  test('sendStartCloudStreaming POSTs a publishCommand action to the Lambda with command=0', () async {
-    http.Request? captured;
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        captured = request;
-        return http.Response('{"published":true}', 200);
-      }),
-    );
+  test('sendStartCloudStreaming publishes command=0, no request_id (fire-and-forget)', () async {
+    final transport = _FakeTransport();
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     await client.sendStartCloudStreaming();
 
-    expect(captured, isNotNull);
-    expect(captured!.method, 'POST');
-    expect(captured!.headers['Authorization'], 'Bearer fake-id-token');
-    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-    expect(body['action'], 'publishCommand');
-    expect(body['thingName'], 'VZL-CAM-000001');
-    expect(body['command'], 0);
+    expect(transport.published, [
+      {'command': IotCommandClient.startCloudStreaming},
+    ]);
   });
 
-  test('sendStopCloudStreaming POSTs command=1', () async {
-    http.Request? captured;
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        captured = request;
-        return http.Response('{"published":true}', 200);
-      }),
-    );
+  test('sendStopCloudStreaming publishes command=1', () async {
+    final transport = _FakeTransport();
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     await client.sendStopCloudStreaming();
 
-    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-    expect(body['command'], 1);
+    expect(transport.published, [
+      {'command': IotCommandClient.stopCloudStreaming},
+    ]);
   });
 
   test(
-    'getCloudStreamingStatus goes through the generic commandWithResponse relay (command=4), '
-    'not a dedicated Lambda action — removed 2026-08-06 so the Lambda stays independent of '
-    'firmware-specific command semantics',
+    'getCloudStreamingStatus goes through the generic publishAndWait request/response path '
+    '(command=4)',
     () async {
-      http.Request? captured;
-      final client = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response('{"output":{"stream_status":"active"}}', 200);
-        }),
-      );
+      final transport = _FakeTransport()
+        ..replies.add({
+          'status': 'ok',
+          'output': {'stream_status': 'active'},
+        });
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-      final output = await client.sendCommandWithResponse(
-        IotCommandClient.getCloudStreamingStatus,
-      );
+      final output = await client.sendCommandWithResponse(IotCommandClient.getCloudStreamingStatus);
 
-      final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['action'], 'commandWithResponse');
-      expect(body['command'], 4);
+      expect(transport.publishedAndWaited.single['command'], IotCommandClient.getCloudStreamingStatus);
       expect(output, {'stream_status': 'active'});
     },
   );
 
-  test('a non-200 relay response throws with the Lambda\'s error message', () async {
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async => http.Response('{"error":"IoT publish failed: boom"}', 502)),
-    );
+  test('a camera-side failure (status != ok) throws', () async {
+    final transport = _FakeTransport()..replies.add({'status': 'error'});
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     expect(
-      client.sendStartCloudStreaming(),
-      throwsA(predicate((e) => e.toString().contains('IoT publish failed: boom'))),
+      client.sendCommandWithResponse(IotCommandClient.setMirrorFlip),
+      throwsA(predicate((e) => e.toString().contains('failed on camera'))),
     );
-  });
-
-  test('throws StateError when unauthenticated (no ID token)', () async {
-    final client = IotCommandClient('VZL-CAM-000001', idTokenProvider: () => null);
-
-    expect(client.sendStartCloudStreaming(), throwsStateError);
   });
 
   test(
-    'sendCommandWithResponse POSTs a commandWithResponse action with command+params and '
-    'returns the output object',
+    'sendCommandWithResponse includes command+params and returns the output object',
     () async {
-      http.Request? captured;
-      final client = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response(
-            '{"output":{"type":"Grey","color_capable":true,"smart_capable":false}}',
-            200,
-          );
-        }),
-      );
+      final transport = _FakeTransport()
+        ..replies.add({
+          'status': 'ok',
+          'output': {'type': 'Grey', 'color_capable': true, 'smart_capable': false},
+        });
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
       final output = await client.sendCommandWithResponse(
         IotCommandClient.setNightVisionType,
         params: {'type': 'Grey'},
       );
 
-      final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['action'], 'commandWithResponse');
-      expect(body['thingName'], 'VZL-CAM-000001');
+      final body = transport.publishedAndWaited.single;
       expect(body['command'], IotCommandClient.setNightVisionType);
       expect(body['params'], {'type': 'Grey'});
+      expect(body['request_id'], isNotNull);
       expect(output, {'type': 'Grey', 'color_capable': true, 'smart_capable': false});
     },
   );
 
   test(
-    'a 504 (Lambda timeout) is retried once — a second-attempt 200 succeeds without the '
+    'a timeout (no reply) is retried once — a second-attempt reply succeeds without the '
     'caller ever seeing the timeout',
     () async {
-      var callCount = 0;
-      final client = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          callCount++;
-          if (callCount == 1) {
-            return http.Response('{"error":"No response from camera (timed out)"}', 504);
-          }
-          return http.Response('{"output":{"mode":"Both"}}', 200);
-        }),
-      );
+      final transport = _FakeTransport()
+        ..replies.add(null)
+        ..replies.add({
+          'status': 'ok',
+          'output': {'mode': 'Both'},
+        });
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
       final output = await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
 
-      expect(callCount, 2);
+      expect(transport.publishedAndWaited.length, 2);
       expect(output, {'mode': 'Both'});
     },
   );
 
-  test('a second consecutive 504 is not retried again — the timeout is surfaced', () async {
-    var callCount = 0;
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        callCount++;
-        return http.Response('{"error":"No response from camera (timed out)"}', 504);
-      }),
-    );
+  test('a second consecutive timeout is not retried again — it is surfaced', () async {
+    final transport = _FakeTransport()
+      ..replies.add(null)
+      ..replies.add(null);
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    expect(
+    await expectLater(
       client.sendCommandWithResponse(IotCommandClient.getMirrorFlip),
       throwsA(predicate((e) => e.toString().contains('timed out'))),
     );
-    await Future<void>.delayed(Duration.zero);
-    expect(callCount, 2);
+    expect(transport.publishedAndWaited.length, 2);
   });
 
-  test('a genuine camera-side failure (502) is not retried', () async {
-    var callCount = 0;
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        callCount++;
-        return http.Response('{"error":"Command 11 failed on camera"}', 502);
-      }),
-    );
+  test('a genuine camera-side failure is not retried', () async {
+    final transport = _FakeTransport()..replies.add({'status': 'error'});
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    expect(
+    await expectLater(
       client.sendCommandWithResponse(IotCommandClient.setMirrorFlip),
       throwsA(predicate((e) => e.toString().contains('failed on camera'))),
     );
-    await Future<void>.delayed(Duration.zero);
-    expect(callCount, 1);
+    expect(transport.publishedAndWaited.length, 1);
   });
 
   test('sendCommandWithResponse omits params entirely when none are given', () async {
-    http.Request? captured;
-    final client = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        captured = request;
-        return http.Response('{"output":{"type":"Grey"}}', 200);
-      }),
-    );
+    final transport = _FakeTransport()
+      ..replies.add({
+        'status': 'ok',
+        'output': {'type': 'Grey'},
+      });
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     await client.sendCommandWithResponse(IotCommandClient.getNightVisionType);
 
-    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-    expect(body.containsKey('params'), isFalse);
+    expect(transport.publishedAndWaited.single.containsKey('params'), isFalse);
+  });
+
+  test(
+    'a successful reply with no output field (every Set*/Delete* command\'s real shape) '
+    'returns an empty map, not null — null must mean "no reply arrived", never "arrived with '
+    'nothing to report" (regression: every WAN Set*/Delete* client checks output == null to '
+    'mean timeout, so this used to misreport every successful Set as a timeout once the '
+    'Lambda relay — which used to default this itself — was removed)',
+    () async {
+      final transport = _FakeTransport()..replies.add({'status': 'ok'});
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+      final output = await client.sendCommandWithResponse(IotCommandClient.setCameraLocation);
+
+      expect(output, isNotNull);
+      expect(output, <String, dynamic>{});
+    },
+  );
+
+  test('each command gets a fresh, distinct request_id', () async {
+    final transport = _FakeTransport();
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+    await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
+    await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
+
+    final ids = transport.publishedAndWaited.map((b) => b['request_id']).toSet();
+    expect(ids.length, 2);
   });
 }

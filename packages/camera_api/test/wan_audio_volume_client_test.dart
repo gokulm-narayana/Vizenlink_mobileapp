@@ -1,32 +1,42 @@
-import 'dart:convert';
-
 import 'package:camera_api/camera_api.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
 // `FR-NE-078`'s WAN mirror (`SetAudioRecording`/`GetAudioRecording`, commands 17/18) was
 // hardware-verified in firmware since 2026-07-28 but never wired into `WanAudioVolumeClient`
 // until 2026-08-11 — see that class's doc comment for the full history. Mirrors
 // `wan_night_vision_client_test.dart`'s shape.
+class _FakeTransport implements IotTransport {
+  _FakeTransport(this.publishAndWaitImpl);
+
+  final Future<Map<String, dynamic>?> Function(Map<String, dynamic> body) publishAndWaitImpl;
+  Map<String, dynamic>? captured;
+
+  @override
+  Future<void> publish(String thingName, Map<String, dynamic> body) async {}
+
+  @override
+  Future<Map<String, dynamic>?> publishAndWait(
+    String thingName,
+    Map<String, dynamic> body, {
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    captured = body;
+    return publishAndWaitImpl(body);
+  }
+}
+
 void main() {
   test('isAudioRecordingEnabled parses enabled from GetAudioRecording', () async {
-    http.Request? captured;
-    final iot = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        captured = request;
-        return http.Response('{"output":{"enabled":true}}', 200);
-      }),
-    );
+    final transport = _FakeTransport((_) async => {
+      'status': 'ok',
+      'output': {'enabled': true},
+    });
+    final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
     final result = await client.isAudioRecordingEnabled();
 
-    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-    expect(body['action'], 'commandWithResponse');
-    expect(body['command'], IotCommandClient.getAudioRecording);
+    expect(transport.captured!['command'], IotCommandClient.getAudioRecording);
 
     switch (result) {
       case CameraSuccess(:final value):
@@ -39,34 +49,21 @@ void main() {
   test(
     'setAudioRecordingEnabled sends the enabled flag and reports success once the camera replies',
     () async {
-      http.Request? captured;
-      final iot = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response('{"output":{}}', 200);
-        }),
-      );
+      final transport = _FakeTransport((_) async => {'status': 'ok', 'output': <String, dynamic>{}});
+      final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
       final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
       final result = await client.setAudioRecordingEnabled(false);
 
-      final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['command'], IotCommandClient.setAudioRecording);
-      expect(body['params'], {'enabled': false});
+      expect(transport.captured!['command'], IotCommandClient.setAudioRecording);
+      expect(transport.captured!['params'], {'enabled': false});
       expect(result, isA<CameraSuccess<void>>());
     },
   );
 
-  test('a Lambda-reported camera timeout surfaces as CameraFailure, not a thrown exception', () async {
-    final iot = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient(
-        (request) async => http.Response('{"error":"No response from camera (timed out)"}', 504),
-      ),
-    );
+  test('a camera timeout (no reply, even after the one-shot retry) surfaces as CameraFailure, not a thrown exception', () async {
+    final transport = _FakeTransport((_) async => null);
+    final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     final client = WanAudioVolumeClient('VZL-CAM-000001', iotCommandClient: iot);
     final result = await client.isAudioRecordingEnabled();

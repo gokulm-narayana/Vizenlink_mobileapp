@@ -141,7 +141,7 @@ class AuthController extends ChangeNotifier {
     } on CognitoAuthException catch (e) {
       lastError = e.code == 'UsernameExistsException'
           ? 'An account with this email already exists.'
-          : e.message;
+          : e.friendlyMessage;
       rethrow;
     }
   }
@@ -168,10 +168,17 @@ class AuthController extends ChangeNotifier {
     } on CognitoAuthException catch (e) {
       // Generic message for both "no such user" and "wrong password" — anti-enumeration.
       // UserNotConfirmedException is the one case that gets its own copy (the user needs to go
-      // finish sign-up, not retry the password).
-      lastError = e.code == 'UserNotConfirmedException'
-          ? 'Please confirm your email before signing in.'
-          : 'Incorrect email or password.';
+      // finish sign-up, not retry the password). Throttling (repeated failed sign-in attempts)
+      // is checked *before* falling through to the anti-enumeration text — found 2026-08-14
+      // alongside the changePassword throttling-copy fix: without this, a real
+      // LimitExceededException from Cognito's own brute-force protection showed as "Incorrect
+      // email or password," misleading a throttled user into thinking their password was wrong
+      // and prompting more retries, the opposite of what a throttle response should do.
+      lastError = switch (e.code) {
+        'UserNotConfirmedException' => 'Please confirm your email before signing in.',
+        'LimitExceededException' || 'TooManyRequestsException' => e.friendlyMessage,
+        _ => 'Incorrect email or password.',
+      };
       rethrow;
     }
   }
@@ -210,7 +217,7 @@ class AuthController extends ChangeNotifier {
     try {
       await _requireClient.changePassword(current.accessToken, previousPassword, newPassword);
     } on CognitoAuthException catch (e) {
-      lastError = e.message;
+      lastError = e.friendlyMessage;
       rethrow;
     }
   }

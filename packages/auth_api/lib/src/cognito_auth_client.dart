@@ -9,16 +9,33 @@ import 'auth_api_config.dart';
 /// `NotAuthorizedException`, `UserNotConfirmedException`, `CodeMismatchException`,
 /// `InvalidPasswordException`, `LimitExceededException`, `TooManyRequestsException`) — callers
 /// map specific codes to specific copy where the anti-enumeration/duplicate-email requirements
-/// need it and fall back to [message] otherwise.
-///
-/// **Not yet special-cased in this package:** `LimitExceededException`/`TooManyRequestsException`
-/// (Cognito throttling) surface here with Cognito's raw `message` text — no friendlier copy is
-/// mapped for them. Callers wanting a nicer message should catch on `code` themselves.
+/// need it and fall back to [friendlyMessage] otherwise.
 class CognitoAuthException implements Exception {
   const CognitoAuthException(this.code, this.message);
 
   final String code;
   final String message;
+
+  /// User-facing text for [code]s common enough across every Cognito-calling flow to warrant one
+  /// shared mapping, rather than each screen inventing its own — currently just Cognito's
+  /// throttling codes. Added 2026-08-14: a real "limit exceed" report on repeated
+  /// `ChangePassword` attempts turned out to be Cognito's own `LimitExceededException`
+  /// surfacing its raw AWS message text verbatim (no code fix needed on the throttle itself —
+  /// it's expected AWS behavior — but the copy shown to the user was bad). Any call site with a
+  /// more specific mapping for a given [code] (anti-enumeration text for a wrong password,
+  /// "email already exists" for sign-up, etc.) should check that first and only fall back to
+  /// this getter — never call it unconditionally ahead of a call-specific check, or a throttle
+  /// during e.g. sign-in would lose the sign-in-specific copy for the codes that already have
+  /// one.
+  String get friendlyMessage {
+    switch (code) {
+      case 'LimitExceededException':
+      case 'TooManyRequestsException':
+        return 'Too many attempts. Please wait a few minutes and try again.';
+      default:
+        return message;
+    }
+  }
 
   @override
   String toString() => 'CognitoAuthException($code: $message)';

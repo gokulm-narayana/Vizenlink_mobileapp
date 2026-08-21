@@ -1,5 +1,23 @@
 import 'package:pointycastle/export.dart';
 
+/// Real, temporary per-user AWS credentials (Cognito Identity Pool `GetCredentialsForIdentity`
+/// result) — the shape [WanAuth.awsCredentialsProvider] returns. A minimal, `camera_api`-local
+/// copy of `auth_api`'s `AwsCredentials` (this package can't depend on `auth_api` — see
+/// [WanAuth]'s own doc) rather than expiry-tracking of its own: the provider is expected to
+/// re-fetch/refresh internally (`AuthController.awsCredentials()` already does), so this class
+/// only carries what a single MQTT connect actually needs.
+class WanAwsCredentials {
+  const WanAwsCredentials({
+    required this.accessKeyId,
+    required this.secretKey,
+    required this.sessionToken,
+  });
+
+  final String accessKeyId;
+  final String secretKey;
+  final String sessionToken;
+}
+
 /// App-wide hooks the WAN clients in this package call through instead of importing anything
 /// app-specific (a `ChangeNotifier`-based auth controller, a `flutter_secure_storage`-backed key
 /// store) directly — `camera_api` stays pure-Dart and UI/app-independent per its own package doc.
@@ -13,15 +31,31 @@ import 'package:pointycastle/export.dart';
 class WanAuth {
   WanAuth._();
 
-  /// The signed-in session's current Cognito ID token, or `null` if not signed in. Backs every
-  /// AWS IoT command (`IotCommandClient`) and KVS playback lookup (`KvsPlaybackClient`).
+  /// The signed-in session's current Cognito ID token, or `null` if not signed in. Backs
+  /// `KvsPlaybackClient` (still Lambda-relayed — see [kvsPlaybackLambdaUrl]'s doc).
   static String? Function()? idTokenProvider;
 
   /// The deployed `cloud_backend/kvs_playback_lambda` Function URL
-  /// (`kb/wiki/aws-iot-kvs-setup.md` Part D) — every WAN command and KVS playback lookup goes
-  /// through this one relay. Fleet-wide, not per-camera or secret — set once from whatever
-  /// build-time config mechanism the app uses (e.g. `--dart-define`).
+  /// (`kb/wiki/aws-iot-kvs-setup.md` Part D). **2026-08-18**: `IotCommandClient` no longer routes
+  /// through this relay (see its own doc) — this URL now backs only `KvsPlaybackClient`'s KVS
+  /// HLS-session lookup, which is a separate, still-unverified Cognito-federation restriction
+  /// (`kb/wiki/kvs-viewer-read-permissions-cognito-role.md`), not touched by that change.
   static String? kvsPlaybackLambdaUrl;
+
+  /// Real, temporary AWS credentials for the signed-in user's federated Identity Pool role, or
+  /// `null` if not signed in — backs `IotCommandClient`'s direct MQTT-over-WSS connection to AWS
+  /// IoT Core. Expected to internally cache/refresh (mirrors `idTokenProvider`'s "current value"
+  /// contract) — `IotCommandClient` calls this every time it needs a connection, not just once.
+  static Future<WanAwsCredentials?> Function()? awsCredentialsProvider;
+
+  /// AWS IoT Core data-plane endpoint (e.g. `xxxxx-ats.iot.ap-south-1.amazonaws.com`, no scheme)
+  /// — fleet-wide, same value the camera firmware itself connects to. Backs
+  /// `IotCommandClient`'s MQTT-over-WSS connect.
+  static String? awsIotEndpoint;
+
+  /// AWS region the Identity Pool / IoT endpoint above live in (e.g. `ap-south-1`) — needed for
+  /// SigV4 request signing. Backs `IotCommandClient`'s MQTT-over-WSS connect.
+  static String? awsRegion;
 
   /// The device's stored RSA private key for the WAN preview-snapshot decrypt path
   /// (`FR-MOB-101`/`FR-SECL-017`) — `null` if no keypair has been generated/registered yet.

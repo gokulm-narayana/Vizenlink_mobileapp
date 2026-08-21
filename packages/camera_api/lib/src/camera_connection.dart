@@ -10,6 +10,7 @@ class CameraConnection {
     this.rtspPort = 554,
     this.thingName,
     this.wanLiveViewCapable,
+    this.wanCommandCapable,
     this.macAddress,
   });
 
@@ -49,6 +50,22 @@ class CameraConnection {
   /// already-onboarded camera the moment this shipped — see that class's own doc.
   final bool? wanLiveViewCapable;
 
+  /// Whether this camera supports WAN (remote) commands at all — AWS IoT/MQTT built into this
+  /// firmware **and** this specific device actually provisioned with real credentials
+  /// (`FR-NE-092`'s `GetCapabilities`, queried once at onboarding, same call as
+  /// [wanLiveViewCapable]). **Null means "unknown," not "unsupported"** — same fail-open
+  /// convention as [wanLiveViewCapable]: either this connection predates the field, or the
+  /// onboarding-time query failed (best-effort, never blocks onboarding). **Added 2026-08-14**
+  /// — the value was already being fetched at onboarding (`AddCameraCredentialsScreen` logged
+  /// it) but never persisted, so nothing downstream could gate on it; the Alerts screen showed
+  /// full event-configuration controls even for a camera with no AWS IoT support at all, even
+  /// though `CameraAlertsHub`'s entire delivery path is WAN MQTT — a camera that can't publish
+  /// can never actually deliver an alert, so those controls configured something with no
+  /// observable effect. Distinct from [wanLiveViewCapable]: a build can have AWS IoT (alerts
+  /// work) without KVS (WAN live view doesn't) — the cost-constrained-SKU case `FR-CF-137`
+  /// exists for — so one can't be inferred from the other.
+  final bool? wanCommandCapable;
+
   /// Builds a new connection with [thingName] replaced — used at onboarding time once
   /// `OnvifDeviceClient.getSerialNumber()` resolves it (see `AddCameraCredentialsScreen`).
   /// `CameraConnection` itself stays immutable; this returns a fresh instance rather than
@@ -61,12 +78,19 @@ class CameraConnection {
         rtspPort: rtspPort,
         thingName: thingName,
         wanLiveViewCapable: wanLiveViewCapable,
+        wanCommandCapable: wanCommandCapable,
         macAddress: macAddress,
       );
 
-  /// Builds a new connection with [wanLiveViewCapable] replaced — used at onboarding time once
-  /// `CapabilitiesClient.getCapabilities()` resolves it (see `AddCameraCredentialsScreen`).
-  CameraConnection copyWithWanLiveViewCapable(bool wanLiveViewCapable) => CameraConnection(
+  /// Builds a new connection with [wanLiveViewCapable]/[wanCommandCapable] replaced — used at
+  /// onboarding time once `CapabilitiesClient.getCapabilities()` resolves them (see
+  /// `AddCameraCredentialsScreen`). Both come from the same `GetCapabilities` call, so they're
+  /// set together rather than via two separate `copyWith*` methods.
+  CameraConnection copyWithWanCapabilities({
+    required bool wanLiveViewCapable,
+    required bool wanCommandCapable,
+  }) =>
+      CameraConnection(
         host: host,
         username: username,
         password: password,
@@ -74,6 +98,7 @@ class CameraConnection {
         rtspPort: rtspPort,
         thingName: thingName,
         wanLiveViewCapable: wanLiveViewCapable,
+        wanCommandCapable: wanCommandCapable,
         macAddress: macAddress,
       );
 
@@ -89,6 +114,7 @@ class CameraConnection {
         rtspPort: rtspPort,
         thingName: thingName,
         wanLiveViewCapable: wanLiveViewCapable,
+        wanCommandCapable: wanCommandCapable,
         macAddress: macAddress,
       );
 
@@ -103,6 +129,7 @@ class CameraConnection {
         rtspPort: rtspPort,
         thingName: thingName,
         wanLiveViewCapable: wanLiveViewCapable,
+        wanCommandCapable: wanCommandCapable,
         macAddress: macAddress,
       );
 
@@ -132,6 +159,7 @@ class CameraConnection {
         'rtspPort': rtspPort,
         if (thingName != null) 'thingName': thingName,
         if (wanLiveViewCapable != null) 'wanLiveViewCapable': wanLiveViewCapable,
+        if (wanCommandCapable != null) 'wanCommandCapable': wanCommandCapable,
         if (macAddress != null) 'macAddress': macAddress,
       };
 
@@ -144,5 +172,6 @@ class CameraConnection {
         rtspPort: json['rtspPort'] as int? ?? 554,
         thingName: json['thingName'] as String?,
         wanLiveViewCapable: json['wanLiveViewCapable'] as bool?,
+        wanCommandCapable: json['wanCommandCapable'] as bool?,
       );
 }

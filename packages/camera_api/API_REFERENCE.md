@@ -216,6 +216,7 @@ const CameraConnection({
   int rtspPort = 554,
   String? thingName,           // AWS IoT thing name — required for any WAN call
   bool? wanLiveViewCapable,    // null = unknown (not yet queried), not "unsupported"
+  bool? wanCommandCapable,     // null = unknown; AWS IoT/MQTT support (independent of KVS)
   String? macAddress,          // stable identity across DHCP lease changes
 });
 ```
@@ -228,7 +229,7 @@ Key members:
 | `onvifDeviceEndpoint` / `onvifImagingEndpoint` / `onvifMediaEndpoint` | Fixed ONVIF SOAP endpoint URIs derived from `host`/`httpsPort`. |
 | `snapshotEndpoint({String profile = 'high'})` | `GET /snapshot` URI. `profile` is `"high"`, `"medium"`, or `"low"` — one of the camera's fixed ONVIF profile names. Use `"high"` for a user-facing capture, `"medium"` for a lightweight click-to-draw backdrop (mask/OSD editors). |
 | `copyWithThingName(String)` | Returns a new connection with `thingName` set (once resolved via `OnvifDeviceClient.getSerialNumber()` at onboarding). |
-| `copyWithWanLiveViewCapable(bool)` | Returns a new connection with the WAN-capability flag set. |
+| `copyWithWanCapabilities({required bool wanLiveViewCapable, required bool wanCommandCapable})` | Returns a new connection with both WAN-capability flags set — both come from the same `GetCapabilities` call, so they're set together (**renamed from `copyWithWanLiveViewCapable` 2026-08-14** when `wanCommandCapable` was added — it was being fetched at onboarding but silently discarded, so nothing could gate the Alerts screen on it even though alert delivery is exclusively WAN MQTT; see `CameraAlertsScreen`). |
 | `copyWithMacAddress(String)` | Returns a new connection with `macAddress` set. |
 | `copyWithPassword(String)` | Returns a new connection with `password` replaced — call after a successful password change; the old connection keeps using its old password otherwise. |
 | `toJson()` / `CameraConnection.fromJson(Map)` | Plain-Dart JSON (de)serialization, for the app's own local persistence. |
@@ -792,10 +793,14 @@ overwhelming majority of home/community LANs, this app's target deployment.
 
 ## WAN — AWS IoT / KVS
 
-Every client in this section talks to the camera indirectly, via AWS IoT Core MQTT commands and
-a Lambda relay (`cloud_backend/kvs_playback_lambda`) rather than a direct HTTP/SOAP connection.
-None of them import anything app-specific — they source their AWS credentials/config through
-`WanAuth`'s static hooks instead.
+Every client in this section talks to the camera over AWS IoT Core. **Since 2026-08-18**,
+`IotCommandClient` (commands: settings, deterrence, device identity, etc.) connects **directly**
+to AWS IoT Core over MQTT-over-WSS — no Lambda relay involved. `KvsPlaybackClient` (KVS/HLS video
+playback) still goes through the Lambda relay (`cloud_backend/kvs_playback_lambda`) — a separate,
+still-unverified Cognito-federation restriction on the KVS control-plane APIs specifically (see
+`kb/wiki/kvs-viewer-read-permissions-cognito-role.md`), not the same restriction the command relay
+was removed for. None of these clients import anything app-specific — they source their AWS
+credentials/config through `WanAuth`'s static hooks instead.
 
 ### WanAuth
 
@@ -805,27 +810,45 @@ in `main.dart`).
 
 | Hook | Type | Purpose |
 |---|---|---|
-| `idTokenProvider` | `String? Function()?` | Returns the signed-in session's current Cognito ID token, or `null` if not signed in. Backs every AWS IoT command and KVS playback lookup. |
-| `kvsPlaybackLambdaUrl` | `String?` | The deployed `cloud_backend/kvs_playback_lambda` Function URL. Every WAN command and KVS lookup goes through this one relay. Fleet-wide, not per-camera. |
+| `idTokenProvider` | `String? Function()?` | Returns the signed-in session's current Cognito ID token, or `null` if not signed in. Backs `KvsPlaybackClient`'s Lambda-relayed lookup. |
+| `kvsPlaybackLambdaUrl` | `String?` | The deployed `cloud_backend/kvs_playback_lambda` Function URL. Backs only `KvsPlaybackClient` now — `IotCommandClient` no longer uses it. |
+| `awsCredentialsProvider` | `Future<WanAwsCredentials?> Function()?` | Returns real, temporary AWS credentials for the signed-in user's federated Identity Pool role, or `null` if not signed in. Expected to internally cache/refresh. Backs `IotCommandClient`'s direct MQTT-over-WSS connection. |
+| `awsIotEndpoint` | `String?` | AWS IoT Core data-plane endpoint (no scheme, e.g. `xxxxx-ats.iot.ap-south-1.amazonaws.com`) — fleet-wide, same value the camera firmware connects to. Backs `IotCommandClient`. |
+| `awsRegion` | `String?` | AWS region the Identity Pool / IoT endpoint live in (e.g. `ap-south-1`) — needed for SigV4 signing. Backs `IotCommandClient`. |
 | `previewPrivateKeyProvider` | `Future<RSAPrivateKey?> Function()?` | Returns the device's stored RSA private key for the WAN preview-snapshot decrypt path, or `null` if no keypair has been generated/registered yet. Backs `WanPreviewSnapshotClient`. |
 | `onPreviewKeyNeedsRegistration` | `void Function(String thingName)?` | Called when the camera reports its previously-registered preview key is gone (e.g. after a factory reset) — the app should flag that camera for automatic re-registration next time it's reachable on LAN. |
 
+`WanAwsCredentials` (`wan/wan_auth.dart`) is a minimal `{accessKeyId, secretKey, sessionToken}`
+value type — a `camera_api`-local copy of `auth_api`'s `AwsCredentials` shape (this package can't
+depend on `auth_api`), just the fields a single MQTT connect needs.
+
 ### IotCommandClient
 
-`wan/iot_command_client.dart` — the low-level AWS IoT command-relay transport every other WAN
-client in this package sits on top of. Talks to the Lambda relay over plain HTTPS with the
-Cognito ID token as a bearer token (not AWS SigV4 — Cognito-federated credentials are rejected by
-AWS for direct MQTT publish, hence the relay).
+`wan/iot_command_client.dart` — the low-level AWS IoT command transport every other WAN client in
+this package sits on top of. **Talks directly to AWS IoT Core** over a single, persistent,
+self-healing MQTT-over-WSS connection (`IotMqttTransport`, `wan/iot_mqtt_transport.dart`) — SigV4
+WebSocket presigning with the app's own federated Cognito credentials, reused across every command
+and every `IotCommandClient` instance/thingName in the process, not reconnected per call.
+
+**History**: this used to be direct MQTT, then a Lambda-relayed HTTPS call (2026-07-31 —
+2026-08-18, after AWS was found to reject Cognito-federated credentials for this call pattern),
+then reverted back to direct MQTT (2026-08-18) once that restriction was re-tested live and found
+no longer reproducing (`kb/raw/2026-08-18-fix-direct-iot-mqtt-restored.md`) — the relay's
+fresh-connection-per-call pattern was costing up to ~12s per command by itself. If AWS ever
+re-rejects direct Cognito-federated MQTT, that history is the reference for restoring a relay.
 
 ```dart
-IotCommandClient(String thingName, {String? Function()? idTokenProvider, http.Client? httpClient})
+IotCommandClient(String thingName, {IotTransport? transport})
 ```
+
+`transport` is the test seam (`IotTransport` interface, `wan/iot_mqtt_transport.dart`) — defaults
+to `IotMqttTransport.instance`, the one shared connection.
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `sendStartCloudStreaming` | — | `Future<void>` | Fire-and-forget `StartCloudStreaming`. Throws on transport/relay failure. |
+| `sendStartCloudStreaming` | — | `Future<void>` | Fire-and-forget `StartCloudStreaming`. Throws on transport failure. |
 | `sendStopCloudStreaming` | — | `Future<void>` | Fire-and-forget `StopCloudStreaming`. |
-| `sendCommandWithResponse` | `int command, {Map<String, dynamic>? params, double? timeoutSeconds}` | `Future<Map<String, dynamic>?>` | Generic request/response relay for any command that replies on the camera's response topic. Returns `null` on a server-side timeout (camera didn't respond within the window); the Lambda's own wait is clamped to 25s server-side regardless of `timeoutSeconds`. Has a one-shot automatic retry on an HTTP 504 from the relay itself (transient MQTT session jitter, not a stuck camera). Throws on a genuine relay/camera-side failure. |
+| `sendCommandWithResponse` | `int command, {Map<String, dynamic>? params, double? timeoutSeconds}` | `Future<Map<String, dynamic>?>` | Generic request/response path for any command that replies on the camera's response topic (`vizenlink/response/<thingName>`), reassembling a chunked reply (`FR-NE-108`) if one arrives. Returns `null` **only** when no reply arrives within the window at all (default 12s, overridable via `timeoutSeconds`) — a successful reply with no `output` field (every `Set*`/`Delete*` command's normal shape, see `.claude/rules/cloud-components.md` § "Get/Set response asymmetry") returns an empty map, `{}`, never `null` (`BUG-020`, fixed 2026-08-18 — this class of bug was first found and fixed once already for the old Lambda relay, `BUG-006`; removing the relay dropped that same normalization until this fix restored it client-side). Has a one-shot automatic retry when no reply arrives at all (transient session jitter, not a stuck camera). Throws on a genuine camera-side failure (`status != "ok"`). |
 
 Every WAN setting client below is a thin typed wrapper around `sendCommandWithResponse` with a
 specific integer command constant (defined as `static const` fields on this class, e.g.
@@ -1257,10 +1280,23 @@ WAN client is used:
 ```dart
 void configureWan() {
   WanAuth.idTokenProvider = () => currentCognitoIdToken; // your own auth state — see auth_api
-  // This project's real, live deployed relay (VizenLinkKvsPlaybackProxy, confirmed live
-  // 2026-08-12) — not a placeholder. Overridable via --dart-define=KVS_PLAYBACK_LAMBDA_URL=...
-  // if this Lambda is ever redeployed at a new Function URL.
+  // Still used, but only by KvsPlaybackClient (KVS/HLS playback) now — this project's real,
+  // live deployed relay (VizenLinkKvsPlaybackProxy, confirmed live 2026-08-12). Overridable via
+  // --dart-define=KVS_PLAYBACK_LAMBDA_URL=... if this Lambda is ever redeployed at a new
+  // Function URL.
   WanAuth.kvsPlaybackLambdaUrl = 'https://jxce73jfkwoouhcmxvhsoysxxq0gavso.lambda-url.ap-south-1.on.aws/';
+  // IotCommandClient talks directly to AWS IoT — needs real, temporary AWS credentials (not just
+  // the ID token above) plus the IoT endpoint/region. See auth_api's AuthController.awsCredentials().
+  WanAuth.awsCredentialsProvider = () async {
+    final creds = await currentAwsCredentials(); // your own auth state — see auth_api
+    return WanAwsCredentials(
+      accessKeyId: creds.accessKeyId,
+      secretKey: creds.secretKey,
+      sessionToken: creds.sessionToken,
+    );
+  };
+  WanAuth.awsIotEndpoint = 'a1zfm34z2p80an-ats.iot.ap-south-1.amazonaws.com'; // this project's real endpoint
+  WanAuth.awsRegion = 'ap-south-1';
 }
 
 Future<void> readMirrorFlipOverWan(String thingName) async {

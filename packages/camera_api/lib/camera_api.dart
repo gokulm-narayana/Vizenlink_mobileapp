@@ -69,6 +69,7 @@ export 'src/privacy_mode_types.dart';
 export 'src/util/onvif_rect_coordinates.dart';
 export 'src/wan/aws_wan_live_view_client.dart';
 export 'src/wan/iot_command_client.dart';
+export 'src/wan/iot_mqtt_transport.dart';
 export 'src/wan/kvs_playback_client.dart';
 export 'src/wan/wan_auth.dart';
 export 'src/wan/wan_audio_volume_client.dart';

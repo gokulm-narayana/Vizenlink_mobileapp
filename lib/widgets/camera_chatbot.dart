@@ -269,6 +269,12 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
   /// appear to show a stale/previous snapshot.
   bool _isReplying = false;
 
+  /// "Thinking…"/"Calling Take Snapshot…"-style progress text for the
+  /// in-flight assistant bubble, shown while [msg.text] is still empty so
+  /// the user sees the model is actually working instead of a blank bubble.
+  /// Cleared as soon as real content starts streaming.
+  String? _statusText;
+
   /// Built once — resolves camera names against the same [HomesController]
   /// this sheet already has, and routes any tool-call side effect
   /// (snapshot/live-view/confirm card) to [_handleToolEffect].
@@ -353,13 +359,20 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
     final text = rawText.trim();
     if (text.isEmpty) return;
     widget.chatController.addUserMessage(text);
-    setState(() => _isReplying = true);
+    setState(() {
+      _isReplying = true;
+      _statusText = 'Thinking…';
+    });
     _inputController.clear();
     _scrollToBottom();
 
     final aiStream = widget.aiModelManager.reply(
       text,
       tools: selectRelevantTools(text, _tools),
+      onStatus: (status) {
+        if (!mounted) return;
+        setState(() => _statusText = status.isEmpty ? null : status);
+      },
     );
     if (aiStream != null) {
       _streamAiReply(aiStream);
@@ -430,7 +443,12 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
     } finally {
       _activeEffects = null;
       _activeMessageIndex = null;
-      if (mounted) setState(() => _isReplying = false);
+      if (mounted) {
+        setState(() {
+          _isReplying = false;
+          _statusText = null;
+        });
+      }
     }
   }
 
@@ -575,11 +593,22 @@ class _CameraChatbotSheetState extends State<_CameraChatbotSheet> {
                   : colorScheme.surfaceContainerHighest,
               borderRadius: BorderRadius.circular(16),
             ),
-            child: Text(
-              msg.text,
-              style: TextStyle(
-                color: msg.isUser ? colorScheme.onPrimary : null,
-              ),
+            child: Builder(
+              builder: (context) {
+                final showStatus =
+                    !msg.isUser &&
+                    msg.text.isEmpty &&
+                    _isReplying &&
+                    i == _messages.length - 1 &&
+                    _statusText != null;
+                return Text(
+                  showStatus ? _statusText! : msg.text,
+                  style: TextStyle(
+                    color: msg.isUser ? colorScheme.onPrimary : null,
+                    fontStyle: showStatus ? FontStyle.italic : FontStyle.normal,
+                  ),
+                );
+              },
             ),
           ),
           for (final effect in msg.effects) _buildToolEffect(context, effect),

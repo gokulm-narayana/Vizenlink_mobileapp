@@ -1,31 +1,38 @@
-import 'dart:convert';
-
 import 'package:camera_api/camera_api.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:test/test.dart';
+
+class _FakeTransport implements IotTransport {
+  _FakeTransport(this.publishAndWaitImpl);
+
+  final Future<Map<String, dynamic>?> Function(Map<String, dynamic> body) publishAndWaitImpl;
+  Map<String, dynamic>? captured;
+
+  @override
+  Future<void> publish(String thingName, Map<String, dynamic> body) async {}
+
+  @override
+  Future<Map<String, dynamic>?> publishAndWait(
+    String thingName,
+    Map<String, dynamic> body, {
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    captured = body;
+    return publishAndWaitImpl(body);
+  }
+}
 
 void main() {
   test('getNightVisionType parses the same fields as the LAN client', () async {
-    http.Request? captured;
-    final iot = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient((request) async {
-        captured = request;
-        return http.Response(
-          '{"output":{"type":"Color","color_capable":true,"smart_capable":false}}',
-          200,
-        );
-      }),
-    );
+    final transport = _FakeTransport((_) async => {
+      'status': 'ok',
+      'output': {'type': 'Color', 'color_capable': true, 'smart_capable': false},
+    });
+    final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     final client = WanNightVisionClient('VZL-CAM-000001', iotCommandClient: iot);
     final result = await client.getNightVisionType();
 
-    final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-    expect(body['action'], 'commandWithResponse');
-    expect(body['command'], IotCommandClient.getNightVisionType);
+    expect(transport.captured!['command'], IotCommandClient.getNightVisionType);
 
     switch (result) {
       case CameraSuccess(:final value):
@@ -38,16 +45,16 @@ void main() {
   });
 
   test('getNightVisionType parses sub_state when type is Smart', () async {
-    final iot = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient(
-        (request) async => http.Response(
-          '{"output":{"type":"Smart","sub_state":"Grey","color_capable":true,"smart_capable":true}}',
-          200,
-        ),
-      ),
-    );
+    final transport = _FakeTransport((_) async => {
+      'status': 'ok',
+      'output': {
+        'type': 'Smart',
+        'sub_state': 'Grey',
+        'color_capable': true,
+        'smart_capable': true,
+      },
+    });
+    final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     final client = WanNightVisionClient('VZL-CAM-000001', iotCommandClient: iot);
     final result = await client.getNightVisionType();
@@ -64,34 +71,21 @@ void main() {
   test(
     'setNightVisionType sends the wire type and reports success once the camera replies',
     () async {
-      http.Request? captured;
-      final iot = IotCommandClient(
-        'VZL-CAM-000001',
-        idTokenProvider: () => 'fake-id-token',
-        httpClient: MockClient((request) async {
-          captured = request;
-          return http.Response('{"output":{}}', 200);
-        }),
-      );
+      final transport = _FakeTransport((_) async => {'status': 'ok', 'output': <String, dynamic>{}});
+      final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
       final client = WanNightVisionClient('VZL-CAM-000001', iotCommandClient: iot);
       final result = await client.setNightVisionType(NightVisionType.color);
 
-      final body = jsonDecode(captured!.body) as Map<String, dynamic>;
-      expect(body['command'], IotCommandClient.setNightVisionType);
-      expect(body['params'], {'type': 'Color'});
+      expect(transport.captured!['command'], IotCommandClient.setNightVisionType);
+      expect(transport.captured!['params'], {'type': 'Color'});
       expect(result, isA<CameraSuccess<void>>());
     },
   );
 
-  test('a Lambda-reported camera timeout surfaces as CameraFailure, not a thrown exception', () async {
-    final iot = IotCommandClient(
-      'VZL-CAM-000001',
-      idTokenProvider: () => 'fake-id-token',
-      httpClient: MockClient(
-        (request) async => http.Response('{"error":"No response from camera (timed out)"}', 504),
-      ),
-    );
+  test('a camera timeout (no reply, even after the one-shot retry) surfaces as CameraFailure, not a thrown exception', () async {
+    final transport = _FakeTransport((_) async => null);
+    final iot = IotCommandClient('VZL-CAM-000001', transport: transport);
 
     final client = WanNightVisionClient('VZL-CAM-000001', iotCommandClient: iot);
     final result = await client.getNightVisionType();
