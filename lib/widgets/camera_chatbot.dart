@@ -97,8 +97,8 @@ Future<bool> _showConsentDialog(
       title: const Text('Enable AI chat?'),
       content: const Text(
         key: Key('CHAT-020'),
-        'Answering with AI needs a one-time download of the Qwen3.5-0.8B '
-        'model (about 0.6GB).',
+        'Answering with AI needs a one-time download of the Qwen3-1.7B '
+        'model (about 1.1GB).',
       ),
       actions: [
         TextButton(

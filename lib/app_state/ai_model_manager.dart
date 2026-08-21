@@ -14,8 +14,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 enum AiChatStatus { unknown, notAccepted, declined, downloading, ready, failed }
 
 class AiModelManager extends ChangeNotifier {
-  static const _repoId = 'bartowski/Qwen_Qwen3.5-0.8B-GGUF';
-  static const _filePath = 'Qwen_Qwen3.5-0.8B-Q4_K_M.gguf';
+  // static const _repoId = 'bartowski/Qwen_Qwen3.5-0.8B-GGUF';  // old model ~0.6GB
+  // static const _filePath = 'Qwen_Qwen3.5-0.8B-Q4_K_M.gguf';
+  static const _repoId = 'bartowski/Qwen_Qwen3-1.7B-GGUF'; // new model ~1.1GB
+  static const _filePath = 'Qwen_Qwen3-1.7B-Q4_K_M.gguf';
   static const _consentPrefsKey = 'ai_chat_consent';
 
   AiChatStatus status = AiChatStatus.unknown;
@@ -214,35 +216,47 @@ class AiModelManager extends ChangeNotifier {
         return;
       }
 
-      // Execute at most one tool call per round even if the model emitted
-      // several — a small model asked to pick from a keyword-scored
-      // candidate list can still emit multiple calls in one pass when
-      // more than one tool's name/description loosely matches the
-      // message; running all of them compounds a single bad guess into
-      // several side effects. The rest get a "not executed" tool result
-      // so every emitted call still has a matching reply (required by the
-      // chat template) without actually running.
+      // Execute every tool call the model emitted this round — a compound
+      // request ("turn on night mode and show me the snapshot") correctly
+      // produces two tool calls in one round, and only running the first
+      // made the second depend on the model reliably re-issuing it next
+      // round from a "not executed, ask again" note, which it did
+      // inconsistently (the intermittent "changed the mode but no
+      // snapshot" bug). Destructive tools don't need this guard anyway —
+      // reboot_camera/reset_camera_settings/factory_reset_camera/
+      // delete_camera never auto-execute regardless, they always stage a
+      // ConfirmEffect first (see chatbot_tools.dart), so there's no real
+      // risk being traded away here for the tools that would actually
+      // matter if a small model over-emitted a bad extra call.
+      //
+      // Previously capped to one call per round — a small model asked to
+      // pick from a keyword-scored candidate list could emit multiple
+      // calls in one pass when more than one tool's name/description
+      // loosely matched the message, and running all of them would
+      // compound a single bad guess into several side effects. Commented
+      // out rather than deleted in case that tradeoff needs revisiting:
+      //
+      // if (index != sortedIndexes.first) {
+      //   session.addMessage(
+      //     LlamaChatMessage.withContent(
+      //       role: LlamaChatRole.tool,
+      //       content: [
+      //         LlamaToolResultContent(
+      //           id: call.id,
+      //           name: name ?? 'unknown_tool',
+      //           result:
+      //               'Not executed: only one tool call is handled per '
+      //               'turn. Ask again if this was actually needed.',
+      //         ),
+      //       ],
+      //     ),
+      //   );
+      //   continue;
+      // }
       final sortedIndexes = accumulators.keys.toList()..sort();
       for (final index in sortedIndexes) {
         final call = accumulators[index]!;
         final name = call.name;
-        if (index != sortedIndexes.first) {
-          session.addMessage(
-            LlamaChatMessage.withContent(
-              role: LlamaChatRole.tool,
-              content: [
-                LlamaToolResultContent(
-                  id: call.id,
-                  name: name ?? 'unknown_tool',
-                  result:
-                      'Not executed: only one tool call is handled per '
-                      'turn. Ask again if this was actually needed.',
-                ),
-              ],
-            ),
-          );
-          continue;
-        }
         if (name == null || name.isEmpty) {
           session.addMessage(
             LlamaChatMessage.withContent(
@@ -340,7 +354,9 @@ const _systemPrompt =
     'same thing here). A tool result is real, '
     'accomplished fact, never hypothetical — report it directly, never '
     'add a disclaimer like "I can\'t access the camera/devices" after a '
-    'successful tool call. If a result starts with "Awaiting user '
+    'successful tool call. If a result starts with "Error", the action '
+    'did NOT happen — say so plainly and never describe it as done or '
+    'successful. If a result starts with "Awaiting user '
     'confirmation", say you\'ve shown a confirmation prompt and don\'t '
     'call that tool again this turn.';
 
