@@ -20,6 +20,7 @@ class CameraCapabilities {
     required this.sirenCapable,
     required this.spotlightCapable,
     required this.warningCapable,
+    required this.localStorageCapable,
   });
 
   /// Whether this device can receive AWS IoT/MQTT commands at all (deterrence, settings sync,
@@ -58,6 +59,11 @@ class CameraCapabilities {
   final bool sirenCapable;
   final bool spotlightCapable;
   final bool warningCapable;
+
+  /// `FR-CF-044`: whether this SKU has an SD card slot at all (a fixed, build-time hardware
+  /// fact) — distinct from live card-insertion status, which `LocalStorageClient.getStatus()`
+  /// reports separately. Default `false` on firmware too old to report it.
+  final bool localStorageCapable;
 }
 
 /// Dispatches over both LAN and WAN on the firmware side (`FR-NE-092`, matching the
@@ -107,6 +113,7 @@ class CapabilitiesClient {
               sirenCapable: value['siren_capable'] == true,
               spotlightCapable: value['spotlight_capable'] == true,
               warningCapable: value['warning_capable'] == true,
+              localStorageCapable: value['local_storage_capable'] == true,
             ),
           );
         }(),

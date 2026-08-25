@@ -15,20 +15,17 @@ class RestStreamingClient {
     return _client.get('/nuraeye/cloud/streaming').then((result) => result.map((json) => GetCloudStreamingStatusResponse.fromJson(json)));
   }
 
+  /// Fetch the camera-generated shared key for end-to-end-encrypted WAN preview snapshots
+  Future<RestResult<GetPreviewKeyResponse>> getPreviewKey() {
+    return _client.get('/nuraeye/preview-key').then((result) => result.map((json) => GetPreviewKeyResponse.fromJson(json)));
+  }
+
   /// Resolve the LAN WebRTC signaling URI for a stream profile
   Future<RestResult<GetWebRtcUriResponse>> getWebRtcUri({required String profileToken}) {
     final body = <String, dynamic>{
       'profile_token': profileToken,
     };
     return _client.post('/nuraeye/webrtc-uri', body).then((result) => result.map((json) => GetWebRtcUriResponse.fromJson(json)));
-  }
-
-  /// Register the mobile app's public key for end-to-end-encrypted WAN preview snapshots
-  Future<RestResult<void>> setPreviewKey({required String publicKey}) {
-    final body = <String, dynamic>{
-      'public_key': publicKey,
-    };
-    return _client.post('/nuraeye/preview-key', body);
   }
 
   Future<RestResult<void>> stopCloudStreaming() {
@@ -44,6 +41,16 @@ class GetCloudStreamingStatusResponse {
 
   factory GetCloudStreamingStatusResponse.fromJson(Map<String, dynamic> json) => GetCloudStreamingStatusResponse(
         streamStatus: json['stream_status'] as String?,
+      );
+}
+
+class GetPreviewKeyResponse {
+  final String? key;
+
+  const GetPreviewKeyResponse({this.key});
+
+  factory GetPreviewKeyResponse.fromJson(Map<String, dynamic> json) => GetPreviewKeyResponse(
+        key: json['key'] as String?,
       );
 }
 

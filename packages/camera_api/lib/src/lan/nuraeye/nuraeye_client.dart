@@ -162,6 +162,10 @@ class NuraeyeClient {
         return _get('/nuraeye/audio/test-sound', timeout);
       case 'GetCapabilities':
         return _capabilities(timeout);
+      case 'GetLocalStorage':
+        return _get('/nuraeye/local-storage', timeout);
+      case 'SetLocalStorage':
+        return _post('/nuraeye/local-storage', {'enabled': p['enabled']}, timeout);
       case 'GetNightVisionType':
         return _getNightVisionType(timeout);
       case 'SetNightVisionType':
@@ -193,11 +197,13 @@ class NuraeyeClient {
         return _get('/nuraeye/video/image-defaults', timeout);
       case 'GetVideoMode':
         return _get('/nuraeye/video/mode', timeout);
-      case 'RegisterPreviewKey':
-        // FR-CF-141/FR-SECL-017/FR-NE-108: registers this device's public key so the camera can
-        // encrypt WAN preview snapshots to it. LAN-only, called once over the already-
-        // authenticated pairing channel.
-        return _post('/nuraeye/preview-key', {'public_key': p['public_key']}, timeout);
+      case 'GetPreviewKey':
+        // FR-CF-141/FR-SECL-017/FR-NE-108: fetches the camera-generated shared key used to
+        // encrypt WAN preview snapshots. LAN-only, called over the already-authenticated
+        // pairing channel — redesigned 2026-08-21 from a Set (app pushes its own key) to this
+        // Get (camera owns and hands out the key), so any number of apps can decrypt, not just
+        // the last one to register.
+        return _get('/nuraeye/preview-key', timeout);
       case 'GetDeterrenceStatus':
         return _get('/nuraeye/deterrence', timeout);
       case 'ActivateDeterrence':

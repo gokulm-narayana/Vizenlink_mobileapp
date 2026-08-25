@@ -2,6 +2,7 @@ import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
@@ -250,17 +251,21 @@ class _CameraAlertSectionState extends State<_CameraAlertSection> {
   Future<bool> _sendPreferences(Map<String, bool> changes) async {
     final connection = _connection;
     if (connection == null) return false;
-    final nuraeye = NuraeyeClient(connection);
-    var result = await EventPreferencesClient(
-      nuraeye,
-    ).setEventPreferences(changes);
-    nuraeye.close();
     final thingName = connection.thingName;
-    if (result is! CameraSuccess && thingName != null) {
-      result = await WanEventPreferencesClient(
-        thingName,
-      ).setEventPreferences(changes);
-    }
+    final result = await callPreferringKnownTransport(
+      camera: widget.camera,
+      thingName: thingName,
+      lan: () async {
+        final nuraeye = NuraeyeClient(connection);
+        final result = await EventPreferencesClient(
+          nuraeye,
+        ).setEventPreferences(changes);
+        nuraeye.close();
+        return result;
+      },
+      wan: () =>
+          WanEventPreferencesClient(thingName!).setEventPreferences(changes),
+    );
     return result is CameraSuccess;
   }
 
@@ -269,17 +274,22 @@ class _CameraAlertSectionState extends State<_CameraAlertSection> {
   Future<bool> _sendResponseActions(Map<String, List<String>> changes) async {
     final connection = _connection;
     if (connection == null) return false;
-    final nuraeye = NuraeyeClient(connection);
-    var result = await EventResponseActionsClient(
-      nuraeye,
-    ).setEventResponseActions(changes);
-    nuraeye.close();
     final thingName = connection.thingName;
-    if (result is! CameraSuccess && thingName != null) {
-      result = await WanEventResponseActionsClient(
-        thingName,
-      ).setEventResponseActions(changes);
-    }
+    final result = await callPreferringKnownTransport(
+      camera: widget.camera,
+      thingName: thingName,
+      lan: () async {
+        final nuraeye = NuraeyeClient(connection);
+        final result = await EventResponseActionsClient(
+          nuraeye,
+        ).setEventResponseActions(changes);
+        nuraeye.close();
+        return result;
+      },
+      wan: () => WanEventResponseActionsClient(
+        thingName!,
+      ).setEventResponseActions(changes),
+    );
     return result is CameraSuccess;
   }
 
@@ -288,17 +298,21 @@ class _CameraAlertSectionState extends State<_CameraAlertSection> {
   Future<bool> _sendDurations(Map<String, int> changes) async {
     final connection = _connection;
     if (connection == null) return false;
-    final nuraeye = NuraeyeClient(connection);
-    var result = await DeterrenceClient(
-      nuraeye,
-    ).setDeterrenceDurations(changes);
-    nuraeye.close();
     final thingName = connection.thingName;
-    if (result is! CameraSuccess && thingName != null) {
-      result = await WanDeterrenceClient(
-        thingName,
-      ).setDeterrenceDurations(changes);
-    }
+    final result = await callPreferringKnownTransport(
+      camera: widget.camera,
+      thingName: thingName,
+      lan: () async {
+        final nuraeye = NuraeyeClient(connection);
+        final result = await DeterrenceClient(
+          nuraeye,
+        ).setDeterrenceDurations(changes);
+        nuraeye.close();
+        return result;
+      },
+      wan: () =>
+          WanDeterrenceClient(thingName!).setDeterrenceDurations(changes),
+    );
     return result is CameraSuccess;
   }
 

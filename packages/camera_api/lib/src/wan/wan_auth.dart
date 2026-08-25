@@ -1,4 +1,4 @@
-import 'package:pointycastle/export.dart';
+import 'dart:typed_data';
 
 /// Real, temporary per-user AWS credentials (Cognito Identity Pool `GetCredentialsForIdentity`
 /// result) — the shape [WanAuth.awsCredentialsProvider] returns. A minimal, `camera_api`-local
@@ -57,14 +57,18 @@ class WanAuth {
   /// SigV4 request signing. Backs `IotCommandClient`'s MQTT-over-WSS connect.
   static String? awsRegion;
 
-  /// The device's stored RSA private key for the WAN preview-snapshot decrypt path
-  /// (`FR-MOB-101`/`FR-SECL-017`) — `null` if no keypair has been generated/registered yet.
-  /// Backs `WanPreviewSnapshotClient.getPreviewSnapshot()`.
-  static Future<RSAPrivateKey?> Function()? previewPrivateKeyProvider;
+  /// This device's cached copy of [thingName]'s camera-generated shared AES-256 preview key
+  /// (`FR-MOB-101`/`FR-CF-141`/`FR-SECL-017`) — `null` if this device has never fetched one for
+  /// that camera over LAN. Backs `WanPreviewSnapshotClient.getPreviewSnapshot()`.
+  ///
+  /// **Redesigned 2026-08-21** from a single device-wide RSA private key (this app generated its
+  /// own keypair) to a per-camera shared symmetric key the camera itself generates and any
+  /// number of apps can fetch — see `PreviewKeyStore`'s own doc for the full rationale.
+  static Future<Uint8List?> Function(String thingName)? previewSharedKeyProvider;
 
   /// Called when the camera reports `no_preview_key_registered` for [thingName] (e.g. after a
-  /// factory reset wiped its previously-registered key) — the app's job is to flag that camera
-  /// for automatic re-registration next time it's reachable on LAN. Backs
+  /// factory reset wiped its previously-generated key) — the app's job is to flag that camera
+  /// for automatic re-fetch next time it's reachable on LAN. Backs
   /// `WanPreviewSnapshotClient.getPreviewSnapshot()`'s error-recovery path.
   static void Function(String thingName)? onPreviewKeyNeedsRegistration;
 }

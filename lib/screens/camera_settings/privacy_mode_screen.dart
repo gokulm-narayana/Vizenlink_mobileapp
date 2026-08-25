@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../widgets/drawable_zone.dart';
 import '../../widgets/fixed_preview_layout.dart';
@@ -143,28 +144,53 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     setState(() => _isLoading = true);
     final nuraeye = NuraeyeClient(connection);
     final maskClient = MaskClient(connection);
-    final results = await Future.wait([
-      PrivacyModeClient(nuraeye).getPrivacyMode(),
-      maskClient.getMasks(),
-      maskClient.getMaskOptions(forceRefresh: forceRefresh),
-    ]);
+    final thingName = connection.thingName;
+    // Skips the LAN mode/masks attempt entirely when this camera's last
+    // confirmed transport was WAN — see Camera.lastKnownWan's doc. Options
+    // stays LAN-only regardless (see this class's doc comment).
+    final preferWan = _camera.lastKnownWan == true && thingName != null;
+
+    CameraResult<PrivacyMode> modeResult;
+    CameraResult<List<MaskEntry>> masksResult;
+    final CameraResult<MaskOptions> optionsResult;
+    if (preferWan) {
+      optionsResult = await maskClient.getMaskOptions(
+        forceRefresh: forceRefresh,
+      );
+      modeResult = const CameraTimeout<PrivacyMode>();
+      masksResult = const CameraTimeout<List<MaskEntry>>();
+    } else {
+      final results = await Future.wait([
+        PrivacyModeClient(nuraeye).getPrivacyMode(),
+        maskClient.getMasks(),
+        maskClient.getMaskOptions(forceRefresh: forceRefresh),
+      ]);
+      modeResult = results[0] as CameraResult<PrivacyMode>;
+      masksResult = results[1] as CameraResult<List<MaskEntry>>;
+      optionsResult = results[2] as CameraResult<MaskOptions>;
+    }
     nuraeye.close();
     maskClient.close();
 
-    var modeResult = results[0] as CameraResult<PrivacyMode>;
-    var masksResult = results[1] as CameraResult<List<MaskEntry>>;
-    final optionsResult = results[2] as CameraResult<MaskOptions>;
-
     // Options are LAN-only on a normal load (see this class's doc comment)
-    // — only the current-value reads (mode, masks) fall back to WAN here.
-    final thingName = connection.thingName;
+    // — only the current-value reads (mode, masks) fall back to WAN here,
+    // in parallel (previously sequential).
     if (thingName != null) {
-      final wanMaskClient = WanMaskClient(thingName);
-      if (modeResult is! CameraSuccess) {
-        modeResult = await WanPrivacyModeClient(thingName).getPrivacyMode();
-      }
-      if (masksResult is! CameraSuccess) {
-        masksResult = await wanMaskClient.getMasks();
+      final needsMode = modeResult is! CameraSuccess;
+      final needsMasks = masksResult is! CameraSuccess;
+      if (needsMode || needsMasks) {
+        final wanResults = await Future.wait([
+          needsMode
+              ? WanPrivacyModeClient(thingName).getPrivacyMode()
+              : Future.value(null),
+          needsMasks ? WanMaskClient(thingName).getMasks() : Future.value(null),
+        ]);
+        if (needsMode) {
+          modeResult = wanResults[0] as CameraResult<PrivacyMode>;
+        }
+        if (needsMasks) {
+          masksResult = wanResults[1] as CameraResult<List<MaskEntry>>;
+        }
       }
     }
     if (!mounted) return;
@@ -346,21 +372,30 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     if (connection != null) {
       final thingName = connection.thingName;
 
-      final nuraeye = NuraeyeClient(connection);
-      var modeResult = await PrivacyModeClient(
-        nuraeye,
-      ).setPrivacyMode(_toWirePrivacyMode(_mode));
-      nuraeye.close();
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention.
-      if (modeResult is! CameraSuccess && thingName != null) {
-        modeResult = await WanPrivacyModeClient(
-          thingName,
-        ).setPrivacyMode(_toWirePrivacyMode(_mode));
-      }
+      // A failed LAN Apply/Set retries over WAN before surfacing an error
+      // (or WAN is called directly when known — see Camera.lastKnownWan's
+      // doc), per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final modeResult = await callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () async {
+          final nuraeye = NuraeyeClient(connection);
+          final result = await PrivacyModeClient(
+            nuraeye,
+          ).setPrivacyMode(_toWirePrivacyMode(_mode));
+          nuraeye.close();
+          return result;
+        },
+        wan: () => WanPrivacyModeClient(
+          thingName!,
+        ).setPrivacyMode(_toWirePrivacyMode(_mode)),
+      );
 
       final maskClient = MaskClient(connection);
       final wanMaskClient = thingName != null ? WanMaskClient(thingName) : null;
+      // Skips each LAN mask attempt below entirely when this camera's last
+      // confirmed transport was WAN — see Camera.lastKnownWan's doc.
+      final preferWan = _camera.lastKnownWan == true && wanMaskClient != null;
       // ONVIF masks have no bulk-update call — diff the zone list against
       // what's already on the camera (tracked in _maskTokenByZoneId).
       final maskType = _maskOptions != null && _maskOptions!.types.isNotEmpty
@@ -378,7 +413,8 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
           .toList();
       for (final id in removedZoneIds) {
         final token = _maskTokenByZoneId[id]!;
-        var result = await maskClient.deleteMask(token);
+        CameraResult<void>? result;
+        if (!preferWan) result = await maskClient.deleteMask(token);
         if (result is! CameraSuccess && wanMaskClient != null) {
           result = await wanMaskClient.deleteMask(token);
         }
@@ -393,13 +429,16 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
         final polygon = _zoneToPolygon(zone.rect);
         final existingToken = _maskTokenByZoneId[zone.id];
         if (existingToken != null) {
-          var result = await maskClient.setMask(
-            token: existingToken,
-            polygon: polygon,
-            enabled: true,
-            type: maskType,
-            color: maskColor,
-          );
+          CameraResult<void>? result;
+          if (!preferWan) {
+            result = await maskClient.setMask(
+              token: existingToken,
+              polygon: polygon,
+              enabled: true,
+              type: maskType,
+              color: maskColor,
+            );
+          }
           if (result is! CameraSuccess && wanMaskClient != null) {
             result = await wanMaskClient.setMask(
               token: existingToken,
@@ -411,12 +450,15 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
           }
           if (result is! CameraSuccess) masksOk = false;
         } else {
-          var result = await maskClient.createMask(
-            polygon: polygon,
-            enabled: true,
-            type: maskType,
-            color: maskColor,
-          );
+          CameraResult<String>? result;
+          if (!preferWan) {
+            result = await maskClient.createMask(
+              polygon: polygon,
+              enabled: true,
+              type: maskType,
+              color: maskColor,
+            );
+          }
           // WAN's setMask (not a separate createMask) handles creation too
           // — an empty/omitted token creates a new mask, per its own doc.
           if (result is! CameraSuccess && wanMaskClient != null) {

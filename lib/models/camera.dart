@@ -178,6 +178,7 @@ class Camera {
     this.thingName,
     this.wanLiveViewCapable,
     this.wanCommandCapable,
+    this.lastKnownWan,
     this.sirenCapable,
     this.spotlightCapable,
     this.warningCapable,
@@ -356,6 +357,19 @@ class Camera {
   final bool? spotlightCapable;
   final bool? warningCapable;
 
+  /// Which transport the live-view session for this camera most recently
+  /// confirmed a real connection over — `true` = WAN, `false` = LAN, `null`
+  /// = not yet known (never successfully connected this app session).
+  /// Written only by `CameraLiveScreen` on an actual successful connect
+  /// (see `_syncLastKnownTransport`), per
+  /// `.claude/rules/mobile-app-screen-conventions.md`'s "Whatever component
+  /// negotiates live view should track the most recently confirmed
+  /// transport and thread it down to any settings screen opened from
+  /// there." Every settings screen reads this (already has `camera` in
+  /// hand) to call the correct transport directly instead of always trying
+  /// LAN first and paying its full timeout before falling back to WAN.
+  final bool? lastKnownWan;
+
   /// Builds a [CameraConnection] from this camera's saved credentials, or
   /// null if it doesn't have any yet (see [host]'s doc).
   CameraConnection? get connection {
@@ -444,6 +458,7 @@ class Camera {
     String? thingName,
     bool? wanLiveViewCapable,
     bool? wanCommandCapable,
+    bool? lastKnownWan,
     bool? sirenCapable,
     bool? spotlightCapable,
     bool? warningCapable,
@@ -534,6 +549,7 @@ class Camera {
       thingName: thingName ?? this.thingName,
       wanLiveViewCapable: wanLiveViewCapable ?? this.wanLiveViewCapable,
       wanCommandCapable: wanCommandCapable ?? this.wanCommandCapable,
+      lastKnownWan: lastKnownWan ?? this.lastKnownWan,
       sirenCapable: sirenCapable ?? this.sirenCapable,
       spotlightCapable: spotlightCapable ?? this.spotlightCapable,
       warningCapable: warningCapable ?? this.warningCapable,

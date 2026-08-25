@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
@@ -53,6 +55,7 @@ class _LineCrossingScreenState extends State<LineCrossingScreen> {
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+  Uint8List? _wanPreviewBytes;
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -90,11 +93,25 @@ class _LineCrossingScreenState extends State<LineCrossingScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -173,6 +190,7 @@ class _LineCrossingScreenState extends State<LineCrossingScreen> {
                         _markDirty(() => _lineStart = offset),
                     onLineEndChanged: (offset) =>
                         _markDirty(() => _lineEnd = offset),
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   Align(
@@ -273,6 +291,7 @@ class _LineCrossingPreview extends StatelessWidget {
     required this.lineEnd,
     required this.onLineStartChanged,
     required this.onLineEndChanged,
+    this.overrideBytes,
   });
 
   final Key settingsKey;
@@ -281,6 +300,7 @@ class _LineCrossingPreview extends StatelessWidget {
   final Offset lineEnd;
   final ValueChanged<Offset> onLineStartChanged;
   final ValueChanged<Offset> onLineEndChanged;
+  final Uint8List? overrideBytes;
 
   @override
   Widget build(BuildContext context) {
@@ -294,7 +314,7 @@ class _LineCrossingPreview extends StatelessWidget {
           child: Stack(
             key: settingsKey,
             children: [
-              CameraImage(camera: camera),
+              CameraImage(camera: camera, overrideBytes: overrideBytes),
               Positioned.fill(
                 child: LayoutBuilder(
                   builder: (context, constraints) {

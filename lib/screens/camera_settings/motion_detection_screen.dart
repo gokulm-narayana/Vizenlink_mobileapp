@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
@@ -38,6 +40,7 @@ class _MotionDetectionScreenState extends State<MotionDetectionScreen> {
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+  Uint8List? _wanPreviewBytes;
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -75,11 +78,25 @@ class _MotionDetectionScreenState extends State<MotionDetectionScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -149,6 +166,7 @@ class _MotionDetectionScreenState extends State<MotionDetectionScreen> {
                     key: ValueKey(_previewReloadKey),
                     settingsKey: const Key('MOTION-005'),
                     camera: _camera,
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   RefreshPreviewButton(

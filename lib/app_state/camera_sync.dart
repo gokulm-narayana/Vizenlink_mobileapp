@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -15,8 +16,33 @@ import 'preview_key_store.dart';
 /// [CameraInfoScreen]'s manual "Sync from camera" button, so both stay in
 /// sync with the same fields/behavior.
 ///
+/// **Device identity/info/timezone fall back to WAN** (`WanDeviceIdentityClient`)
+/// when the LAN attempt above fails and this camera is WAN-eligible — added
+/// after this previously being LAN-only meant "Sync from camera" failed on
+/// every single field whenever the phone was off the camera's LAN, which
+/// read as a permanent error rather than the normal off-LAN case every
+/// other screen in this app already handles via LAN-then-WAN fallback.
+/// Network info (MAC/local IP) and capabilities have no WAN equivalent —
+/// network info is inherently LAN-topology data, and every
+/// `GetCapabilities`-sourced field is LAN-only per `IotCommandClient`'s own
+/// doc — so those two stay LAN-only, same as before. Snapshot also stays
+/// LAN-only: `WanPreviewSnapshotClient`'s doc is explicit its bytes must
+/// never be persisted as a kept thumbnail.
+///
 /// Returns the human-readable failure reasons for whichever calls didn't
 /// succeed (empty list = fully synced) — callers decide how to surface that.
+///
+/// **Cheap LAN reachability probe first** (`WebRtcUriClient.checkReachable`
+/// — the same unauthenticated, ~3s single round trip `pingCameraReachability`
+/// already uses), rather than firing all 6 heavier ONVIF/REST calls blind
+/// every time. When the phone is off this camera's LAN, this skips straight
+/// to the WAN fallback below instead of eating each of those 6 calls' own
+/// timeout first (previously the visible cause of "Sync from camera" taking
+/// up to ~58s and surfacing a wall of per-field failures off-LAN: a ~10s LAN
+/// burst always attempted first, then two *sequential* WAN calls at up to
+/// ~24s each — `IotCommandClient`'s own one-shot retry on top of this
+/// class's 12s timeout). The WAN fallback itself now also runs in parallel
+/// (`Future.wait`) instead of sequentially, for the same reason.
 Future<List<String>> syncCameraFromDevice({
   required HomesController homesController,
   required String cameraId,
@@ -25,27 +51,54 @@ Future<List<String>> syncCameraFromDevice({
   final device = OnvifDeviceClient(connection);
   final nuraeye = NuraeyeClient(connection);
   try {
-    final results = await Future.wait([
-      device.getDeviceInformation(),
-      device.getDeviceIdentity(),
-      device.getNetworkInterfaceInfo(),
-      CapabilitiesClient(nuraeye).getCapabilities(),
-      device.getSystemDateAndTime(),
-      SnapshotClient(connection).getSnapshot(),
-    ]);
-    final infoResult = results[0] as CameraResult<DeviceInformation>;
-    final identityResult = results[1] as CameraResult<DeviceIdentity>;
-    final netResult = results[2] as CameraResult<NetworkInterfaceInfo>;
-    final capsResult = results[3] as CameraResult<CameraCapabilities>;
-    final dateTimeResult = results[4] as CameraResult<DeviceDateTime>;
-    final snapshotResult = results[5] as CameraResult<Uint8List>;
+    // Known WAN (Camera.lastKnownWan) skips even the cheap probe below —
+    // an instant decision beats a ~3s round trip when we already know the
+    // answer from the live-view session that's been open on this camera.
+    final knownWan = _findCamera(homesController, cameraId)?.lastKnownWan;
+    final lanReachable = knownWan == true
+        ? false
+        : await WebRtcUriClient(nuraeye).checkReachable();
+
+    final CameraResult<DeviceInformation> infoResult;
+    final CameraResult<DeviceIdentity> identityResult;
+    final CameraResult<NetworkInterfaceInfo> netResult;
+    final CameraResult<CameraCapabilities> capsResult;
+    final CameraResult<DeviceDateTime> dateTimeResult;
+    final CameraResult<Uint8List> snapshotResult;
+    if (lanReachable) {
+      final results = await Future.wait([
+        device.getDeviceInformation(),
+        device.getDeviceIdentity(),
+        device.getNetworkInterfaceInfo(),
+        CapabilitiesClient(nuraeye).getCapabilities(),
+        device.getSystemDateAndTime(),
+        SnapshotClient(connection).getSnapshot(),
+      ]);
+      infoResult = results[0] as CameraResult<DeviceInformation>;
+      identityResult = results[1] as CameraResult<DeviceIdentity>;
+      netResult = results[2] as CameraResult<NetworkInterfaceInfo>;
+      capsResult = results[3] as CameraResult<CameraCapabilities>;
+      dateTimeResult = results[4] as CameraResult<DeviceDateTime>;
+      snapshotResult = results[5] as CameraResult<Uint8List>;
+    } else {
+      // Known unreachable on LAN — skip straight to the WAN fallback below
+      // rather than waiting out each call's own LAN timeout first. Network
+      // info/capabilities/snapshot have no WAN equivalent (see this
+      // function's own doc), so those three stay a plain timeout.
+      infoResult = const CameraTimeout<DeviceInformation>();
+      identityResult = const CameraTimeout<DeviceIdentity>();
+      netResult = const CameraTimeout<NetworkInterfaceInfo>();
+      capsResult = const CameraTimeout<CameraCapabilities>();
+      dateTimeResult = const CameraTimeout<DeviceDateTime>();
+      snapshotResult = const CameraTimeout<Uint8List>();
+    }
 
     final failures = <String>[];
     DeviceInformation? info;
     DeviceIdentity? identity;
     NetworkInterfaceInfo? net;
     CameraCapabilities? caps;
-    DeviceDateTime? dateTime;
+    String? timezone;
     String? thumbnailPath;
 
     switch (identityResult) {
@@ -82,12 +135,52 @@ Future<List<String>> syncCameraFromDevice({
     }
     switch (dateTimeResult) {
       case CameraSuccess(:final value):
-        dateTime = value;
+        timezone = value.timezone;
       case CameraFailure(:final reason):
         failures.add('timezone ($reason)');
       case CameraTimeout():
         failures.add('timezone (timed out)');
     }
+
+    final wanThingName = connection.thingName;
+    if (connection.wanCommandCapable != false &&
+        wanThingName != null &&
+        (info == null || identity == null || timezone == null)) {
+      final wan = WanDeviceIdentityClient(wanThingName);
+      // Both requested in parallel (previously sequential — awaiting
+      // getDeviceInfo() before even starting getDeviceIdentity() could
+      // double the worst-case wait, up to ~24s each with
+      // IotCommandClient's own built-in one-shot retry on top of this
+      // class's 12s timeout).
+      final needsInfo = info == null;
+      final needsIdentity = identity == null || timezone == null;
+      final wanResults = await Future.wait([
+        needsInfo ? wan.getDeviceInfo() : Future.value(null),
+        needsIdentity ? wan.getDeviceIdentity() : Future.value(null),
+      ]);
+      final wanInfoResult = wanResults[0] as CameraResult<DeviceInformation>?;
+      final wanIdentityResult =
+          wanResults[1]
+              as CameraResult<
+                ({String name, String location, String timezone})
+              >?;
+
+      if (wanInfoResult case CameraSuccess(:final value)) {
+        info = value;
+        failures.removeWhere((f) => f.startsWith('device info'));
+      }
+      if (wanIdentityResult case CameraSuccess(:final value)) {
+        if (identity == null) {
+          identity = DeviceIdentity(name: value.name, location: value.location);
+          failures.removeWhere((f) => f.startsWith('name'));
+        }
+        if (timezone == null) {
+          timezone = value.timezone;
+          failures.removeWhere((f) => f.startsWith('timezone'));
+        }
+      }
+    }
+
     switch (snapshotResult) {
       case CameraSuccess(:final value):
         thumbnailPath = await _saveSnapshotLocally(
@@ -114,18 +207,21 @@ Future<List<String>> syncCameraFromDevice({
         : null;
 
     // Reachability ("ping") for [Camera.isOnline]: this camera is online if
-    // *any* of the LAN calls above actually got a response — a single
+    // *any* call above actually got a response, LAN or WAN — a single
     // failed call (e.g. one ONVIF service down) doesn't mean the whole
     // device is unreachable, but every one of them failing/timing out does.
     // Always written below, even when every call failed, so a camera that's
     // gone offline actually gets marked offline instead of the app trusting
-    // whatever isOnline was set to at onboarding forever.
+    // whatever isOnline was set to at onboarding forever. Uses the resolved
+    // values (LAN or WAN) rather than just the LAN results, so a camera
+    // reachable only over WAN is correctly marked online instead of
+    // "offline" just because it's off the phone's current LAN.
     final reachable =
-        infoResult is CameraSuccess ||
-        identityResult is CameraSuccess ||
-        netResult is CameraSuccess ||
-        capsResult is CameraSuccess ||
-        dateTimeResult is CameraSuccess ||
+        info != null ||
+        identity != null ||
+        net != null ||
+        caps != null ||
+        timezone != null ||
         snapshotResult is CameraSuccess;
 
     homesController.updateCamera(
@@ -156,18 +252,18 @@ Future<List<String>> syncCameraFromDevice({
         // camera's own GetSupportedTimezones catalog (same code
         // vocabulary) once a connection is available, so this is never
         // compared against IANA strings.
-        timezone: dateTime?.timezone,
+        timezone: timezone,
         thumbnailUrl: thumbnailPath,
       ),
     );
 
-    // Opportunistic, once-per-camera registration of this device's WAN
-    // preview-snapshot public key (see PreviewKeyStore's doc) — needs a
+    // Opportunistic, once-per-camera fetch of the camera's WAN
+    // preview-snapshot shared key (see PreviewKeyStore's doc) — needs a
     // reachable LAN connection and a resolved thingName, both of which this
     // sync either already has or just confirmed.
     final resolvedThingName = info?.serialNumber ?? connection.thingName;
     if (reachable && resolvedThingName != null) {
-      await _registerPreviewKeyIfNeeded(connection, resolvedThingName);
+      await _fetchPreviewKeyIfNeeded(connection, resolvedThingName);
     }
 
     return failures;
@@ -177,27 +273,28 @@ Future<List<String>> syncCameraFromDevice({
   }
 }
 
-/// Registers this device's preview public key with the camera
-/// (`RegisterPreviewKey`, LAN-only) if it hasn't been already — see
+/// Fetches the camera's shared preview-snapshot key (`GetPreviewKey`,
+/// LAN-only) and caches it locally if it hasn't been already — see
 /// [PreviewKeyStore]'s doc comment for the full picture. Best-effort:
 /// failures are silently skipped, same reasoning as every other
 /// non-critical field in [syncCameraFromDevice] — the next sync/reachability
-/// check simply tries again since nothing gets marked registered on failure.
-Future<void> _registerPreviewKeyIfNeeded(
+/// check simply tries again since nothing gets cached on failure.
+Future<void> _fetchPreviewKeyIfNeeded(
   CameraConnection connection,
   String thingName,
 ) async {
-  if (await PreviewKeyStore.instance.isRegistered(thingName)) return;
-  final publicKeyBase64 = await PreviewKeyStore.instance
-      .getOrCreatePublicKeyBase64();
+  if (await PreviewKeyStore.instance.hasSharedKey(thingName)) return;
   final nuraeye = NuraeyeClient(connection);
   try {
-    final result = await nuraeye.call(
-      'RegisterPreviewKey',
-      params: {'public_key': publicKeyBase64},
-    );
-    if (result is CameraSuccess) {
-      await PreviewKeyStore.instance.markRegistered(thingName);
+    final result = await nuraeye.call('GetPreviewKey');
+    if (result case CameraSuccess(:final value)) {
+      final keyBase64 = value['key'];
+      if (keyBase64 is String) {
+        await PreviewKeyStore.instance.storeSharedKey(
+          thingName,
+          base64Decode(keyBase64),
+        );
+      }
     }
   } finally {
     nuraeye.close();
@@ -217,27 +314,33 @@ Future<bool> refreshCameraSnapshot({
   final client = SnapshotClient(connection);
   try {
     final result = await client.getSnapshot();
-    // A successful snapshot fetch doubles as this camera's reachability
-    // ping — always recorded, on both success and failure, so a camera
-    // that's gone offline gets marked offline instead of the app trusting
-    // whatever isOnline was last set to (see syncCameraFromDevice's doc for
-    // the fuller version of this same reasoning).
+    // A successful snapshot fetch is a real, positive reachability signal —
+    // always recorded. **A failure is deliberately NOT recorded as
+    // offline** (changed from unconditional both-ways writes): this call is
+    // LAN-only, with no WAN fallback, so treating its failure as "offline"
+    // disagreed with pingCameraReachability's LAN-then-WAN check (which
+    // does fall back) whenever the phone is off this camera's LAN but the
+    // camera is still reachable over WAN — the two calls fighting over the
+    // same flag produced a visible flicker (this timer flips it false,
+    // pingCameraReachability's next tick flips it back true). Offline is
+    // now exclusively pingCameraReachability's call to make; a failed
+    // snapshot here just means no fresh thumbnail this round, reflected via
+    // this function's own `bool` return, not the shared online/offline flag.
     final reachable = result is CameraSuccess;
-    homesController.updateCamera(
-      cameraId,
-      (current) => current.copyWith(
-        isOnline: reachable,
-        lastSeen: reachable ? DateTime.now() : null,
-      ),
-    );
-    // Same opportunistic registration syncCameraFromDevice does — this is a
-    // much more frequently-successful LAN touchpoint (every manual "Refresh
+    if (reachable) {
+      homesController.updateCamera(
+        cameraId,
+        (current) => current.copyWith(isOnline: true, lastSeen: DateTime.now()),
+      );
+    }
+    // Same opportunistic fetch syncCameraFromDevice does — this is a much
+    // more frequently-successful LAN touchpoint (every manual "Refresh
     // preview" tap, not just onboarding/"Sync from camera"), so a camera
     // whose full sync never happened to land while reachable still gets its
-    // WAN preview key registered the first time this lighter call succeeds.
+    // WAN preview key fetched the first time this lighter call succeeds.
     final thingName = connection.thingName;
     if (reachable && thingName != null) {
-      await _registerPreviewKeyIfNeeded(connection, thingName);
+      await _fetchPreviewKeyIfNeeded(connection, thingName);
     }
     if (result case CameraSuccess(:final value)) {
       final path = await _saveSnapshotLocally(
@@ -262,15 +365,38 @@ Future<bool> refreshCameraSnapshot({
   }
 }
 
+/// Per-camera WAN-fallback backoff state for [pingCameraReachability] — the
+/// Dashboard's reachability timer calls this for every camera on every
+/// ~15s tick. Without this, a camera that's neither reachable on LAN nor
+/// actually answering on WAN incurs a full WAN round trip (`~10s`, since
+/// `IotCommandClient` has its own built-in one-shot retry on top of this
+/// call's own 5s timeout) every single cycle, indefinitely, for as long as
+/// the Dashboard stays open — real-world impact: with even one or two
+/// cameras stuck in that state, the app can feel constantly laggy while
+/// nothing ever actually recovers. After [_wanBackoffThreshold] consecutive
+/// WAN failures for a camera, skip the WAN attempt for [_wanBackoffDuration]
+/// before trying again instead of paying full cost every cycle. Module-level
+/// (not per-`HomesController`) since this is purely a rate-limit on outbound
+/// calls, not app state that needs to survive a restart or be shared beyond
+/// this process.
+final _wanFailureStreak = <String, int>{};
+final _wanBackoffUntil = <String, DateTime>{};
+const _wanBackoffThreshold = 2;
+const _wanBackoffDuration = Duration(minutes: 2);
+
 /// Cheap reachability-only probe for [cameraId] — updates `isOnline`/
-/// `lastSeen` the same way [refreshCameraSnapshot] does, but via a single
-/// unauthenticated LAN round trip (`WebRtcUriClient.checkReachable()`'s
-/// `areYouNuraeyeDevice`) instead of fetching a full snapshot image. Meant
-/// to run on a much tighter timer (e.g. the Dashboard's short-interval
-/// online/offline check) than the heavier, image-fetching
-/// [refreshCameraSnapshot] — polling every camera's full snapshot every few
-/// seconds would waste bandwidth for no benefit beyond the reachability bit
-/// this already gets for a fraction of the cost.
+/// `lastSeen`, via a single unauthenticated LAN round trip
+/// (`WebRtcUriClient.checkReachable()`'s `areYouNuraeyeDevice`) instead of
+/// fetching a full snapshot image. Meant to run on a much tighter timer
+/// (e.g. the Dashboard's short-interval online/offline check) than the
+/// heavier, image-fetching [refreshCameraSnapshot] — polling every camera's
+/// full snapshot every few seconds would waste bandwidth for no benefit
+/// beyond the reachability bit this already gets for a fraction of the
+/// cost. **The periodic/automatic path that's allowed to write `isOnline:
+/// false`** — [refreshCameraSnapshot] only ever writes `true` (see its own
+/// doc) since, unlike this function and [syncCameraFromDevice], it has no
+/// WAN fallback; disagreeing on that point between the two produced a
+/// visible online/offline flicker.
 ///
 /// Falls back to a cheap WAN read (`WanDeviceIdentityClient.getDeviceIdentity`
 /// — a real round trip, but the smallest one available on that transport)
@@ -278,7 +404,8 @@ Future<bool> refreshCameraSnapshot({
 /// otherwise a camera that's simply off the phone's current LAN (not
 /// actually offline) would be wrongly marked offline, same reasoning as
 /// live view's own LAN-then-WAN transport selection
-/// (`STREAMING_GUIDE.md` §1).
+/// (`STREAMING_GUIDE.md` §1). See [_wanFailureStreak]/[_wanBackoffUntil]'s
+/// doc for why that fallback is itself rate-limited after repeated failures.
 Future<void> pingCameraReachability({
   required HomesController homesController,
   required String cameraId,
@@ -292,14 +419,33 @@ Future<void> pingCameraReachability({
     nuraeye.close();
   }
 
-  if (!reachable) {
+  if (reachable) {
+    _wanFailureStreak.remove(cameraId);
+    _wanBackoffUntil.remove(cameraId);
+  } else {
     final thingName = connection.thingName;
-    if (thingName != null) {
+    final backoffUntil = _wanBackoffUntil[cameraId];
+    final inBackoff =
+        backoffUntil != null && DateTime.now().isBefore(backoffUntil);
+    if (thingName != null && !inBackoff) {
       final result = await WanDeviceIdentityClient(
         thingName,
       ).getDeviceIdentity(timeout: const Duration(seconds: 5));
       reachable = result is CameraSuccess;
+      if (reachable) {
+        _wanFailureStreak.remove(cameraId);
+        _wanBackoffUntil.remove(cameraId);
+      } else {
+        final streak = (_wanFailureStreak[cameraId] ?? 0) + 1;
+        _wanFailureStreak[cameraId] = streak;
+        if (streak >= _wanBackoffThreshold) {
+          _wanBackoffUntil[cameraId] = DateTime.now().add(_wanBackoffDuration);
+        }
+      }
     }
+    // Else: LAN failed and either this camera has no thingName, or it's
+    // currently in its WAN backoff window — `reachable` stays false without
+    // spending another WAN round trip.
   }
 
   final current = _findCamera(homesController, cameraId);

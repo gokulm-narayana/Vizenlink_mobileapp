@@ -67,8 +67,23 @@ enum TalkStatus { idle, connecting, talking, busy, error }
 /// app's own development (the two connections evicted each other in a
 /// loop).
 class LiveViewController extends ChangeNotifier {
-  LiveViewController(this.connection, {http.Client? httpClient})
-    : _http = httpClient ?? http.Client();
+  /// [initialProfile] — one of [_profileLadder] (`Profile_1`/`Profile_2`/
+  /// `Profile_3`), defaulting to the highest-resolution `Profile_1` if
+  /// omitted. Lets a caller that already knows it only has a small display
+  /// budget for this session (e.g. a Multiview grid tile) start below full
+  /// resolution instead of connecting at `Profile_1` and immediately
+  /// stepping down — the automatic ladder in [_maybeStepDownProfile]/
+  /// [_maybeStepUpProfile] still applies on top of whatever this starts at.
+  LiveViewController(
+    this.connection, {
+    http.Client? httpClient,
+    String? initialProfile,
+    this.forceTransport,
+  }) : _http = httpClient ?? http.Client(),
+       _profileToken =
+           (initialProfile != null && _profileLadder.contains(initialProfile))
+           ? initialProfile
+           : _profileLadder.first;
 
   final CameraConnection connection;
   final http.Client _http;
@@ -78,7 +93,59 @@ class LiveViewController extends ChangeNotifier {
   /// drop — see STREAMING_GUIDE.md §2.4.
   static const _iceDisconnectGrace = Duration(seconds: 5);
 
-  static const _profileToken = 'Profile_1';
+  /// How long the LAN discovery probe (`GetWebRtcUri`) waits before deciding
+  /// the camera isn't reachable on this network — tuned against real WiFi
+  /// testing (matches the sibling `nuraeye-rt` app's `lanProbeTimeout`): long
+  /// enough to absorb normal same-subnet variance, short enough that a phone
+  /// genuinely off the camera's LAN doesn't wait needlessly before WAN is
+  /// even attempted.
+  static const _lanProbeTimeout = Duration(seconds: 4);
+
+  /// How many times [_connectLan] retries `GetWebRtcUri` before falling
+  /// through to [_handleLanExhausted]'s reachability recheck.
+  static const _maxLanReconnectAttempts = 1;
+  static const _lanRetryPollInterval = Duration(seconds: 1);
+
+  /// Once `GetWebRtcUri` has exhausted its retries, how long the independent
+  /// `AreYouNuraeyeDevice` reachability probe waits — distinguishes "camera
+  /// isn't on this network at all" (falls to WAN) from "camera IS on this
+  /// network but the signaling call itself glitched" (retries LAN instead of
+  /// wrongly falling back to the much-higher-latency WAN path).
+  static const _lanReachabilityCheckTimeout = Duration(seconds: 5);
+
+  /// WebRTC signaling POST timeout — tightened from an earlier unbounded/10s
+  /// value; a genuinely-unreachable-mid-negotiation camera should fail out
+  /// quickly enough for reconnect/fallback logic to actually kick in.
+  static const _webrtcSignalingTimeout = Duration(seconds: 5);
+
+  /// Bound on waiting for ICE gathering to complete before sending the offer
+  /// — see [_negotiate]'s doc comment for why this step exists at all.
+  static const _iceGatheringTimeout = Duration(seconds: 3);
+
+  /// `Profile_1` (highest resolution) down to `Profile_3` (lowest) — this
+  /// firmware's fixed, compile-time profile set. [_profileToken] steps down
+  /// this ladder on sustained LAN trouble and back up once the link recovers
+  /// — see [_maybeStepDownProfile]/[_maybeStepUpProfile].
+  static const _profileLadder = ['Profile_1', 'Profile_2', 'Profile_3'];
+  String _profileToken;
+
+  /// Recent ICE drops within [_lanTroubleWindow] — [_lanTroubleThreshold] or
+  /// more within that window steps the resolution ladder down a tier instead
+  /// of just reconnecting at the same (evidently struggling) profile.
+  final List<DateTime> _recentLanDrops = [];
+  static const _lanTroubleWindow = Duration(minutes: 2);
+  static const _lanTroubleThreshold = 3;
+
+  /// Stats-based trouble detection — catches a session that stays nominally
+  /// ICE-`connected` while actually stalled/starved, which ICE state alone
+  /// never sees. See [_pollBitrate].
+  int _stallPollCount = 0;
+  int _lowBitratePollCount = 0;
+  int _healthyPollCount = 0;
+  static const _stallPollThreshold = 3;
+  static const _lowBitrateThresholdKbps = 100.0;
+  static const _lowBitratePollThreshold = 3;
+  static const _healthyPollThreshold = 10;
 
   LiveViewStatus status = LiveViewStatus.connecting;
   String? errorMessage;
@@ -109,6 +176,7 @@ class LiveViewController extends ChangeNotifier {
   Timer? _statsTimer;
   int? _lastStatsBytesReceived;
   double? _lastStatsTimestampMs;
+  int? _lastFramesDecoded;
 
   static const _statsPollInterval = Duration(seconds: 2);
 
@@ -128,6 +196,14 @@ class LiveViewController extends ChangeNotifier {
   /// this, not on [status] alone.
   LiveViewTransport transport = LiveViewTransport.lan;
 
+  /// Test-only manual transport override (see `DebugTransportOverride`'s
+  /// doc) — `null` is normal automatic LAN-first/WAN-fallback behavior.
+  /// [LiveViewTransport.wan] skips the LAN attempt entirely in [connect]
+  /// and stops [_checkWanHealth] from ever switching back to LAN just
+  /// because the camera happens to be reachable there; [LiveViewTransport.lan]
+  /// stops [connect] from falling back to WAN when the LAN attempt fails.
+  final LiveViewTransport? forceTransport;
+
   /// Non-null only while [transport] is [LiveViewTransport.wan] and a
   /// session is live — plays the resolved HLS URL (STREAMING_GUIDE.md §3
   /// step 4). Owned by this controller so it tears down alongside
@@ -145,6 +221,19 @@ class LiveViewController extends ChangeNotifier {
   /// STREAMING_GUIDE.md §5 — poll cadence for `GetCloudStreamingStatus`
   /// while a WAN session is playing.
   static const _wanHealthCheckInterval = Duration(seconds: 10);
+
+  /// The URI [wanVideoController] is currently (or was last) playing —
+  /// distinct from the health monitor's `GetCloudStreamingStatus` check,
+  /// this backs [_pollWanStall]'s local-first recovery: a purely phone-side
+  /// HLS hiccup (decoder stall, a blip to the CloudFront/S3 endpoint) with a
+  /// perfectly healthy camera-side stream doesn't need a fresh AWS resolve,
+  /// just a local re-init against the same still-valid URL.
+  Uri? _lastWanPlaybackUri;
+  Timer? _wanStallTimer;
+  Duration? _lastWanPosition;
+  int _wanStallPollCount = 0;
+  static const _wanStallPollInterval = Duration(seconds: 3);
+  static const _wanStallThreshold = 3;
 
   /// Camera reports this via `GetCapabilities` at onboarding — cached on
   /// [CameraConnection]. An unknown (`null`) value fails open (treated as
@@ -167,7 +256,9 @@ class LiveViewController extends ChangeNotifier {
   /// Orchestrates transport selection per STREAMING_GUIDE.md §1: try LAN
   /// first, only fall back to WAN after a genuine LAN failure (never by
   /// comparing IP addresses or guessing from network type), and skip WAN
-  /// entirely for a camera known not to support it ([_wanEligible]).
+  /// entirely for a camera known not to support it ([_wanEligible]). See
+  /// [forceTransport]'s doc for the test-only override this defers to
+  /// before any of that normal logic runs.
   Future<void> connect() async {
     if (_disposed) return;
     _autoRetryTimer?.cancel();
@@ -176,8 +267,22 @@ class LiveViewController extends ChangeNotifier {
     errorMessage = null;
     notifyListeners();
 
+    if (forceTransport == LiveViewTransport.wan) {
+      if (_wanEligible && await _connectWan()) return;
+      if (_disposed) return;
+      _fail(
+        errorMessage ?? 'Could not connect to the camera over WAN (forced)',
+      );
+      return;
+    }
+
     if (await _connectLan()) return;
     if (_disposed) return;
+
+    if (forceTransport == LiveViewTransport.lan) {
+      _fail(errorMessage ?? 'Could not connect to the camera (forced LAN)');
+      return;
+    }
 
     if (_wanEligible && await _connectWan()) return;
     if (_disposed) return;
@@ -199,11 +304,14 @@ class LiveViewController extends ChangeNotifier {
     await [Permission.microphone, Permission.bluetoothConnect].request();
   }
 
-  /// LAN WebRTC path (STREAMING_GUIDE.md §2). Returns true and leaves
-  /// [status] as [LiveViewStatus.connected] on success; on failure, sets
-  /// [errorMessage] and returns false without touching [status] — the
-  /// caller ([connect]) decides whether a WAN attempt follows or this is
-  /// the final failure.
+  /// LAN WebRTC path (STREAMING_GUIDE.md §2). Retries `GetWebRtcUri` up to
+  /// [_maxLanReconnectAttempts] times before falling through to
+  /// [_handleLanExhausted]'s independent reachability recheck — a single
+  /// transient failure no longer sends this straight to the much
+  /// higher-latency WAN path. Returns true and leaves [status] as
+  /// [LiveViewStatus.connected] on success; on failure, sets [errorMessage]
+  /// and returns false without touching [status] — the caller ([connect])
+  /// decides whether a WAN attempt follows or this is the final failure.
   Future<bool> _connectLan() async {
     await _ensureRuntimePermissions();
     if (_disposed) return false;
@@ -214,24 +322,78 @@ class LiveViewController extends ChangeNotifier {
     }
     if (_disposed) return false;
 
+    return _tryLan(attempt: 0);
+  }
+
+  Future<bool> _tryLan({
+    required int attempt,
+    bool afterReachabilityRecheck = false,
+  }) async {
+    if (_disposed) return false;
+
     final nuraeye = NuraeyeClient(connection);
-    final result = await WebRtcUriClient(nuraeye).getWebRtcUri(_profileToken);
+    final result = await WebRtcUriClient(
+      nuraeye,
+    ).getWebRtcUri(_profileToken, timeout: _lanProbeTimeout);
     nuraeye.close();
     if (_disposed) return false;
 
     final WebRtcTarget target;
+    final String failureReason;
     switch (result) {
       case CameraSuccess(:final value):
         target = value;
+        return _negotiate(target.signalingUrl, talk: false);
       case CameraFailure(:final reason):
-        errorMessage = reason;
-        return false;
+        failureReason = reason;
       case CameraTimeout():
-        errorMessage = 'Timed out reaching the camera';
-        return false;
+        failureReason = 'Timed out reaching the camera';
     }
 
-    return _negotiate(target.signalingUrl, talk: false);
+    if (attempt < _maxLanReconnectAttempts) {
+      await Future.delayed(_lanRetryPollInterval);
+      if (_disposed) return false;
+      return _tryLan(
+        attempt: attempt + 1,
+        afterReachabilityRecheck: afterReachabilityRecheck,
+      );
+    }
+    // Already gave this one extra shot after confirming the camera was
+    // reachable — stop here and let the outer connect()/auto-retry cadence
+    // (not a tight recursive loop) handle any further attempts.
+    if (afterReachabilityRecheck) {
+      errorMessage = failureReason;
+      return false;
+    }
+    return _handleLanExhausted(failureReason);
+  }
+
+  /// `GetWebRtcUri` has exhausted its retries — before treating that as
+  /// "camera isn't on this network" and falling to WAN, confirm that verdict
+  /// with one cheap, independent reachability probe (`AreYouNuraeyeDevice`).
+  /// A camera that's still genuinely on this LAN gets one more LAN attempt
+  /// instead of being needlessly bounced to the much higher-latency WAN path
+  /// on what was actually just a signaling hiccup.
+  Future<bool> _handleLanExhausted(String lanFailureReason) async {
+    if (_disposed) return false;
+
+    final nuraeye = NuraeyeClient(connection);
+    final bool reachable;
+    try {
+      reachable = await WebRtcUriClient(
+        nuraeye,
+      ).checkReachable(timeout: _lanReachabilityCheckTimeout);
+    } finally {
+      nuraeye.close();
+    }
+    if (_disposed) return false;
+
+    if (reachable) {
+      return _tryLan(attempt: 0, afterReachabilityRecheck: true);
+    }
+
+    errorMessage = lanFailureReason;
+    return false;
   }
 
   /// Negotiates a brand-new `RTCPeerConnection` against [signalingUrl] —
@@ -351,13 +513,34 @@ class LiveViewController extends ChangeNotifier {
       }
       await pc.setLocalDescription(offer);
 
+      // This camera's WebRTC signaling is non-trickle — it needs host ICE
+      // candidates already embedded in the offer SDP, not delivered
+      // separately after the fact. Waiting for gathering to finish (bounded,
+      // since gathering host-only candidates with no STUN/TURN is normally
+      // near-instant but nothing guarantees it can never stall) and
+      // re-reading the local description picks those candidates up before
+      // the offer is sent — skipping this step can produce a negotiation
+      // that "connects" at the SDP level but never actually carries media.
+      await _waitForIceGatheringComplete(pc);
+      if (_disposed) {
+        await pc.close();
+        if (localStream != null) {
+          for (final track in localStream.getTracks()) {
+            await track.stop();
+          }
+        }
+        return false;
+      }
+      final localDescription = await pc.getLocalDescription();
+      final offerSdp = localDescription?.sdp ?? offer.sdp;
+
       final response = await _http
           .post(
             signalingUrl,
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'type': 'offer', 'sdp': offer.sdp, 'talk': talk}),
+            body: jsonEncode({'type': 'offer', 'sdp': offerSdp, 'talk': talk}),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(_webrtcSignalingTimeout);
       if (_disposed) return false;
       if (talk) {
         // ignore: avoid_print
@@ -451,6 +634,26 @@ class LiveViewController extends ChangeNotifier {
     }
   }
 
+  /// Bounded wait for [pc]'s ICE gathering to reach
+  /// [RTCIceGatheringState.RTCIceGatheringStateComplete] — see the call site
+  /// in [_negotiate] for why this matters for this camera's non-trickle
+  /// signaling. Proceeding with whatever candidates were gathered so far on
+  /// timeout is standard WebRTC practice, not a degraded state.
+  Future<void> _waitForIceGatheringComplete(RTCPeerConnection pc) async {
+    if (pc.iceGatheringState ==
+        RTCIceGatheringState.RTCIceGatheringStateComplete) {
+      return;
+    }
+    final completer = Completer<void>();
+    pc.onIceGatheringState = (state) {
+      if (state == RTCIceGatheringState.RTCIceGatheringStateComplete &&
+          !completer.isCompleted) {
+        completer.complete();
+      }
+    };
+    await completer.future.timeout(_iceGatheringTimeout, onTimeout: () {});
+  }
+
   void _fail(String reason) {
     status = LiveViewStatus.failed;
     errorMessage = reason;
@@ -505,13 +708,13 @@ class LiveViewController extends ChangeNotifier {
         // drop. See STREAMING_GUIDE.md §2.4.
         _disconnectGraceTimer ??= Timer(_iceDisconnectGrace, () {
           _disconnectGraceTimer = null;
-          if (!_disposed) unawaited(_reconnect());
+          if (!_disposed) unawaited(_recordLanDropAndReconnect());
         });
       case RTCIceConnectionState.RTCIceConnectionStateFailed:
       case RTCIceConnectionState.RTCIceConnectionStateClosed:
         _disconnectGraceTimer?.cancel();
         _disconnectGraceTimer = null;
-        unawaited(_reconnect());
+        unawaited(_recordLanDropAndReconnect());
       case RTCIceConnectionState.RTCIceConnectionStateNew:
       case RTCIceConnectionState.RTCIceConnectionStateChecking:
       case RTCIceConnectionState.RTCIceConnectionStateCount:
@@ -534,6 +737,59 @@ class LiveViewController extends ChangeNotifier {
       // Best-effort — a platform-level audio routing failure shouldn't
       // block the connection itself.
     }
+  }
+
+  String? _nextLowerProfile() {
+    final i = _profileLadder.indexOf(_profileToken);
+    if (i == -1 || i + 1 >= _profileLadder.length) return null;
+    return _profileLadder[i + 1];
+  }
+
+  String? _nextHigherProfile() {
+    final i = _profileLadder.indexOf(_profileToken);
+    if (i <= 0) return null;
+    return _profileLadder[i - 1];
+  }
+
+  /// Funnel for every LAN WebRTC drop (disconnect-grace expiry, or a hard
+  /// `failed`/`closed` state) — counts drops within [_lanTroubleWindow] and,
+  /// once [_lanTroubleThreshold] is hit, steps the resolution ladder down a
+  /// tier instead of just reconnecting at the same (evidently struggling)
+  /// profile. A marginal LAN link then self-heals into something watchable
+  /// rather than repeatedly stalling/reconnecting at full resolution.
+  Future<void> _recordLanDropAndReconnect() async {
+    if (_disposed) return;
+    final now = DateTime.now();
+    _recentLanDrops.removeWhere((t) => now.difference(t) > _lanTroubleWindow);
+    _recentLanDrops.add(now);
+    final lowerProfile = _nextLowerProfile();
+    if (transport == LiveViewTransport.lan &&
+        _recentLanDrops.length >= _lanTroubleThreshold &&
+        lowerProfile != null) {
+      await _switchProfile(lowerProfile);
+      return;
+    }
+    await _reconnect();
+  }
+
+  /// Moves live view to a different rung of [_profileLadder] — one tier
+  /// down on sustained trouble ([_recordLanDropAndReconnect]'s ICE-drop
+  /// counter, or a stats-detected stall/low-bitrate run in [_pollBitrate]),
+  /// or one tier up after a sustained healthy run. Tears down the current
+  /// peer connection and reconnects fresh on [newProfile] via the normal
+  /// [connect] path (which still tries LAN-then-WAN, but LAN will now
+  /// request the new profile).
+  Future<void> _switchProfile(String newProfile) async {
+    if (_disposed || transport != LiveViewTransport.lan) return;
+    _profileToken = newProfile;
+    _recentLanDrops.clear();
+    _healthyPollCount = 0;
+    _stallPollCount = 0;
+    _lowBitratePollCount = 0;
+    status = LiveViewStatus.reconnecting;
+    notifyListeners();
+    await _teardownPeerConnection();
+    if (!_disposed) await connect();
   }
 
   Future<void> _reconnect() async {
@@ -587,6 +843,9 @@ class LiveViewController extends ChangeNotifier {
     _statsTimer = null;
     _lastStatsBytesReceived = null;
     _lastStatsTimestampMs = null;
+    _lastFramesDecoded = null;
+    _stallPollCount = 0;
+    _lowBitratePollCount = 0;
     if (measuredBitrateKbps != null) {
       measuredBitrateKbps = null;
       if (!_disposed) notifyListeners();
@@ -595,7 +854,10 @@ class LiveViewController extends ChangeNotifier {
 
   /// One `getStats()` sample — computes a rate from the delta against the
   /// previous sample, so the first tick after (re)connecting only seeds the
-  /// baseline and doesn't yet update [measuredBitrateKbps].
+  /// baseline and doesn't yet update [measuredBitrateKbps]. Also feeds
+  /// [_maybeAdjustProfile]'s stall/low-bitrate detection — catches a session
+  /// that stays nominally ICE-`connected` while actually stalled/starved,
+  /// which [_handleIceConnectionState] alone never sees.
   Future<void> _pollBitrate() async {
     final pc = _pc;
     if (_disposed || pc == null) return;
@@ -610,6 +872,7 @@ class LiveViewController extends ChangeNotifier {
         final kind = report.values['kind'] ?? report.values['mediaType'];
         if (kind != 'video') continue;
         final bytesReceivedRaw = report.values['bytesReceived'];
+        final framesDecoded = (report.values['framesDecoded'] as num?)?.toInt();
         if (bytesReceivedRaw is! num) continue;
         final bytesReceived = bytesReceivedRaw.toInt();
         final timestampMs = report.timestamp;
@@ -619,18 +882,65 @@ class LiveViewController extends ChangeNotifier {
         _lastStatsBytesReceived = bytesReceived;
         _lastStatsTimestampMs = timestampMs;
 
+        double? bitrateKbps;
         if (prevBytes != null && prevTimestampMs != null) {
           final deltaBytes = bytesReceived - prevBytes;
           final deltaSeconds = (timestampMs - prevTimestampMs) / 1000;
           if (deltaSeconds > 0 && deltaBytes >= 0) {
-            measuredBitrateKbps = (deltaBytes * 8) / 1000 / deltaSeconds;
+            bitrateKbps = (deltaBytes * 8) / 1000 / deltaSeconds;
+            measuredBitrateKbps = bitrateKbps;
             if (!_disposed) notifyListeners();
           }
         }
+
+        final stalled =
+            framesDecoded != null &&
+            _lastFramesDecoded != null &&
+            framesDecoded == _lastFramesDecoded;
+        _lastFramesDecoded = framesDecoded;
+        await _maybeAdjustProfile(stalled: stalled, bitrateKbps: bitrateKbps);
         return;
       }
     } catch (_) {
       // Best-effort — stats aren't critical to the connection itself.
+    }
+  }
+
+  /// Steps [_profileToken] down a tier on a sustained stall/low-bitrate run,
+  /// or up a tier after a sustained healthy run — the counterpart to
+  /// [_recordLanDropAndReconnect]'s ICE-drop-based trigger. Deliberately
+  /// slower to step up than down: a marginal link should recover fast, but
+  /// shouldn't flap back to full resolution on one good sample.
+  Future<void> _maybeAdjustProfile({
+    required bool stalled,
+    required double? bitrateKbps,
+  }) async {
+    if (_disposed || transport != LiveViewTransport.lan) return;
+
+    _stallPollCount = stalled ? _stallPollCount + 1 : 0;
+    final lowBitrate =
+        bitrateKbps != null && bitrateKbps < _lowBitrateThresholdKbps;
+    _lowBitratePollCount = lowBitrate ? _lowBitratePollCount + 1 : 0;
+
+    final troubled =
+        _stallPollCount >= _stallPollThreshold ||
+        _lowBitratePollCount >= _lowBitratePollThreshold;
+    final lowerProfile = _nextLowerProfile();
+    if (troubled && lowerProfile != null) {
+      _healthyPollCount = 0;
+      await _switchProfile(lowerProfile);
+      return;
+    }
+
+    final higherProfile = _nextHigherProfile();
+    if (!troubled && higherProfile != null) {
+      _healthyPollCount++;
+      if (_healthyPollCount >= _healthyPollThreshold) {
+        _healthyPollCount = 0;
+        await _switchProfile(higherProfile);
+      }
+    } else if (!troubled) {
+      _healthyPollCount = 0;
     }
   }
 
@@ -727,6 +1037,7 @@ class LiveViewController extends ChangeNotifier {
     _retryAttempt = 0;
     notifyListeners();
     _startWanHealthMonitor();
+    _startWanStallMonitor();
     return true;
   }
 
@@ -749,6 +1060,7 @@ class LiveViewController extends ChangeNotifier {
     await videoController.play();
     final oldController = wanVideoController;
     wanVideoController = videoController;
+    _lastWanPlaybackUri = uri;
     if (oldController != null) unawaited(oldController.dispose());
     return true;
   }
@@ -761,11 +1073,82 @@ class LiveViewController extends ChangeNotifier {
     );
   }
 
+  void _startWanStallMonitor() {
+    _wanStallTimer?.cancel();
+    _lastWanPosition = null;
+    _wanStallPollCount = 0;
+    _wanStallTimer = Timer.periodic(
+      _wanStallPollInterval,
+      (_) => unawaited(_pollWanStall()),
+    );
+  }
+
+  void _stopWanStallMonitor() {
+    _wanStallTimer?.cancel();
+    _wanStallTimer = null;
+    _lastWanPosition = null;
+    _wanStallPollCount = 0;
+  }
+
+  /// Client-side counterpart to [_checkWanHealth]'s server-side poll — a
+  /// purely phone-side hiccup (decoder stall, a blip to the CloudFront/S3
+  /// endpoint) with a perfectly healthy camera-side stream can leave
+  /// [wanVideoController] frozen while `GetCloudStreamingStatus` keeps
+  /// reporting `active`, since the camera side really is fine. Detects that
+  /// case directly from the player's own state (an error, or playback
+  /// position not advancing) rather than waiting for the next health tick.
+  Future<void> _pollWanStall() async {
+    if (_disposed ||
+        transport != LiveViewTransport.wan ||
+        status != LiveViewStatus.connected) {
+      return;
+    }
+    final controller = wanVideoController;
+    if (controller == null) return;
+    final value = controller.value;
+
+    final stalled =
+        value.hasError ||
+        (value.isPlaying && value.position == _lastWanPosition);
+    _lastWanPosition = value.position;
+
+    _wanStallPollCount = stalled ? _wanStallPollCount + 1 : 0;
+    if (_wanStallPollCount < _wanStallThreshold) return;
+    _wanStallPollCount = 0;
+    await _recoverWanStallLocalFirst();
+  }
+
+  /// Re-inits playback against the same, already-valid HLS URI first — no
+  /// extra AWS round trip needed for a purely local hiccup — only
+  /// escalating to a fresh WAN resolve ([_recoverWanPlayback]) if that
+  /// itself fails.
+  Future<void> _recoverWanStallLocalFirst() async {
+    if (_disposed || transport != LiveViewTransport.wan) return;
+    final uri = _lastWanPlaybackUri;
+    if (uri != null) {
+      for (var attempt = 0; attempt < 3 && !_disposed; attempt++) {
+        if (transport != LiveViewTransport.wan) return;
+        if (await _playWanUrl(uri)) {
+          if (!_disposed) notifyListeners();
+          return;
+        }
+        if (attempt < 2) await Future.delayed(const Duration(seconds: 2));
+      }
+    }
+    if (_disposed || transport != LiveViewTransport.wan) return;
+    unawaited(_recoverWanPlayback());
+  }
+
   /// STREAMING_GUIDE.md §5 — two separate watchers, since WAN has no single
   /// live push signal the way LAN's ICE state is one: a cheap LAN
   /// reachability probe first each tick (switch back to LAN the moment the
   /// phone is back on the camera's network, before spending a paid
-  /// AWS/Lambda call), then `GetCloudStreamingStatus` itself.
+  /// AWS/Lambda call), then `GetCloudStreamingStatus` itself. **Skips the
+  /// LAN probe (and any switch-back) entirely when [forceTransport] is
+  /// [LiveViewTransport.wan]** — the whole point of forcing WAN for a test
+  /// is to exercise it even when LAN is available, so this must never
+  /// switch a forced-WAN session back to LAN just because the camera
+  /// happens to be reachable there.
   Future<void> _checkWanHealth() async {
     if (_disposed ||
         transport != LiveViewTransport.wan ||
@@ -773,17 +1156,19 @@ class LiveViewController extends ChangeNotifier {
       return;
     }
 
-    final nuraeye = NuraeyeClient(connection);
-    final bool reachableOnLan;
-    try {
-      reachableOnLan = await WebRtcUriClient(nuraeye).checkReachable();
-    } finally {
-      nuraeye.close();
-    }
-    if (_disposed || transport != LiveViewTransport.wan) return;
-    if (reachableOnLan) {
-      unawaited(_reconnect());
-      return;
+    if (forceTransport != LiveViewTransport.wan) {
+      final nuraeye = NuraeyeClient(connection);
+      final bool reachableOnLan;
+      try {
+        reachableOnLan = await WebRtcUriClient(nuraeye).checkReachable();
+      } finally {
+        nuraeye.close();
+      }
+      if (_disposed || transport != LiveViewTransport.wan) return;
+      if (reachableOnLan) {
+        unawaited(_reconnect());
+        return;
+      }
     }
 
     final thingName = connection.thingName;
@@ -854,6 +1239,8 @@ class LiveViewController extends ChangeNotifier {
     _wanStreamStarted = false;
     _wanHealthTimer?.cancel();
     _wanHealthTimer = null;
+    _stopWanStallMonitor();
+    _lastWanPlaybackUri = null;
     final controller = wanVideoController;
     wanVideoController = null;
     if (controller != null) {
@@ -1074,6 +1461,7 @@ class LiveViewController extends ChangeNotifier {
     _disconnectGraceTimer?.cancel();
     _autoRetryTimer?.cancel();
     _wanHealthTimer?.cancel();
+    _wanStallTimer?.cancel();
     _statsTimer?.cancel();
     unawaited(_releaseLocalAudio());
     unawaited(_teardownPeerConnection());

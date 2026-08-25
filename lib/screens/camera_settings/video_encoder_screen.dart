@@ -316,15 +316,22 @@ class _VideoEncoderScreenState extends State<VideoEncoderScreen> {
         encoding: _encoderTypeToWire(_encoder),
         cbr: _bitrateMode == CameraBitrateMode.cbr,
       );
-      final result = await client.setVideoEncoderSettings(settings);
+      final thingName = connection.thingName;
+      // Skips the LAN Set attempt entirely when this camera's last
+      // confirmed transport was WAN — see Camera.lastKnownWan's doc.
+      final preferWan = _camera.lastKnownWan == true && thingName != null;
+      CameraResult<void>? result;
+      if (!preferWan) {
+        result = await client.setVideoEncoderSettings(settings);
+      }
       client.close();
 
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention. WAN's
+      // A failed LAN Apply/Set retries over WAN before surfacing an error
+      // (or WAN is called directly when known), per
+      // mobile-app-screen-conventions.md's LAN/WAN convention. WAN's
       // setVideoEncoderSettings returns the applied VideoEncoderSettings
       // rather than void, unlike the LAN client — only its success/failure
       // matters here, not the returned value.
-      final thingName = connection.thingName;
       if (result is CameraSuccess) {
         succeeded = true;
       } else if (thingName != null) {

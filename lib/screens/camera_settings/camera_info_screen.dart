@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../models/home.dart';
 import '../../widgets/glass_card.dart';
@@ -12,6 +13,7 @@ import '../../widgets/gradient_button.dart';
 import '../../widgets/live_status_badges.dart' show formatBitrate;
 import '../../widgets/navigation_leave_guard.dart';
 import '../../widgets/password_form_field.dart';
+import '../../widgets/saving_overlay.dart';
 import 'wifi_config_screen.dart';
 
 const _unassignedRoomLabel = 'Unassigned';
@@ -195,16 +197,43 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     final failures = <String>[];
     final connection = _camera.connection;
 
+    // Compared against [_camera] (the live, current HomesController value),
+    // not [widget.camera] — [widget.camera] is a fixed snapshot from when
+    // this screen was first pushed and never updates after a successful
+    // in-screen save. Comparing against it meant a *second* Save in the
+    // same screen visit (e.g. name saved once, then only timezone changed)
+    // kept re-detecting the already-saved name/room/timezone as "changed"
+    // against their pre-first-save values and re-pushing them for no
+    // reason — a real report: changing only the timezone was also sending
+    // a redundant `setDeviceName` with the same name already saved a
+    // moment earlier, adding a full extra round trip's delay.
     final newName = _nameController.text.trim();
-    if (newName.isNotEmpty && newName != widget.camera.name) {
+    if (newName.isNotEmpty && newName != _camera.name) {
       // Pushed to the device (ONVIF SetScopes) whenever a connection is
       // known, keeping the app's label and the camera's own reported name
       // in sync — only falls back to a local-only rename for a camera that
       // predates credential capture and so has nothing to push to.
       if (connection != null) {
-        final client = OnvifDeviceClient(connection);
-        final result = await client.setDeviceName(newName);
-        client.close();
+        // LAN failed — retry over WAN before surfacing an error, per
+        // mobile-app-screen-conventions.md's LAN/WAN convention (a LAN
+        // Apply/Set failure should automatically retry over WAN, not just
+        // fail outright) — or WAN is called directly when this camera's
+        // last confirmed transport was WAN (Camera.lastKnownWan's doc).
+        final wanThingName = connection.thingName;
+        final wanEligible =
+            connection.wanCommandCapable != false && wanThingName != null;
+        final result = await callPreferringKnownTransport(
+          camera: _camera,
+          thingName: wanEligible ? wanThingName : null,
+          lan: () async {
+            final client = OnvifDeviceClient(connection);
+            final result = await client.setDeviceName(newName);
+            client.close();
+            return result;
+          },
+          wan: () =>
+              WanDeviceIdentityClient(wanThingName!).setDeviceName(newName),
+        );
         switch (result) {
           case CameraSuccess():
             widget.homesController.renameCamera(
@@ -226,7 +255,7 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
       }
     }
 
-    if (_homeId != _originalHomeId || _room != widget.camera.room) {
+    if (_homeId != _originalHomeId || _room != _camera.room) {
       widget.homesController.moveCameraToHome(
         fromHomeId: _originalHomeId,
         toHomeId: _homeId,
@@ -235,15 +264,30 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
       );
     }
 
-    if (_timezone != widget.camera.timezone) {
+    if (_timezone != _camera.timezone) {
       // Only push to the real camera when this code came from its own
       // verified catalog (_cameraTimezones) — never send a POSIX string
       // guessed from the [_dummyTimezones] fallback. In that fallback case,
       // stay local-only, same as home/room.
       if (_cameraTimezones != null && connection != null) {
-        final client = OnvifDeviceClient(connection);
-        final result = await client.setTimeZone(_timezone);
-        client.close();
+        // LAN failed — retry over WAN before surfacing an error, same
+        // convention as the name push above (or WAN is called directly
+        // when known — see Camera.lastKnownWan's doc).
+        final wanThingName = connection.thingName;
+        final wanEligible =
+            connection.wanCommandCapable != false && wanThingName != null;
+        final result = await callPreferringKnownTransport(
+          camera: _camera,
+          thingName: wanEligible ? wanThingName : null,
+          lan: () async {
+            final client = OnvifDeviceClient(connection);
+            final result = await client.setTimeZone(_timezone);
+            client.close();
+            return result;
+          },
+          wan: () =>
+              WanDeviceIdentityClient(wanThingName!).setTimeZone(_timezone),
+        );
         switch (result) {
           case CameraSuccess():
             widget.homesController.updateCameraTimezone(
@@ -428,270 +472,276 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
               ),
             ],
           ),
-          body: ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              if (_camera.healthConditionMessages.isNotEmpty) ...[
-                _SectionHeader('Health'),
+          body: SavingOverlay(
+            isSaving: _saving,
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                if (_camera.healthConditionMessages.isNotEmpty) ...[
+                  _SectionHeader('Health'),
+                  const SizedBox(height: 8),
+                  GlassCard(
+                    padding: EdgeInsets.zero,
+                    child: Column(
+                      children: [
+                        for (final (index, message)
+                            in _camera.healthConditionMessages.indexed)
+                          _InfoRow(
+                            settingsKey: Key('CAMINFO-031-$index'),
+                            icon: Icons.warning_amber_rounded,
+                            label: message,
+                            value: '',
+                            isLast:
+                                index ==
+                                _camera.healthConditionMessages.length - 1,
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                ],
+                _SectionHeader('Device Identity'),
+                const SizedBox(height: 8),
+                GlassCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      TextField(
+                        key: const Key('CAMINFO-003'),
+                        controller: _nameController,
+                        maxLength: kMaxDeviceNameLength,
+                        decoration: const InputDecoration(
+                          labelText: 'Camera name',
+                        ),
+                        textInputAction: TextInputAction.done,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const Key('CAMINFO-032'),
+                  onPressed: _syncing ? null : _syncFromCamera,
+                  icon: _syncing
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.sync),
+                  label: Text(_syncing ? 'Syncing…' : 'Sync from camera'),
+                ),
                 const SizedBox(height: 8),
                 GlassCard(
                   padding: EdgeInsets.zero,
                   child: Column(
                     children: [
-                      for (final (index, message)
-                          in _camera.healthConditionMessages.indexed)
-                        _InfoRow(
-                          settingsKey: Key('CAMINFO-031-$index'),
-                          icon: Icons.warning_amber_rounded,
-                          label: message,
-                          value: '',
-                          isLast:
-                              index ==
-                              _camera.healthConditionMessages.length - 1,
-                        ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-011'),
+                        icon: Icons.precision_manufacturing_outlined,
+                        label: 'Manufacturer',
+                        value: _camera.manufacturer,
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-033'),
+                        icon: Icons.camera_outlined,
+                        label: 'Model',
+                        value: _camera.model,
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-013'),
+                        icon: Icons.tag,
+                        label: 'Serial number',
+                        value: _camera.serialNumber,
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-014'),
+                        icon: Icons.fingerprint,
+                        label: 'Hardware ID',
+                        value: _camera.hardwareId,
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-012'),
+                        icon: Icons.system_update_outlined,
+                        label: 'Firmware version',
+                        value: _camera.firmwareVersion,
+                        isLast: true,
+                      ),
                     ],
                   ),
                 ),
                 const SizedBox(height: 24),
-              ],
-              _SectionHeader('Device Identity'),
-              const SizedBox(height: 8),
-              GlassCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    TextField(
-                      key: const Key('CAMINFO-003'),
-                      controller: _nameController,
-                      maxLength: kMaxDeviceNameLength,
-                      decoration: const InputDecoration(
-                        labelText: 'Camera name',
+                _SectionHeader('Network & Connectivity'),
+                const SizedBox(height: 8),
+                GlassCard(
+                  padding: EdgeInsets.zero,
+                  child: Column(
+                    children: [
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-008'),
+                        icon: Icons.wifi,
+                        label: 'Wi-Fi network',
+                        value: _camera.wifiNetwork,
                       ),
-                      textInputAction: TextInputAction.done,
-                    ),
-                  ],
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-009'),
+                        icon: Icons.signal_cellular_alt,
+                        label: 'Signal strength',
+                        value: '${_camera.signalStrength} / 4',
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-030'),
+                        icon: Icons.speed_outlined,
+                        label: 'Network speed',
+                        value: formatBitrate(_camera.networkSpeedKbps),
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-010'),
+                        icon: Icons.memory,
+                        label: 'MAC address',
+                        value: _camera.macAddress,
+                      ),
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-028'),
+                        icon: Icons.lan_outlined,
+                        label: 'IP address',
+                        value: _camera.ipAddress,
+                        isLast: true,
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const Key('CAMINFO-032'),
-                onPressed: _syncing ? null : _syncFromCamera,
-                icon: _syncing
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.sync),
-                label: Text(_syncing ? 'Syncing…' : 'Sync from camera'),
-              ),
-              const SizedBox(height: 8),
-              GlassCard(
-                padding: EdgeInsets.zero,
-                child: Column(
-                  children: [
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-011'),
-                      icon: Icons.precision_manufacturing_outlined,
-                      label: 'Manufacturer',
-                      value: _camera.manufacturer,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-033'),
-                      icon: Icons.camera_outlined,
-                      label: 'Model',
-                      value: _camera.model,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-013'),
-                      icon: Icons.tag,
-                      label: 'Serial number',
-                      value: _camera.serialNumber,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-014'),
-                      icon: Icons.fingerprint,
-                      label: 'Hardware ID',
-                      value: _camera.hardwareId,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-012'),
-                      icon: Icons.system_update_outlined,
-                      label: 'Firmware version',
-                      value: _camera.firmwareVersion,
-                      isLast: true,
-                    ),
-                  ],
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const Key('CAMINFO-029'),
+                  onPressed: () => context.push(
+                    '${GoRouterState.of(context).matchedLocation}/${WifiConfigScreen.routeName}',
+                    extra: _camera,
+                  ),
+                  icon: const Icon(Icons.wifi_outlined),
+                  label: const Text('Configure Wi-Fi'),
                 ),
-              ),
-              const SizedBox(height: 24),
-              _SectionHeader('Network & Connectivity'),
-              const SizedBox(height: 8),
-              GlassCard(
-                padding: EdgeInsets.zero,
-                child: Column(
-                  children: [
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-008'),
-                      icon: Icons.wifi,
-                      label: 'Wi-Fi network',
-                      value: _camera.wifiNetwork,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-009'),
-                      icon: Icons.signal_cellular_alt,
-                      label: 'Signal strength',
-                      value: '${_camera.signalStrength} / 4',
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-030'),
-                      icon: Icons.speed_outlined,
-                      label: 'Network speed',
-                      value: formatBitrate(_camera.networkSpeedKbps),
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-010'),
-                      icon: Icons.memory,
-                      label: 'MAC address',
-                      value: _camera.macAddress,
-                    ),
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-028'),
-                      icon: Icons.lan_outlined,
-                      label: 'IP address',
-                      value: _camera.ipAddress,
-                      isLast: true,
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const Key('CAMINFO-029'),
-                onPressed: () => context.push(
-                  '${GoRouterState.of(context).matchedLocation}/${WifiConfigScreen.routeName}',
-                  extra: _camera,
-                ),
-                icon: const Icon(Icons.wifi_outlined),
-                label: const Text('Configure Wi-Fi'),
-              ),
-              const SizedBox(height: 24),
-              _SectionHeader('Location'),
-              const SizedBox(height: 8),
-              GlassCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    DropdownButtonFormField<String>(
-                      key: const Key('CAMINFO-004'),
-                      initialValue: _homeId,
-                      isExpanded: true,
-                      decoration: const InputDecoration(labelText: 'Home'),
-                      items: [
-                        for (final home in homes)
-                          DropdownMenuItem(
-                            value: home.id,
+                const SizedBox(height: 24),
+                _SectionHeader('Location'),
+                const SizedBox(height: 8),
+                GlassCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      DropdownButtonFormField<String>(
+                        key: const Key('CAMINFO-004'),
+                        initialValue: _homeId,
+                        isExpanded: true,
+                        decoration: const InputDecoration(labelText: 'Home'),
+                        items: [
+                          for (final home in homes)
+                            DropdownMenuItem(
+                              value: home.id,
+                              child: Text(
+                                home.name,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                        onChanged: _onHomeChanged,
+                      ),
+                      const SizedBox(height: 16),
+                      DropdownButtonFormField<String?>(
+                        key: const Key('CAMINFO-005'),
+                        initialValue: _room,
+                        isExpanded: true,
+                        decoration: const InputDecoration(labelText: 'Room'),
+                        items: [
+                          const DropdownMenuItem<String?>(
+                            value: null,
                             child: Text(
-                              home.name,
+                              _unassignedRoomLabel,
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
-                      ],
-                      onChanged: _onHomeChanged,
-                    ),
-                    const SizedBox(height: 16),
-                    DropdownButtonFormField<String?>(
-                      key: const Key('CAMINFO-005'),
-                      initialValue: _room,
-                      isExpanded: true,
-                      decoration: const InputDecoration(labelText: 'Room'),
-                      items: [
-                        const DropdownMenuItem<String?>(
-                          value: null,
-                          child: Text(
-                            _unassignedRoomLabel,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        for (final room in rooms)
-                          DropdownMenuItem<String?>(
-                            value: room,
-                            child: Text(room, overflow: TextOverflow.ellipsis),
-                          ),
-                      ],
-                      onChanged: _onRoomChanged,
-                    ),
-                    const SizedBox(height: 16),
-                    Builder(
-                      builder: (context) {
-                        final cameraTimezones = _cameraTimezones;
-                        final codes = cameraTimezones != null
-                            ? [for (final tz in cameraTimezones) tz.code]
-                            : _dummyTimezones;
-                        return DropdownButtonFormField<String>(
-                          key: const Key('CAMINFO-006'),
-                          initialValue: codes.contains(_timezone)
-                              ? _timezone
-                              : codes.first,
-                          isExpanded: true,
-                          decoration: const InputDecoration(
-                            labelText: 'Timezone',
-                          ),
-                          items: cameraTimezones != null
-                              ? [
-                                  for (final tz in cameraTimezones)
-                                    DropdownMenuItem(
-                                      value: tz.code,
-                                      child: Text(
-                                        _formatTimezoneLabel(tz.name),
-                                        overflow: TextOverflow.ellipsis,
+                          for (final room in rooms)
+                            DropdownMenuItem<String?>(
+                              value: room,
+                              child: Text(
+                                room,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                        onChanged: _onRoomChanged,
+                      ),
+                      const SizedBox(height: 16),
+                      Builder(
+                        builder: (context) {
+                          final cameraTimezones = _cameraTimezones;
+                          final codes = cameraTimezones != null
+                              ? [for (final tz in cameraTimezones) tz.code]
+                              : _dummyTimezones;
+                          return DropdownButtonFormField<String>(
+                            key: const Key('CAMINFO-006'),
+                            initialValue: codes.contains(_timezone)
+                                ? _timezone
+                                : codes.first,
+                            isExpanded: true,
+                            decoration: const InputDecoration(
+                              labelText: 'Timezone',
+                            ),
+                            items: cameraTimezones != null
+                                ? [
+                                    for (final tz in cameraTimezones)
+                                      DropdownMenuItem(
+                                        value: tz.code,
+                                        child: Text(
+                                          _formatTimezoneLabel(tz.name),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
                                       ),
-                                    ),
-                                ]
-                              : [
-                                  for (final zone in _dummyTimezones)
-                                    DropdownMenuItem(
-                                      value: zone,
-                                      child: Text(
-                                        zone,
-                                        overflow: TextOverflow.ellipsis,
+                                  ]
+                                : [
+                                    for (final zone in _dummyTimezones)
+                                      DropdownMenuItem(
+                                        value: zone,
+                                        child: Text(
+                                          zone,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
                                       ),
-                                    ),
-                                ],
-                          onChanged: _onTimezoneChanged,
-                        );
-                      },
-                    ),
-                  ],
+                                  ],
+                            onChanged: _onTimezoneChanged,
+                          );
+                        },
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 24),
-              _SectionHeader('Recording'),
-              const SizedBox(height: 8),
-              GlassCard(
-                padding: EdgeInsets.zero,
-                child: Column(
-                  children: [
-                    _InfoRow(
-                      settingsKey: const Key('CAMINFO-007'),
-                      icon: Icons.fiber_manual_record,
-                      label: 'Recording status',
-                      value: _recordingStatusLabel(_camera.recordingStatus),
-                      isLast: true,
-                    ),
-                  ],
+                const SizedBox(height: 24),
+                _SectionHeader('Recording'),
+                const SizedBox(height: 8),
+                GlassCard(
+                  padding: EdgeInsets.zero,
+                  child: Column(
+                    children: [
+                      _InfoRow(
+                        settingsKey: const Key('CAMINFO-007'),
+                        icon: Icons.fiber_manual_record,
+                        label: 'Recording status',
+                        value: _recordingStatusLabel(_camera.recordingStatus),
+                        isLast: true,
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 24),
-              _SectionHeader('Security'),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                key: const Key('CAMINFO-015'),
-                onPressed: _openModifyPasswordDialog,
-                icon: const Icon(Icons.lock_outline),
-                label: const Text('Modify Password'),
-              ),
-            ],
+                const SizedBox(height: 24),
+                _SectionHeader('Security'),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const Key('CAMINFO-015'),
+                  onPressed: _openModifyPasswordDialog,
+                  icon: const Icon(Icons.lock_outline),
+                  label: const Text('Modify Password'),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -843,19 +893,23 @@ class _ModifyPasswordDialogState extends State<_ModifyPasswordDialog> {
     });
 
     final newPassword = _newController.text;
-    final lanClient = OnvifDeviceClient(connection);
-    var result = await lanClient.setUserPassword(
-      connection.username,
-      newPassword,
-    );
-    lanClient.close();
-
     final thingName = connection.thingName;
-    if (result is! CameraSuccess && thingName != null) {
-      result = await WanDeviceIdentityClient(
-        thingName,
-      ).setUserPassword(connection.username, newPassword);
-    }
+    final result = await callPreferringKnownTransport(
+      camera: widget.camera,
+      thingName: thingName,
+      lan: () async {
+        final lanClient = OnvifDeviceClient(connection);
+        final result = await lanClient.setUserPassword(
+          connection.username,
+          newPassword,
+        );
+        lanClient.close();
+        return result;
+      },
+      wan: () => WanDeviceIdentityClient(
+        thingName!,
+      ).setUserPassword(connection.username, newPassword),
+    );
 
     if (!mounted) return;
     switch (result) {

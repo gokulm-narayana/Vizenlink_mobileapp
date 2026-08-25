@@ -262,50 +262,106 @@ class _ImagingScreenState extends State<ImagingScreen> {
     if (connection == null) return;
     final imagingClient = OnvifImagingClient(connection);
     final nuraeye = NuraeyeClient(connection);
-    final results = await Future.wait([
-      imagingClient.getImagingSettings(),
-      imagingClient.getImagingOptions(),
-      MirrorFlipClient(nuraeye).getMirrorFlip(),
-      nuraeye.call('GetImageDefaults'),
-      AntiFlickerClient(nuraeye).getAntiFlickerMode(),
-    ]);
+
+    // Known WAN (Camera.lastKnownWan) skips even the cheap probe below —
+    // an instant decision beats a ~3s round trip. Otherwise, a cheap LAN
+    // reachability probe first (same call camera_sync.dart's
+    // syncCameraFromDevice/pingCameraReachability use) — when the phone is
+    // off this camera's LAN, every one of the 5 LAN calls below fails
+    // together anyway (they're already parallel), so this just skips
+    // straight to the WAN fallback instead of waiting out that shared LAN
+    // timeout for nothing.
+    final lanReachable = _camera.lastKnownWan == true
+        ? false
+        : await WebRtcUriClient(nuraeye).checkReachable();
+
+    final CameraResult<ImagingSettings> settingsResultRaw;
+    final CameraResult<ImagingOptions> optionsResult;
+    final CameraResult<MirrorFlipMode> mirrorFlipResultRaw;
+    final CameraResult<Map<String, dynamic>> defaultsResultRaw;
+    final CameraResult<AntiFlickerMode> antiFlickerResultRaw;
+    if (lanReachable) {
+      final results = await Future.wait([
+        imagingClient.getImagingSettings(),
+        imagingClient.getImagingOptions(),
+        MirrorFlipClient(nuraeye).getMirrorFlip(),
+        nuraeye.call('GetImageDefaults'),
+        AntiFlickerClient(nuraeye).getAntiFlickerMode(),
+      ]);
+      settingsResultRaw = results[0] as CameraResult<ImagingSettings>;
+      optionsResult = results[1] as CameraResult<ImagingOptions>;
+      mirrorFlipResultRaw = results[2] as CameraResult<MirrorFlipMode>;
+      defaultsResultRaw = results[3] as CameraResult<Map<String, dynamic>>;
+      antiFlickerResultRaw = results[4] as CameraResult<AntiFlickerMode>;
+    } else {
+      settingsResultRaw = const CameraTimeout<ImagingSettings>();
+      // Options are LAN-only regardless of transport (see this class's doc
+      // comment) — a known-unreachable LAN just means no Options this load.
+      optionsResult = const CameraTimeout<ImagingOptions>();
+      mirrorFlipResultRaw = const CameraTimeout<MirrorFlipMode>();
+      defaultsResultRaw = const CameraTimeout<Map<String, dynamic>>();
+      antiFlickerResultRaw = const CameraTimeout<AntiFlickerMode>();
+    }
     imagingClient.close();
     nuraeye.close();
 
-    var settingsResult = results[0] as CameraResult<ImagingSettings>;
-    final optionsResult = results[1] as CameraResult<ImagingOptions>;
-    var mirrorFlipResult = results[2] as CameraResult<MirrorFlipMode>;
-    var defaultsResult = results[3] as CameraResult<Map<String, dynamic>>;
-    var antiFlickerResult = results[4] as CameraResult<AntiFlickerMode>;
+    var settingsResult = settingsResultRaw;
+    var mirrorFlipResult = mirrorFlipResultRaw;
+    var defaultsResult = defaultsResultRaw;
+    var antiFlickerResult = antiFlickerResultRaw;
 
     // Options are LAN-only on a normal load (see this class's doc comment)
-    // — only current-value reads fall back to WAN here.
+    // — only current-value reads fall back to WAN here. All four requested
+    // in parallel (previously sequential — up to ~24s each with
+    // IotCommandClient's own built-in one-shot retry on top of this
+    // class's 12s timeout, so up to ~120s combined in the worst case).
     final thingName = connection.thingName;
     Map<String, dynamic>? wanImageSettings;
     ({bool enabled, double level})? wanWdr;
     if (thingName != null) {
-      if (settingsResult is! CameraSuccess) {
-        final wanResult = await WanImageQualityClient(
-          thingName,
-        ).getImageSettings();
-        if (wanResult case CameraSuccess(:final value)) {
+      final needsSettings = settingsResult is! CameraSuccess;
+      final needsMirrorFlip = mirrorFlipResult is! CameraSuccess;
+      final needsDefaults = defaultsResult is! CameraSuccess;
+      final needsAntiFlicker = antiFlickerResult is! CameraSuccess;
+      if (needsSettings ||
+          needsMirrorFlip ||
+          needsDefaults ||
+          needsAntiFlicker) {
+        final wanResults = await Future.wait([
+          needsSettings
+              ? WanImageQualityClient(thingName).getImageSettings()
+              : Future.value(null),
+          needsSettings
+              ? WanImagingClient(thingName).getWdr()
+              : Future.value(null),
+          needsMirrorFlip
+              ? WanMirrorFlipClient(thingName).getMirrorFlip()
+              : Future.value(null),
+          needsDefaults
+              ? WanImageQualityClient(thingName).getImageDefaults()
+              : Future.value(null),
+          needsAntiFlicker
+              ? WanAntiFlickerClient(thingName).getAntiFlickerMode()
+              : Future.value(null),
+        ]);
+        final wanSettingsResult =
+            wanResults[0] as CameraResult<Map<String, dynamic>>?;
+        final wanWdrResult =
+            wanResults[1] as CameraResult<({bool enabled, double level})>?;
+        final wanMirrorFlipResult =
+            wanResults[2] as CameraResult<MirrorFlipMode>?;
+        final wanDefaultsResult =
+            wanResults[3] as CameraResult<Map<String, dynamic>>?;
+        final wanAntiFlickerResult =
+            wanResults[4] as CameraResult<AntiFlickerMode>?;
+
+        if (wanSettingsResult case CameraSuccess(:final value)) {
           wanImageSettings = value;
         }
-        final wanWdrResult = await WanImagingClient(thingName).getWdr();
         if (wanWdrResult case CameraSuccess(:final value)) wanWdr = value;
-      }
-      if (mirrorFlipResult is! CameraSuccess) {
-        mirrorFlipResult = await WanMirrorFlipClient(thingName).getMirrorFlip();
-      }
-      if (defaultsResult is! CameraSuccess) {
-        defaultsResult = await WanImageQualityClient(
-          thingName,
-        ).getImageDefaults();
-      }
-      if (antiFlickerResult is! CameraSuccess) {
-        antiFlickerResult = await WanAntiFlickerClient(
-          thingName,
-        ).getAntiFlickerMode();
+        if (needsMirrorFlip) mirrorFlipResult = wanMirrorFlipResult!;
+        if (needsDefaults) defaultsResult = wanDefaultsResult!;
+        if (needsAntiFlicker) antiFlickerResult = wanAntiFlickerResult!;
       }
     }
     if (!mounted) return;
@@ -470,74 +526,119 @@ class _ImagingScreenState extends State<ImagingScreen> {
     if (connection != null) {
       final thingName = connection.thingName;
       final wdrSupported = _imagingOptions?.wdrSupported ?? true;
+      // Skips the LAN Set attempt entirely when this camera's last
+      // confirmed transport was WAN — see Camera.lastKnownWan's doc.
+      final preferWan = _camera.lastKnownWan == true && thingName != null;
 
-      final imagingClient = OnvifImagingClient(connection);
-      final imagingResult = await imagingClient.setImagingSettings(
-        ImagingSettings(
-          brightness: _brightness,
-          colorSaturation: _saturation,
-          contrast: _contrast,
-          sharpness: _sharpness,
-          wdrMode: wdrSupported ? (_wdrEnabled ? 'ON' : 'OFF') : null,
-          wdrLevel: (wdrSupported && _wdrEnabled) ? _wdrLevel : null,
-          whiteBalanceMode: _autoManualToWire(_whiteBalance),
-          exposureMode: _autoManualToWire(_exposure),
-          exposureTime: _exposure == CameraAutoManual.manual
-              ? _exposureTime
-              : null,
-          exposureGain: _exposure == CameraAutoManual.manual
-              ? _exposureGain
-              : null,
-        ),
-      );
-      imagingClient.close();
+      // Only push the sections that actually changed from the last
+      // camera-confirmed value — mobile-app-screen-conventions.md's Apply
+      // convention. Sending all three independent Set calls unconditionally
+      // on every Save was a real source of delay: nudging just one slider
+      // still fired three full round trips (quality/WDR, mirror/flip,
+      // anti-flicker) every time, each of which can take seconds on WAN.
+      final qualityChanged =
+          _brightness != _camera.brightness ||
+          _contrast != _camera.contrast ||
+          _saturation != _camera.saturation ||
+          _sharpness != _camera.sharpness ||
+          _wdrEnabled != _camera.wdrEnabled ||
+          _wdrLevel != _camera.wdrLevel ||
+          _whiteBalance != _camera.whiteBalance ||
+          _exposure != _camera.exposure ||
+          _exposureTime != _camera.exposureTime ||
+          _exposureGain != _camera.exposureGain;
+      final mirrorFlipChanged = _mirrorFlip != _camera.mirrorFlip;
+      final antiFlickerChanged = _antiFlickerMode != _camera.antiFlickerMode;
 
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention.
-      var imagingSucceeded = imagingResult is CameraSuccess;
-      if (!imagingSucceeded && thingName != null) {
-        final wanQualityResult = await WanImageQualityClient(thingName)
-            .setImageSettings({
-              'brightness': _brightness,
-              'contrast': _contrast,
-              'saturation': _saturation,
-              'sharpness': _sharpness,
-              'white_balance_mode': _autoManualToWire(_whiteBalance),
-              'exposure_mode': _autoManualToWire(_exposure),
-            });
-        var wdrOk = true;
-        if (wdrSupported) {
-          final wanWdrResult = await WanImagingClient(
-            thingName,
-          ).setWdr(_wdrEnabled, _wdrEnabled ? _wdrLevel : 0);
-          wdrOk = wanWdrResult is CameraSuccess;
+      var imagingSucceeded = true;
+      if (qualityChanged) {
+        CameraResult<void>? imagingResult;
+        if (!preferWan) {
+          final imagingClient = OnvifImagingClient(connection);
+          imagingResult = await imagingClient.setImagingSettings(
+            ImagingSettings(
+              brightness: _brightness,
+              colorSaturation: _saturation,
+              contrast: _contrast,
+              sharpness: _sharpness,
+              wdrMode: wdrSupported ? (_wdrEnabled ? 'ON' : 'OFF') : null,
+              wdrLevel: (wdrSupported && _wdrEnabled) ? _wdrLevel : null,
+              whiteBalanceMode: _autoManualToWire(_whiteBalance),
+              exposureMode: _autoManualToWire(_exposure),
+              exposureTime: _exposure == CameraAutoManual.manual
+                  ? _exposureTime
+                  : null,
+              exposureGain: _exposure == CameraAutoManual.manual
+                  ? _exposureGain
+                  : null,
+            ),
+          );
+          imagingClient.close();
         }
-        imagingSucceeded = wanQualityResult is CameraSuccess && wdrOk;
+
+        // A failed LAN Apply/Set retries over WAN before surfacing an error
+        // (or WAN is called directly when known — see preferWan above),
+        // per mobile-app-screen-conventions.md's LAN/WAN convention.
+        imagingSucceeded = imagingResult is CameraSuccess;
+        if (!imagingSucceeded && thingName != null) {
+          final wanQualityResult = await WanImageQualityClient(thingName)
+              .setImageSettings({
+                'brightness': _brightness,
+                'contrast': _contrast,
+                'saturation': _saturation,
+                'sharpness': _sharpness,
+                'white_balance_mode': _autoManualToWire(_whiteBalance),
+                'exposure_mode': _autoManualToWire(_exposure),
+              });
+          var wdrOk = true;
+          if (wdrSupported) {
+            final wanWdrResult = await WanImagingClient(
+              thingName,
+            ).setWdr(_wdrEnabled, _wdrEnabled ? _wdrLevel : 0);
+            wdrOk = wanWdrResult is CameraSuccess;
+          }
+          imagingSucceeded = wanQualityResult is CameraSuccess && wdrOk;
+        }
       }
 
-      final nuraeye = NuraeyeClient(connection);
-      var mirrorFlipResult = await MirrorFlipClient(
-        nuraeye,
-      ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
-      var antiFlickerResult = await AntiFlickerClient(
-        nuraeye,
-      ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
-      nuraeye.close();
-      if (mirrorFlipResult is! CameraSuccess && thingName != null) {
-        mirrorFlipResult = await WanMirrorFlipClient(
-          thingName,
-        ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
+      var mirrorFlipSucceeded = true;
+      if (mirrorFlipChanged) {
+        CameraResult<void>? mirrorFlipResult;
+        if (!preferWan) {
+          final nuraeye = NuraeyeClient(connection);
+          mirrorFlipResult = await MirrorFlipClient(
+            nuraeye,
+          ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
+          nuraeye.close();
+        }
+        if (mirrorFlipResult is! CameraSuccess && thingName != null) {
+          mirrorFlipResult = await WanMirrorFlipClient(
+            thingName,
+          ).setMirrorFlip(_toWireMirrorFlip(_mirrorFlip));
+        }
+        mirrorFlipSucceeded = mirrorFlipResult is CameraSuccess;
       }
-      if (antiFlickerResult is! CameraSuccess && thingName != null) {
-        antiFlickerResult = await WanAntiFlickerClient(
-          thingName,
-        ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
+
+      var antiFlickerSucceeded = true;
+      if (antiFlickerChanged) {
+        CameraResult<void>? antiFlickerResult;
+        if (!preferWan) {
+          final nuraeye = NuraeyeClient(connection);
+          antiFlickerResult = await AntiFlickerClient(
+            nuraeye,
+          ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
+          nuraeye.close();
+        }
+        if (antiFlickerResult is! CameraSuccess && thingName != null) {
+          antiFlickerResult = await WanAntiFlickerClient(
+            thingName,
+          ).setAntiFlickerMode(_toWireAntiFlicker(_antiFlickerMode));
+        }
+        antiFlickerSucceeded = antiFlickerResult is CameraSuccess;
       }
 
       succeeded =
-          imagingSucceeded &&
-          mirrorFlipResult is CameraSuccess &&
-          antiFlickerResult is CameraSuccess;
+          imagingSucceeded && mirrorFlipSucceeded && antiFlickerSucceeded;
     } else {
       succeeded = await simulateCameraSave();
     }

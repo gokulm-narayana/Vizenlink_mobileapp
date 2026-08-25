@@ -421,7 +421,11 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
     final capabilitiesResult = results[2] as CameraResult<Media2Capabilities>;
 
     // Options are LAN-only on a normal load (see this class's doc comment)
-    // — only the current-value getOsds read falls back to WAN here.
+    // — only the current-value getOsds read falls back to WAN here. (No
+    // Camera.lastKnownWan skip-LAN fast path here, unlike other screens'
+    // loads: Options must be fetched over LAN regardless of transport, so
+    // this screen's load always pays that LAN round trip anyway — nothing
+    // left to skip.)
     final thingName = connection.thingName;
     if (osdsResult is! CameraSuccess && thingName != null) {
       osdsResult = await WanOsdClient(thingName).getOsds();
@@ -574,6 +578,9 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
       final client = OsdClient(connection);
       final thingName = connection.thingName;
       final wanClient = thingName != null ? WanOsdClient(thingName) : null;
+      // Skips each LAN attempt below entirely when this camera's last
+      // confirmed transport was WAN — see Camera.lastKnownWan's doc.
+      final preferWan = _camera.lastKnownWan == true && wanClient != null;
 
       // Time (DateAndTime) slot.
       if (_timeEnabled) {
@@ -586,15 +593,18 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
         final color = _colorToWire(_timeColor);
         final timeToken = _timeToken;
         if (timeToken != null) {
-          var result = await client.updateTimestampPosition(
-            timeToken,
-            posType: posType,
-            posX: onvifPos?.x ?? 0,
-            posY: onvifPos?.y ?? 0,
-            dateFormat: dateWire,
-            timeFormat: timeWire,
-            fontColor: color,
-          );
+          CameraResult<void>? result;
+          if (!preferWan) {
+            result = await client.updateTimestampPosition(
+              timeToken,
+              posType: posType,
+              posX: onvifPos?.x ?? 0,
+              posY: onvifPos?.y ?? 0,
+              dateFormat: dateWire,
+              timeFormat: timeWire,
+              fontColor: color,
+            );
+          }
           // A failed LAN Apply/Set retries over WAN before surfacing an
           // error, per mobile-app-screen-conventions.md's LAN/WAN
           // convention. WAN's single setOsd covers both create and update.
@@ -614,17 +624,20 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                 : CameraFailure(reasonOf(wanResult));
           }
           if (result is! CameraSuccess) {
-            failures.add('time (${reasonOf(result)})');
+            failures.add('time (${reasonOf(result!)})');
           }
         } else {
-          var result = await client.createTimestampOsd(
-            posType: posType,
-            posX: onvifPos?.x ?? 0.8,
-            posY: onvifPos?.y ?? 1,
-            dateFormat: dateWire,
-            timeFormat: timeWire,
-            fontColor: color,
-          );
+          CameraResult<String>? result;
+          if (!preferWan) {
+            result = await client.createTimestampOsd(
+              posType: posType,
+              posX: onvifPos?.x ?? 0.8,
+              posY: onvifPos?.y ?? 1,
+              dateFormat: dateWire,
+              timeFormat: timeWire,
+              fontColor: color,
+            );
+          }
           if (result is! CameraSuccess && wanClient != null) {
             result = await wanClient.setOsd(
               textType: 'DateAndTime',
@@ -639,18 +652,19 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
           if (result case CameraSuccess(:final value)) {
             _timeToken = value;
           } else {
-            failures.add('time (${reasonOf(result)})');
+            failures.add('time (${reasonOf(result!)})');
           }
         }
       } else if (_timeToken != null) {
-        var result = await client.deleteOsd(_timeToken!);
+        CameraResult<void>? result;
+        if (!preferWan) result = await client.deleteOsd(_timeToken!);
         if (result is! CameraSuccess && wanClient != null) {
           result = await wanClient.deleteOsd(_timeToken!);
         }
         if (result is CameraSuccess) {
           _timeToken = null;
         } else {
-          failures.add('time (${reasonOf(result)})');
+          failures.add('time (${reasonOf(result!)})');
         }
       }
 
@@ -666,14 +680,17 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
         final color = _colorToWire(_customTextColor);
         final customTextToken = _customTextToken;
         if (customTextToken != null) {
-          var result = await client.updateTextOsd(
-            customTextToken,
-            _customTextController.text,
-            posType: posType,
-            posX: onvifPos?.x ?? -1,
-            posY: onvifPos?.y ?? 1,
-            fontColor: color,
-          );
+          CameraResult<void>? result;
+          if (!preferWan) {
+            result = await client.updateTextOsd(
+              customTextToken,
+              _customTextController.text,
+              posType: posType,
+              posX: onvifPos?.x ?? -1,
+              posY: onvifPos?.y ?? 1,
+              fontColor: color,
+            );
+          }
           if (result is! CameraSuccess && wanClient != null) {
             final wanResult = await wanClient.setOsd(
               token: customTextToken,
@@ -689,16 +706,19 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
                 : CameraFailure(reasonOf(wanResult));
           }
           if (result is! CameraSuccess) {
-            failures.add('custom text (${reasonOf(result)})');
+            failures.add('custom text (${reasonOf(result!)})');
           }
         } else {
-          var result = await client.createTextOsd(
-            _customTextController.text,
-            posType: posType,
-            posX: onvifPos?.x ?? -1,
-            posY: onvifPos?.y ?? 1,
-            fontColor: color,
-          );
+          CameraResult<String>? result;
+          if (!preferWan) {
+            result = await client.createTextOsd(
+              _customTextController.text,
+              posType: posType,
+              posX: onvifPos?.x ?? -1,
+              posY: onvifPos?.y ?? 1,
+              fontColor: color,
+            );
+          }
           if (result is! CameraSuccess && wanClient != null) {
             result = await wanClient.setOsd(
               textType: 'Plain',
@@ -712,18 +732,19 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
           if (result case CameraSuccess(:final value)) {
             _customTextToken = value;
           } else {
-            failures.add('custom text (${reasonOf(result)})');
+            failures.add('custom text (${reasonOf(result!)})');
           }
         }
       } else if (_customTextToken != null) {
-        var result = await client.deleteOsd(_customTextToken!);
+        CameraResult<void>? result;
+        if (!preferWan) result = await client.deleteOsd(_customTextToken!);
         if (result is! CameraSuccess && wanClient != null) {
           result = await wanClient.deleteOsd(_customTextToken!);
         }
         if (result is CameraSuccess) {
           _customTextToken = null;
         } else {
-          failures.add('custom text (${reasonOf(result)})');
+          failures.add('custom text (${reasonOf(result!)})');
         }
       }
 

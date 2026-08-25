@@ -8,17 +8,21 @@ import 'package:pointycastle/export.dart';
 /// WAN reference-snapshot preview, end-to-end encrypted (`FR-MOB-101`/`FR-NE-108`/
 /// `FR-SECL-017`) — distinct from `FR-MOB-032`'s persisted WAN snapshot mechanism. The camera
 /// encrypts the frame before it ever leaves the device; this client is the only place that ever
-/// holds the plaintext bytes again, after decrypting locally with the device's own stored
-/// private key ([WanAuth.previewPrivateKeyProvider]) — the cloud relay only ever carries
+/// holds the plaintext bytes again, after decrypting locally with the device's own cached
+/// shared key ([WanAuth.previewSharedKeyProvider]) — the cloud relay only ever carries
 /// ciphertext.
 ///
 /// Callers must not persist the returned bytes (no gallery save, no cache file) — this is a
 /// transient configuration-screen backdrop, not a kept/shared snapshot; see `FR-MOB-101`'s
 /// "what this item does not do" note.
 ///
-/// **Moved into `camera_api` 2026-08-11** — [WanAuth.previewPrivateKeyProvider]/
+/// **Moved into `camera_api` 2026-08-11** — [WanAuth.previewSharedKeyProvider]/
 /// [WanAuth.onPreviewKeyNeedsRegistration] replace the direct `PreviewKeyStore` dependency
 /// (app-layer, `flutter_secure_storage`-backed) this used to have.
+///
+/// **Redesigned 2026-08-21**: the camera-side envelope no longer carries a per-request
+/// RSA-wrapped AES key (`wrapped_key`) — decryption now uses the persisted shared key from
+/// [WanAuth.previewSharedKeyProvider] directly against AES-256-GCM.
 class WanPreviewSnapshotClient {
   WanPreviewSnapshotClient(this.thingName, {IotCommandClient? iotCommandClient})
     : _iot = iotCommandClient ?? IotCommandClient(thingName);
@@ -35,11 +39,11 @@ class WanPreviewSnapshotClient {
     Duration timeout = const Duration(seconds: 25),
   }) async {
     try {
-      final privateKey = await WanAuth.previewPrivateKeyProvider?.call();
-      if (privateKey == null) {
+      final sharedKey = await WanAuth.previewSharedKeyProvider?.call(thingName);
+      if (sharedKey == null) {
         return const CameraFailure(
-          'No preview key generated yet on this device — open a settings screen on LAN once '
-          'first so the camera can register it.',
+          'No preview key fetched yet on this device — open a settings screen on LAN once '
+          'first so the camera can hand it out.',
         );
       }
 
@@ -67,32 +71,20 @@ class WanPreviewSnapshotClient {
 
       final nonceB64 = output['nonce'];
       final tagB64 = output['tag'];
-      final wrappedKeyB64 = output['wrapped_key'];
       final dataB64 = output['data'];
-      if (nonceB64 is! String || tagB64 is! String || wrappedKeyB64 is! String || dataB64 is! String) {
+      if (nonceB64 is! String || tagB64 is! String || dataB64 is! String) {
         return CameraFailure('GetPreviewSnapshot response missing fields: $output');
       }
 
       final nonce = base64Decode(nonceB64);
       final tag = base64Decode(tagB64);
-      final wrappedKey = base64Decode(wrappedKeyB64);
       final ciphertext = base64Decode(dataB64);
 
-      final aesKey = _unwrapContentKey(wrappedKey, privateKey);
-      final plaintext = _decryptAesGcm(ciphertext, tag, nonce, aesKey);
+      final plaintext = _decryptAesGcm(ciphertext, tag, nonce, sharedKey);
       return CameraSuccess(plaintext);
     } catch (e) {
       return CameraFailure(e.toString());
     }
-  }
-
-  /// RSA-OAEP/SHA-256 unwrap — must match the camera's `snapshot_crypto_encrypt()`
-  /// (`mbedtls_pk_encrypt` with `MBEDTLS_RSA_PKCS_V21`/`MBEDTLS_MD_SHA256`) exactly, or
-  /// decryption fails.
-  Uint8List _unwrapContentKey(Uint8List wrappedKey, RSAPrivateKey privateKey) {
-    final cipher = OAEPEncoding.withSHA256(RSAEngine())
-      ..init(false, PrivateKeyParameter<RSAPrivateKey>(privateKey));
-    return cipher.process(wrappedKey);
   }
 
   Uint8List _decryptAesGcm(Uint8List ciphertext, Uint8List tag, Uint8List nonce, Uint8List key) {

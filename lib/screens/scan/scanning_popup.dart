@@ -47,17 +47,26 @@ Future<void> showScanningPopup(BuildContext context) async {
 /// nothing, the popup itself shows a "No cameras found" message (SCAN-018)
 /// instead of closing straight into an empty results screen.
 ///
-/// Returns the found cameras once the scan completes with at least one
+/// [cameras] is the found list once the scan completes with at least one
 /// result, or `null` if the user confirmed they wanted to stop, or if the
 /// scan completed but found nothing. Stopping only makes the *app* treat the
 /// scan as over — cancelling the in-flight LAN discovery/probe calls
 /// themselves isn't supported by `camera_api` today, so they're left to
 /// finish in the background; their eventual result is just discarded.
-Future<List<ScannedCamera>?> showDashboardScanningPopup(
+/// [addManually] is true only when the user tapped "Add camera manually"
+/// from the "No cameras found" state (SCAN-019) — [cameras] is always null
+/// in that case, since no scan result is being carried forward.
+typedef DashboardScanResult = ({
+  List<ScannedCamera>? cameras,
+  bool addManually,
+});
+
+Future<DashboardScanResult> showDashboardScanningPopup(
   BuildContext context,
 ) async {
   final scanFuture = scanForCameras();
   var stopped = false;
+  var addManually = false;
 
   await showDialog<void>(
     context: context,
@@ -65,10 +74,12 @@ Future<List<ScannedCamera>?> showDashboardScanningPopup(
     builder: (dialogContext) => _DashboardScanPopup(
       scanFuture: scanFuture,
       onStopped: () => stopped = true,
+      onAddManually: () => addManually = true,
     ),
   );
 
-  return stopped ? null : await scanFuture;
+  if (addManually) return (cameras: null, addManually: true);
+  return (cameras: stopped ? null : await scanFuture, addManually: false);
 }
 
 /// Content of [showDashboardScanningPopup]'s dialog. A `StatefulWidget`
@@ -84,10 +95,12 @@ class _DashboardScanPopup extends StatefulWidget {
   const _DashboardScanPopup({
     required this.scanFuture,
     required this.onStopped,
+    required this.onAddManually,
   });
 
   final Future<List<ScannedCamera>> scanFuture;
   final VoidCallback onStopped;
+  final VoidCallback onAddManually;
 
   @override
   State<_DashboardScanPopup> createState() => _DashboardScanPopupState();
@@ -163,6 +176,13 @@ class _DashboardScanPopupState extends State<_DashboardScanPopup> {
     Navigator.of(context, rootNavigator: true).pop();
   }
 
+  void _addManually() {
+    if (_closing) return;
+    _closing = true;
+    widget.onAddManually();
+    Navigator.of(context, rootNavigator: true).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -203,6 +223,12 @@ class _DashboardScanPopupState extends State<_DashboardScanPopup> {
                       textAlign: TextAlign.center,
                     ),
                     const SizedBox(height: 20),
+                    TextButton(
+                      key: const Key('SCAN-019'),
+                      onPressed: _addManually,
+                      child: const Text('Add camera manually'),
+                    ),
+                    const SizedBox(height: 4),
                     TextButton(
                       key: const Key('SCAN-017'),
                       onPressed: _close,

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:alerts_api/alerts_api.dart';
 import 'package:auth_api/auth_api.dart';
@@ -6,6 +7,7 @@ import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
 
 import 'app_state/ai_model_manager.dart';
 import 'app_state/alerts_controller.dart';
@@ -132,11 +134,27 @@ void main() {
         'https://jxce73jfkwoouhcmxvhsoysxxq0gavso.lambda-url.ap-south-1.on.aws/',
   );
   // Backs WanPreviewSnapshotClient's decrypt step — see PreviewKeyStore's
-  // own doc comment for the full registration/re-registration picture.
-  WanAuth.previewPrivateKeyProvider =
-      PreviewKeyStore.instance.getExistingPrivateKey;
+  // own doc comment for the full fetch/re-fetch picture.
+  WanAuth.previewSharedKeyProvider = PreviewKeyStore.instance.getSharedKey;
   WanAuth.onPreviewKeyNeedsRegistration =
-      PreviewKeyStore.instance.flagNeedsReregistration;
+      PreviewKeyStore.instance.flagNeedsRefetch;
+  // IotCommandClient (direct MQTT-over-WSS, migrated 2026-08-21 off the
+  // Lambda relay) needs real AWS credentials plus the IoT endpoint/region —
+  // distinct from idTokenProvider above, which only backs KvsPlaybackClient.
+  // This was never wired up as part of that migration, which left every WAN
+  // command (live view, settings sync, deterrence, etc.) failing to connect
+  // at all — same live, fleet-wide values already used below for
+  // alerts_api's own AWS IoT Core listener.
+  WanAuth.awsCredentialsProvider = () async {
+    final creds = await AuthController.instance.awsCredentials();
+    return WanAwsCredentials(
+      accessKeyId: creds.accessKeyId,
+      secretKey: creds.secretKey,
+      sessionToken: creds.sessionToken,
+    );
+  };
+  WanAuth.awsIotEndpoint = 'a1zfm34z2p80an-ats.iot.ap-south-1.amazonaws.com';
+  WanAuth.awsRegion = 'ap-south-1';
   // alerts_api's always-on background alert listener (packages/alerts_api/
   // API_REFERENCE.md § Configuration) — same live, fleet-wide AWS IoT Core
   // values as camera_api's own WAN clients, not a placeholder.
@@ -209,8 +227,26 @@ class _MobileCctvAppState extends State<MobileCctvApp>
       _aiModelManager.load(),
       _homesController.load(),
       AuthController.instance.restore(),
+      _ensureRuntimePermissions(),
     ]).then((_) => _syncAlertsListenerToAuthStatus());
     _router = _buildRouter();
+  }
+
+  /// `RECORD_AUDIO`/`BLUETOOTH_CONNECT` are Android *runtime* permissions
+  /// (API 23+/31+) that live view's two-way talk and audio routing need —
+  /// see `LiveViewController._ensureRuntimePermissions`'s own doc for why
+  /// they're required even for a recvonly session. Requested here, during
+  /// the splash screen, rather than lazily the first time Camera Live opens
+  /// — direct user feedback was that a permission prompt appearing only
+  /// after navigating into a screen felt like it came from nowhere; asking
+  /// once up front, before the user ever reaches the Dashboard, reads as
+  /// the app "setting itself up" instead. `LiveViewController` still asks
+  /// again before every LAN connect as a defensive backstop (a no-op once
+  /// already granted) in case this ever runs on a platform/flow that
+  /// skipped the splash screen.
+  Future<void> _ensureRuntimePermissions() async {
+    if (!Platform.isAndroid) return;
+    await [Permission.microphone, Permission.bluetoothConnect].request();
   }
 
   AuthStatus? _lastSyncedAuthStatus;

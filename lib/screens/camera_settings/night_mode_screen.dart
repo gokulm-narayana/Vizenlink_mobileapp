@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
 import '../../widgets/fixed_preview_layout.dart';
@@ -103,14 +104,18 @@ class _NightModeScreenState extends State<NightModeScreen> {
   Future<void> _loadRealNightMode() async {
     final connection = _camera.connection;
     if (connection == null) return;
-    final nuraeye = NuraeyeClient(connection);
-    var result = await NightVisionClient(nuraeye).getNightVisionType();
-    nuraeye.close();
-
     final thingName = connection.thingName;
-    if (result is! CameraSuccess && thingName != null) {
-      result = await WanNightVisionClient(thingName).getNightVisionType();
-    }
+    final result = await callPreferringKnownTransport(
+      camera: _camera,
+      thingName: thingName,
+      lan: () async {
+        final nuraeye = NuraeyeClient(connection);
+        final result = await NightVisionClient(nuraeye).getNightVisionType();
+        nuraeye.close();
+        return result;
+      },
+      wan: () => WanNightVisionClient(thingName!).getNightVisionType(),
+    );
     if (!mounted) return;
     if (result case CameraSuccess(:final value)) {
       setState(() {
@@ -219,20 +224,25 @@ class _NightModeScreenState extends State<NightModeScreen> {
 
     final bool succeeded;
     if (connection != null) {
-      final nuraeye = NuraeyeClient(connection);
-      var result = await NightVisionClient(
-        nuraeye,
-      ).setNightVisionType(_nightModeToType(_mode));
-      nuraeye.close();
-
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention.
       final thingName = connection.thingName;
-      if (result is! CameraSuccess && thingName != null) {
-        result = await WanNightVisionClient(
-          thingName,
-        ).setNightVisionType(_nightModeToType(_mode));
-      }
+      // A failed LAN Apply/Set retries over WAN before surfacing an error
+      // (or WAN is called directly when known — see Camera.lastKnownWan's
+      // doc), per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final result = await callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () async {
+          final nuraeye = NuraeyeClient(connection);
+          final result = await NightVisionClient(
+            nuraeye,
+          ).setNightVisionType(_nightModeToType(_mode));
+          nuraeye.close();
+          return result;
+        },
+        wan: () => WanNightVisionClient(
+          thingName!,
+        ).setNightVisionType(_nightModeToType(_mode)),
+      );
       succeeded = result is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();

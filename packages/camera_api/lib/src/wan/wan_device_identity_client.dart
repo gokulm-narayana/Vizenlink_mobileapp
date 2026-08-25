@@ -47,6 +47,41 @@ class WanDeviceIdentityClient {
     }
   }
 
+  /// `FR-NE-115`, added 2026-08-21: WAN mirror of `OnvifDeviceClient.getDeviceInformation()` —
+  /// reuses the same [DeviceInformation] type both transports return, since the field set is
+  /// identical either way. Closes the same "Get always LAN regardless of isWan" gap
+  /// [getDeviceIdentity] closed above, this time for `CameraInfoScreen`'s "Device Information"
+  /// card.
+  Future<CameraResult<DeviceInformation>> getDeviceInfo({
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    try {
+      final output = await _iot.sendCommandWithResponse(IotCommandClient.getDeviceInfo);
+      if (output == null) return const CameraTimeout();
+      final manufacturer = output['manufacturer'];
+      final model = output['model'];
+      final firmwareVersion = output['firmware_version'];
+      final serialNumber = output['serial_number'];
+      final hardwareId = output['hardware_id'];
+      if (manufacturer is! String ||
+          model is! String ||
+          firmwareVersion is! String ||
+          serialNumber is! String ||
+          hardwareId is! String) {
+        return CameraFailure('GetDeviceInfo response missing fields: $output');
+      }
+      return CameraSuccess(DeviceInformation(
+        manufacturer: manufacturer,
+        model: model,
+        firmwareVersion: firmwareVersion,
+        serialNumber: serialNumber,
+        hardwareId: hardwareId,
+      ));
+    } catch (e) {
+      return CameraFailure(e.toString());
+    }
+  }
+
   Future<CameraResult<void>> setDeviceName(
     String name, {
     Duration timeout = const Duration(seconds: 15),

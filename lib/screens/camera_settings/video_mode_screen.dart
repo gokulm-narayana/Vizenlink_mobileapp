@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../widgets/camera_preview_thumbnail.dart';
 import '../../widgets/fixed_preview_layout.dart';
@@ -220,20 +221,25 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
 
     final bool succeeded;
     if (connection != null) {
-      final client = OnvifImagingClient(connection);
-      var result = await client.setImagingSettings(
-        ImagingSettings(irCutFilterMode: _videoModeToIrCutFilter(_mode)),
-      );
-      client.close();
-
-      // A failed LAN Apply/Set retries over WAN before surfacing an error,
-      // per mobile-app-screen-conventions.md's LAN/WAN convention.
       final thingName = connection.thingName;
-      if (result is! CameraSuccess && thingName != null) {
-        result = await WanImagingClient(
-          thingName,
-        ).setDayNightMode(_videoModeToIrCutFilter(_mode));
-      }
+      // A failed LAN Apply/Set retries over WAN before surfacing an error
+      // (or WAN is called directly when known — see Camera.lastKnownWan's
+      // doc), per mobile-app-screen-conventions.md's LAN/WAN convention.
+      final result = await callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () async {
+          final client = OnvifImagingClient(connection);
+          final result = await client.setImagingSettings(
+            ImagingSettings(irCutFilterMode: _videoModeToIrCutFilter(_mode)),
+          );
+          client.close();
+          return result;
+        },
+        wan: () => WanImagingClient(
+          thingName!,
+        ).setDayNightMode(_videoModeToIrCutFilter(_mode)),
+      );
       succeeded = result is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();

@@ -91,7 +91,7 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
     final action = await showDialog<String>(
       context: context,
       builder: (dialogContext) {
-        return _GlassDialog(
+        return GlassDialog(
           key: const Key('SCAN-007'),
           title: camera.name,
           child: Column(
@@ -176,7 +176,7 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
             // closed.
             return PopScope(
               canPop: !verifying,
-              child: _GlassDialog(
+              child: GlassDialog(
                 key: const Key('SCAN-010'),
                 title: camera.name,
                 child: Column(
@@ -535,8 +535,8 @@ class _ScannedDevicesScreenState extends State<ScannedDevicesScreen> {
 
 /// Glass-styled dialog shell shared by the scan setup dialogs, matching the
 /// app's Login/Signup visual language instead of a default AlertDialog.
-class _GlassDialog extends StatelessWidget {
-  const _GlassDialog({super.key, required this.title, required this.child});
+class GlassDialog extends StatelessWidget {
+  const GlassDialog({super.key, required this.title, required this.child});
 
   final String title;
   final Widget child;

@@ -126,6 +126,18 @@ must be read from `getImagingOptions()`'s own `wdrSupported` flag, never inferre
 [Per-setting Options-response capability flags](#per-setting-options-response-capability-flags--not-the-same-idea-as-the-two-above)
 for the WAN mirror of this same flag.
 
+**Also the HDR/Linear sensor capture-mode switch (`FR-CF-147`).** On the two HDR-capable
+sensors (IMX662, GC4663), the WDR On/Off field this section already covers **is** the sensor
+capture-mode switch — not a separate control. The sensor's own dual-exposure readout
+(`init_hdr_mode`) is boot-time-only with no live re-init path, so an actual WDR On<->Off
+transition reboots the camera to take effect; the health-monitor task detects the
+booted-vs-persisted mismatch and triggers the reboot (not the request path itself). WDR
+*Level* is unaffected by this — it's still a pure runtime blend-strength control within
+whichever mode is active. **UI must confirm before toggling WDR on a camera where
+`wdrSupported` is true** — it may trigger a reboot, briefly interrupting live view/recording.
+Mirrors the deterrence confirmation-gate pattern (`FR-MOB-105`). See
+`imaging_settings_screen.dart`'s `_WdrCard` for the reference implementation.
+
 ## Image Quality
 
 **Concept:** the standard ISP sliders — brightness, saturation, contrast, sharpness, exposure
@@ -302,6 +314,23 @@ ONVIF/WAN setter. On either transport, **the caller must update its own stored
 `CameraConnection.password` after a successful `setUserPassword`** — the client that made the
 call keeps using the old password it was constructed with.
 
+## Device Information (read-only)
+
+**Concept:** the camera's fixed build/hardware identity — manufacturer, model, firmware
+version, serial number, hardware ID (ONVIF `GetDeviceInformation`). Read-only, no setter.
+
+**Not to be confused with:** [Device Identity](#device-identity-name--location--time-zone--password)'s
+name/location/time zone — those are user-configurable; this is fixed per-unit/build data.
+
+**LAN:** `OnvifDeviceClient.getDeviceInformation()`.
+
+**WAN:** `WanDeviceIdentityClient.getDeviceInfo()` (`FR-NE-115`, added 2026-08-21) — returns the
+same `DeviceInformation` type as the LAN client.
+
+**Notes:** `CameraInfoScreen`'s "Device Information" card shows the cached value instantly
+(`CachedCameraSettings`, warmed at onboarding) and only makes a live call on a cache miss —
+same convention as every other read-only card in this guide.
+
 ## Device Reboot / Factory Reset
 
 **Concept:** rebooting the camera on demand (ONVIF `SystemReboot`), and resetting it to factory
@@ -475,7 +504,7 @@ transport and purpose — pick by scenario, not by "which one did I use last tim
 | Scenario | Client | Notes |
 |---|---|---|
 | LAN, user-facing capture or click-to-draw backdrop | `SnapshotClient.getSnapshot()` | `GET /snapshot`; `profile: 'high'` for a real capture, `'medium'` for a lightweight mask/OSD editor backdrop. |
-| WAN, transient settings-screen backdrop | `WanPreviewSnapshotClient.getPreviewSnapshot()` | End-to-end encrypted (RSA-2048-OAEP + AES-GCM); **caller must not persist the returned bytes** — no gallery save, no cache file. Requires a local keypair already registered (open a settings screen on LAN once first). |
+| WAN, transient settings-screen backdrop | `WanPreviewSnapshotClient.getPreviewSnapshot()` | End-to-end encrypted (AES-256-GCM under a camera-generated shared key); **caller must not persist the returned bytes** — no gallery save, no cache file. Requires the shared key already fetched (open a settings screen on LAN once first — `RestStreamingClient.getPreviewKey()`, redesigned 2026-08-21 from a per-app pushed RSA key so re-adding this camera on a second device doesn't lock the first one out). |
 | WAN, live video | `WanLiveViewClient.resolvePlaybackUri()` | Not a snapshot — resolves a playable KVS HLS URL after `startCloudStreaming()` confirms active. See [Cloud Streaming](#cloud-streaming-wan-live-view) below. |
 
 ## Cloud Streaming (WAN live view)
@@ -575,16 +604,34 @@ they go through `NuraeyeClient.call()`'s REST-backed action-name facade instead 
 vs. generated REST clients](#hand-written-vs-generated-rest-clients) below). `RestBuzzerClient`-
 style direct usage is unused in the app.
 
-## Local Storage — capability-gated, not yet wired up
+## Local Storage
 
-**Concept:** SD-card local storage status/config.
+**Concept:** SD-card local recording enable/disable, plus live card-presence and capacity/free
+space (`FR-CF-044`/`FR-NE-087`/`FR-MOB-083`). **Two independent facts, not one**: *capability*
+(does this SKU have an SD slot at all — a fixed, build-time fact) and *card presence* (is a card
+actually inserted right now — always live). A camera can be capability-supported with no card
+present; the camera actively **rejects** turning recording on in that case (`500`) rather than
+silently accepting it.
 
-**Status:** the REST client exists (`RestStorageClient`, generated) and its capability gate
-exists (`GetCapabilitiesResponse.localStorageCapable`, from `RestCapabilitiesClient`) — but
-**nothing in `mobile_app/lib` calls either the settings client or the capability check yet.** If
-you're the one wiring this up: call `RestCapabilitiesClient.getCapabilities()` first and gate the
-control on `localStorageCapable` before touching `RestStorageClient` — there is no existing call
-site to copy this pattern from, so don't assume one already checks it.
+**Wired up 2026-08-21** — added the whole way through (client, capability field, UI card,
+`StorageSettingsScreen`) in one pass; no earlier partial state to reconcile against.
+
+**LAN:** `LocalStorageClient.getStatus()`/`setEnabled(bool)`. **WAN:**
+`WanLocalStorageClient` — same methods, same `LocalStorageStatus` type.
+
+**Capability:** `CameraCapabilities.localStorageCapable` (`CapabilitiesClient.getCapabilities()`)
+— cached at onboarding as `CachedCameraSettings.localStorageSupported`, same convention as
+`osdSupported`/`privacyModeSupported`. **Live card presence is never cached** — always a fresh
+`getStatus()` call, since it can change the instant the SD slot is opened.
+
+**UI convention — deliberately not FR-MOB-082's "hide the control" pattern**: the top-level
+"Storage" entry on `CameraSettingsScreen` stays visible and disabled-with-message when
+`localStorageSupported == false` (same `_GroupTile` pattern as OSD/Privacy Masks), never hidden
+— direct user instruction. Within `StorageSettingsScreen` itself, the enable/disable toggle is
+omitted (not just disabled) and replaced with a "No SD card present" warning whenever
+`cardPresent == false`, since the camera would reject a Set attempt anyway. Turning the toggle
+off requires an explicit confirmation dialog (stops future recording, does not erase existing
+footage).
 
 ## Capabilities (discovery, not a setting)
 

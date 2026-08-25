@@ -15,6 +15,7 @@ import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
+import '../../app_state/debug_transport_override.dart';
 import '../../app_state/homes_controller.dart';
 import '../../app_state/live_view_controller.dart';
 import '../../app_state/route_observer.dart';
@@ -143,18 +144,45 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
       });
     final connection = widget.camera.connection;
     if (connection != null) {
-      _liveViewController = LiveViewController(connection)
+      _liveViewController = _createLiveViewController(connection)
         ..addListener(_onLiveViewChanged)
         ..connect();
-      unawaited(_pollSignalStrength());
-      _signalPollTimer = Timer.periodic(
-        _signalPollInterval,
-        (_) => unawaited(_pollSignalStrength()),
-      );
-      unawaited(_loadRealBitrate());
-      unawaited(_loadShortcutState());
+      // Signal strength / bitrate / shortcut-tile state are deferred until
+      // the connect attempt resolves — see [_maybeStartSecondaryLoads]'s doc
+      // for why firing them concurrently with the initial connect used to
+      // be a problem.
     }
     _initConnectivity();
+    DebugTransportOverride.instance.addListener(_onGlobalForceTransportChanged);
+  }
+
+  LiveViewController _createLiveViewController(CameraConnection connection) {
+    return LiveViewController(
+      connection,
+      forceTransport: DebugTransportOverride.instance.value,
+    );
+  }
+
+  /// Test-only — see [DebugTransportOverride]'s doc. Fires whenever the
+  /// global Force LAN/WAN override changes (e.g. the user picked a
+  /// different option from the Dashboard's app bar while this screen is
+  /// already open) — tears down whatever session is active and starts a
+  /// fresh one under the newly-selected override.
+  Future<void> _onGlobalForceTransportChanged() async {
+    if (!mounted) return;
+    final connection = widget.camera.connection;
+    if (connection == null) return;
+    final oldController = _liveViewController;
+    oldController?.removeListener(_onLiveViewChanged);
+    await oldController?.stop();
+    oldController?.dispose();
+    if (!mounted) return;
+    setState(() {
+      _secondaryLoadsStarted = false;
+      _liveViewController = _createLiveViewController(connection)
+        ..addListener(_onLiveViewChanged)
+        ..connect();
+    });
   }
 
   /// Refreshes the Privacy Mode/Video Mode/Siren/Spotlight/Warning shortcut
@@ -171,20 +199,17 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
     final connection = widget.camera.connection;
     if (connection == null) return;
 
+    // Run one at a time, not concurrently — this camera's embedded HTTP
+    // server can stall for seconds under a burst of concurrent requests
+    // (same reasoning as `camera_settings_cache.dart`'s prefetch).
     final nuraeye = NuraeyeClient(connection);
     final imagingClient = OnvifImagingClient(connection);
-    final results = await Future.wait([
-      PrivacyModeClient(nuraeye).getPrivacyMode(),
-      imagingClient.getImagingSettings(),
-      DeterrenceClient(nuraeye).getDeterrenceStatus(),
-    ]);
+    final privacyResult = await PrivacyModeClient(nuraeye).getPrivacyMode();
+    final imagingResult = await imagingClient.getImagingSettings();
+    final statusResult = await DeterrenceClient(nuraeye).getDeterrenceStatus();
     nuraeye.close();
     imagingClient.close();
     if (!mounted) return;
-
-    final privacyResult = results[0] as CameraResult<PrivacyMode>;
-    final imagingResult = results[1] as CameraResult<ImagingSettings>;
-    final statusResult = results[2] as CameraResult<DeterrenceStatus>;
 
     if (privacyResult case CameraSuccess(:final value)) {
       widget.homesController.updateCamera(
@@ -358,9 +383,46 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   /// the current build finishes instead.
   void _onLiveViewChanged() {
     _syncCameraOnlineStatus();
+    _syncLastKnownTransport();
+    _maybeStartSecondaryLoads();
     Future.microtask(() {
       if (mounted) setState(() {});
     });
+  }
+
+  /// Fires once, the first time [_liveViewController] leaves
+  /// [LiveViewStatus.connecting] (connected or failed) — deferred rather
+  /// than fired at `initState` alongside `connect()` itself, so signal
+  /// strength / real bitrate / shortcut-tile reads don't compete with the
+  /// time-critical WebRTC signaling POST for the same camera's embedded
+  /// HTTP server. Previously this screen fired ~6 concurrent LAN calls the
+  /// instant it opened, all against the same camera the connect sequence
+  /// was also mid-negotiation with.
+  bool _secondaryLoadsStarted = false;
+
+  void _maybeStartSecondaryLoads() {
+    if (_secondaryLoadsStarted) return;
+    final controller = _liveViewController;
+    if (controller == null || controller.status == LiveViewStatus.connecting) {
+      return;
+    }
+    _secondaryLoadsStarted = true;
+    unawaited(_runSecondaryLoads());
+  }
+
+  /// Runs the non-critical LAN reads one at a time (not as a
+  /// `Future.wait`-style burst) now that the connect attempt itself has
+  /// resolved either way.
+  Future<void> _runSecondaryLoads() async {
+    await _pollSignalStrength();
+    if (!mounted) return;
+    _signalPollTimer = Timer.periodic(
+      _signalPollInterval,
+      (_) => unawaited(_pollSignalStrength()),
+    );
+    await _loadRealBitrate();
+    if (!mounted) return;
+    await _loadShortcutState();
   }
 
   /// The live-view connection attempt *is* a reachability check — a failed
@@ -391,6 +453,26 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
         isOnline: online,
         lastSeen: online ? DateTime.now() : null,
       ),
+    );
+  }
+
+  /// Records which transport actually delivered the current connection —
+  /// see `Camera.lastKnownWan`'s doc. Only writes on a genuine
+  /// [LiveViewStatus.connected] (never on `connecting`/`reconnecting`, which
+  /// don't yet know, or `failed`/`stopped`, which don't mean the *other*
+  /// transport is the answer) and only when it actually changed, same
+  /// guard style as [_syncCameraOnlineStatus].
+  void _syncLastKnownTransport() {
+    final controller = _liveViewController;
+    if (controller == null || controller.status != LiveViewStatus.connected) {
+      return;
+    }
+    final isWan = controller.transport == LiveViewTransport.wan;
+    final current = _currentCamera(widget.homesController.value);
+    if (current.lastKnownWan == isWan) return;
+    widget.homesController.updateCamera(
+      current.id,
+      (camera) => camera.copyWith(lastKnownWan: isWan),
     );
   }
 
@@ -460,6 +542,9 @@ class _CameraLiveScreenState extends State<CameraLiveScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     routeObserver.unsubscribe(this);
+    DebugTransportOverride.instance.removeListener(
+      _onGlobalForceTransportChanged,
+    );
     _recordingTicker?.cancel();
     _cellularReminderTicker?.cancel();
     _signalPollTimer?.cancel();

@@ -67,7 +67,7 @@ class WsDiscoveryClient {
   /// merged with its results (not gated on multicast finding nothing; multicast on WiFi can fail
   /// partially, see `discovery_screen.dart`'s doc comment). Mirrors
   /// `WSDiscoveryScanner.startScanUnicast()`'s single-shared-socket send+receive pattern and
-  /// timing (15s overall cap, 5s straggler wait after the last probe is sent).
+  /// timing (30s overall cap, 10s straggler wait after the last probe is sent).
   ///
   /// **Sends are paced, not fired in a tight loop — found and fixed 2026-08-20.** Firing all
   /// ~253 unicast probes back-to-back (the original behavior) triggers an ARP-resolution storm:
@@ -80,9 +80,19 @@ class WsDiscoveryClient {
   /// the sweep itself, not a WiFi-specific issue (that's a separate, real gap: this camera's
   /// WiFi radio driver doesn't deliver *multicast* WS-Discovery frames at all, unrelated to this
   /// unicast path — see `kb/raw/2026-08-20-wifi-country-code-and-ws-discovery-multicast-gap.md`).
+  ///
+  /// **Overall cap and straggler wait widened 2026-08-20** (was 15s/5s): pacing ~253 sends at
+  /// [sendInterval] takes ~13s on its own, which under the old 15s cap left only ~2s of actual
+  /// post-send listening time — far short of the intended 5s straggler window. On top of that,
+  /// this firmware's WS-Discovery responder runs at the lowest FreeRTOS priority tier
+  /// (`tskIDLE_PRIORITY+1`, "best-effort housekeeping") and can miss a single probe entirely if
+  /// the camera is transiently busy (e.g. actively streaming to an NVR) at the exact moment it
+  /// arrives — a real observed case where one camera answered and another, busier one on the
+  /// same scan didn't, with no retry to recover. Widening the caps doesn't add a retry, but gives
+  /// substantially more real listening time for a delayed reply to still land within the scan.
   Future<List<WsDiscoveryCandidate>> scanUnicast({
-    Duration overallCap = const Duration(seconds: 15),
-    Duration stragglerWait = const Duration(seconds: 5),
+    Duration overallCap = const Duration(seconds: 30),
+    Duration stragglerWait = const Duration(seconds: 10),
     Duration sendInterval = const Duration(milliseconds: 50),
   }) async {
     final hostAddresses = await _localSubnetHostAddresses();

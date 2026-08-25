@@ -16,7 +16,8 @@ Two-part flow: a centered scanning popup, then a dedicated results page.
 | SCAN-015 | "Stop scanning" button | FilledButton, inside SCAN-014 | confirms stopping — closes the SCAN-001 popup and returns `null` to the caller (Dashboard stays on its own screen, no navigation to `ScannedDevicesScreen`). Does **not** cancel the underlying `scanForCameras()` call itself — `camera_api` has no cancellation support for the in-flight WS-Discovery/probe calls, so they're left to finish in the background and their result is simply discarded |
 | SCAN-016 | "Keep scanning" button | TextButton, inside SCAN-014 | declines — closes SCAN-014 only, SCAN-001 keeps waiting on the scan as before |
 | SCAN-018 | "No cameras found" message | Icon + Text, inside the popup | `showDashboardScanningPopup` only — replaces the spinner/SCAN-001 content in place (same dialog, doesn't navigate) once the scan completes with zero results. Also shown on a scan error, same as an empty result |
-| SCAN-017 | Close button | TextButton, shown with SCAN-018 | dismisses the popup and returns `null` to the caller (no navigation to `ScannedDevicesScreen`, since there'd be nothing to show there) |
+| SCAN-019 | "Add camera manually" button | TextButton, shown with SCAN-018 | closes the popup and opens the SCAN-020 manual-add dialog (`showAddCameraManuallyDialog`, `add_camera_manually_dialog.dart`) — the fallback for a camera LAN discovery didn't find |
+| SCAN-017 | Close button | TextButton, shown with SCAN-018 | dismisses the popup and returns with no scan result and `addManually: false` (no navigation to `ScannedDevicesScreen`, since there'd be nothing to show there) |
 
 `SCAN-002` (Cancel button, inline in the SCAN-001 popup) is retired — do not reuse this ID.
 
@@ -37,6 +38,25 @@ Two-part flow: a centered scanning popup, then a dedicated results page.
 | SCAN-010 | Setup form | Glass-styled dialog (GlassCard, rounded fields, gradient "Connect" button) | Unified form for all three entry paths: **Configured** camera → username/password start empty (user must know the camera's existing credentials); **default credentials** path → username/password pre-filled `admin`/`password`; **change credentials** path → username pre-filled `admin`, "New password" + "Confirm password" fields, validated to match. Room dropdown only lists rooms on the currently selected home. "Connect" verifies the credentials against the real camera (`OnvifDeviceClient.getDeviceInformation`) before adding it and returning to the Dashboard — see SCAN-012 and Notes. |
 | SCAN-012 | Verifying spinner | CircularProgressIndicator (small, centered, inside SCAN-010) | shown while the "Connect" credential check is in flight; the dialog is non-dismissible (tap-outside via `barrierDismissible: false`, and the system/gesture back button via `PopScope(canPop: !verifying)`) and both Connect/Cancel are disabled during this window |
 
+## Add camera manually
+
+- **Dart file:** `lib/screens/scan/add_camera_manually_dialog.dart`
+- **Entry point:** SCAN-019, shown only once a `showDashboardScanningPopup` scan completes with zero results — there is no always-visible manual-entry option, by design (scan stays the default path).
+- **Purpose:** Fallback for a camera LAN discovery (`scanForCameras()`) didn't find (e.g. multicast/WiFi discovery reliability gaps — see `scanForCameras`'s own notes). Same "Connect" verification flow as SCAN-010 (`OnvifDeviceClient.getDeviceInformation`, then best-effort `getSerialNumber`/`getNetworkInterfaceInfo`/`CapabilitiesClient.getCapabilities`/`getDeviceIdentity`), with one added field SCAN-010 doesn't need: the camera's LAN IP/host itself, since there's no scan result to supply it. No factory-reset default-credentials prefill (unlike SCAN-007/SCAN-010's "Unconfigured" path) — a manually-entered camera is assumed already configured, so the user must know its real credentials.
+
+| Design ID | Element | Type | Notes |
+|-----------|---------|------|-------|
+| SCAN-020 | Manual add form | Glass-styled dialog (`GlassDialog`, shared with SCAN-007/SCAN-010) | title "Add camera manually" |
+| SCAN-021 | Camera IP address field | TextField | required — the one field this form has that SCAN-010 doesn't |
+| SCAN-022 | Username field | TextField | starts empty, same as SCAN-010's "Configured" camera path |
+| SCAN-023 | Password field | TextField (obscured) | starts empty, no default-credentials prefill (see Purpose above) |
+| SCAN-024 | Room dropdown | DropdownButtonFormField | only lists rooms on the currently selected home, same as SCAN-010 |
+| SCAN-026 | Connect button | GradientButton | verifies the IP/username/password against the real camera before adding it; disabled while SCAN-028 is showing |
+| SCAN-027 | Cancel button | TextButton | closes the dialog without adding anything; disabled while SCAN-028 is showing |
+| SCAN-028 | Verifying spinner | CircularProgressIndicator (small, centered) | shown while the "Connect" credential check is in flight — same non-dismissible treatment as SCAN-012 (`barrierDismissible: false` + `PopScope(canPop: !verifying)`) |
+
+`SCAN-025` is reserved for a "Confirm password" field, in case a future factory-reset "change credentials" path is added here to match SCAN-010 — not currently used.
+
 ## Notes
 
 - Reached only from the Dashboard's "Add camera" AppBar button (`DASH-019`): tap → SCAN-001 popup (`showDashboardScanningPopup`, cancelable via SCAN-002/SCAN-014) runs the real scan over the Dashboard → on completion (not cancellation), push to `/dashboard/scan` with the results already attached via `state.extra`, so this screen's SCAN-011 initial-load scan is skipped.
@@ -50,5 +70,6 @@ Two-part flow: a centered scanning popup, then a dedicated results page.
 - **Auto-sync on add.** Right after `HomesController.addCamera` succeeds, the shared `syncCameraFromDevice` helper (`lib/app_state/camera_sync.dart`) fires automatically for the new camera — fire-and-forget, not awaited, so it doesn't delay returning to the Dashboard. It fetches timezone and a real snapshot in addition to the device/network/capability fields the Connect-time check already verified, filling in fields that check alone doesn't cover.
 - **Widget tests for this screen (`test/widget_test.dart`) cannot currently complete in a sandboxed/CI environment without real LAN access** — `WsDiscoveryClient`'s UDP multicast/unicast scan never returns candidates, so the screen never leaves its SCAN-011 loading state. This is a pre-existing environment limitation (confirmed unchanged before/after the SCAN-010 verification work above), not something introduced by it.
 - Default stub credentials: username `admin`, password `password`.
-- Styling: SCAN-007 and SCAN-010 use the app's glass/gradient visual language (`GlassCard`, rounded input fields, gradient-filled primary button) rather than default `AlertDialog` styling, matching Login/Signup.
+- Styling: SCAN-007 and SCAN-010 use the app's glass/gradient visual language (`GlassCard`, rounded input fields, gradient-filled primary button) rather than default `AlertDialog` styling, matching Login/Signup. `SCAN-020`'s manual-add form reuses the same `GlassDialog` widget (renamed from a `scanned_devices_screen.dart`-private `_GlassDialog` so `add_camera_manually_dialog.dart` could reuse it) for the same look.
 - Superseded the earlier modal-bottom-sheet version of this flow.
+- **`showDashboardScanningPopup` returns a record** (`({List<ScannedCamera>? cameras, bool addManually})`, typedef'd as `DashboardScanResult`), not a plain nullable list — added alongside SCAN-019/SCAN-020 so the Dashboard can tell "scan found nothing and the user closed the popup" apart from "the user tapped Add camera manually," which need different follow-up actions (do nothing, vs. open SCAN-020).

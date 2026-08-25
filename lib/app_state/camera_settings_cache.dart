@@ -24,6 +24,13 @@ import 'package:camera_api/camera_api.dart';
 /// be called `unawaited()`, mirroring `syncCameraFromDevice`'s fire-and-forget
 /// use in the add-camera flow — this never blocks add or reports failures of
 /// its own.
+///
+/// **Run one call at a time, not concurrently** — an earlier version fired
+/// all of these via `Future.wait`, which floods the camera's embedded HTTP
+/// server and can turn a single screen open into a many-seconds-to-tens-of-
+/// seconds stall (the sibling `nuraeye-rt` app hit and documented this exact
+/// failure mode before rewriting its own equivalent prefetch to be
+/// sequential).
 Future<void> prefetchAndCache(CameraConnection connection) async {
   final imaging = OnvifImagingClient(connection);
   final osd = OsdClient(connection);
@@ -33,15 +40,13 @@ Future<void> prefetchAndCache(CameraConnection connection) async {
   final audioCapability = AudioCapabilityClient(connection);
   final speakerVolume = SpeakerVolumeClient(connection);
   try {
-    await Future.wait([
-      imaging.getImagingOptions(),
-      osd.getOsdOptions(),
-      videoEncoder.getVideoEncoderSettingsOptions(),
-      mask.getMaskOptions(),
-      networkInfo.getSupportedTimezones(),
-      audioCapability.getAudioCapability(),
-      speakerVolume.getSpeakerVolume(),
-    ]);
+    await imaging.getImagingOptions();
+    await osd.getOsdOptions();
+    await videoEncoder.getVideoEncoderSettingsOptions();
+    await mask.getMaskOptions();
+    await networkInfo.getSupportedTimezones();
+    await audioCapability.getAudioCapability();
+    await speakerVolume.getSpeakerVolume();
   } finally {
     imaging.close();
     osd.close();

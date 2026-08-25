@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
@@ -48,6 +50,7 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
   bool _isSaving = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
+  Uint8List? _wanPreviewBytes;
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -160,11 +163,25 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
       connection: connection,
     );
     if (!mounted) return;
+    if (succeeded) {
+      setState(() {
+        _isRefreshing = false;
+        _previewReloadKey++;
+        _wanPreviewBytes = null;
+      });
+      return;
+    }
+
+    // LAN failed — fall back to a transient WAN preview rather than
+    // surfacing an error outright, per mobile-app-screen-conventions.md's
+    // LAN/WAN convention.
+    final wanBytes = await fetchWanPreviewSnapshot(connection: connection);
+    if (!mounted) return;
     setState(() {
       _isRefreshing = false;
-      _previewReloadKey++;
+      if (wanBytes != null) _wanPreviewBytes = wanBytes;
     });
-    if (!succeeded) {
+    if (wanBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to refresh preview')),
       );
@@ -241,6 +258,7 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
                     draftZone: _draftZone,
                     selectedZoneId: _selectedZoneId,
                     onVertexChanged: _updateVertex,
+                    overrideBytes: _wanPreviewBytes,
                   ),
                   const SizedBox(height: 8),
                   Align(
@@ -414,6 +432,7 @@ class _PersonPreview extends StatelessWidget {
     required this.draftZone,
     required this.selectedZoneId,
     required this.onVertexChanged,
+    this.overrideBytes,
   });
 
   final Key settingsKey;
@@ -422,6 +441,7 @@ class _PersonPreview extends StatelessWidget {
   final PolygonZone? draftZone;
   final int? selectedZoneId;
   final void Function(int vertexIndex, Offset offset) onVertexChanged;
+  final Uint8List? overrideBytes;
 
   @override
   Widget build(BuildContext context) {
@@ -435,7 +455,7 @@ class _PersonPreview extends StatelessWidget {
           child: Stack(
             key: settingsKey,
             children: [
-              CameraImage(camera: camera),
+              CameraImage(camera: camera, overrideBytes: overrideBytes),
               Positioned.fill(
                 child: LayoutBuilder(
                   builder: (context, constraints) {

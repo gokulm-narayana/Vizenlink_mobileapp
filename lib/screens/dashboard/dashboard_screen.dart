@@ -8,8 +8,11 @@ import '../../app_state/ai_model_manager.dart';
 import '../../app_state/alerts_controller.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/chat_controller.dart';
+import '../../app_state/debug_transport_override.dart';
 import '../../app_state/events_controller.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/live_view_controller.dart';
+import '../../app_state/route_observer.dart';
 import '../../models/camera.dart';
 import '../../models/home.dart';
 import '../../widgets/camera_chatbot.dart';
@@ -18,6 +21,8 @@ import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_fab.dart';
 import '../camera_live/camera_live_screen.dart';
 import '../homes/manage_homes_screen.dart';
+import '../multiview/multiview_screen.dart';
+import '../scan/add_camera_manually_dialog.dart';
 import '../scan/scanned_devices_screen.dart';
 import '../scan/scanning_popup.dart';
 
@@ -63,7 +68,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, RouteAware {
   late TabController _collectionTabController;
   List<String> _tabLabels = const [];
   _CollectionLayout _layout = _CollectionLayout.grid;
@@ -81,22 +86,53 @@ class _DashboardScreenState extends State<DashboardScreen>
       vsync: this,
     );
     widget.homesController.addListener(_onHomesChanged);
-    _thumbnailRefreshTimer = Timer.periodic(
+    _startBackgroundTimers();
+  }
+
+  void _startBackgroundTimers() {
+    _thumbnailRefreshTimer ??= Timer.periodic(
       _thumbnailRefreshInterval,
       (_) => _refreshAllThumbnails(),
     );
-    _reachabilityCheckTimer = Timer.periodic(
+    _reachabilityCheckTimer ??= Timer.periodic(
       _reachabilityCheckInterval,
       (_) => _checkAllReachability(),
     );
   }
 
+  void _stopBackgroundTimers() {
+    _thumbnailRefreshTimer?.cancel();
+    _thumbnailRefreshTimer = null;
+    _reachabilityCheckTimer?.cancel();
+    _reachabilityCheckTimer = null;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    routeObserver.subscribe(this, ModalRoute.of(context)! as PageRoute);
+  }
+
+  /// Dashboard's reachability/thumbnail polling covers every camera in
+  /// every home — while a screen like Camera Live is pushed on top (e.g. an
+  /// active WebRTC/WAN session for one of those same cameras), these two
+  /// timers would otherwise keep contending with it for the same camera's
+  /// LAN bandwidth/embedded HTTP server for no benefit, since the user can't
+  /// see the Dashboard tiles they'd be refreshing anyway. Paused for exactly
+  /// as long as this screen is covered, not stopped for good — resumes the
+  /// moment the user navigates back.
+  @override
+  void didPushNext() => _stopBackgroundTimers();
+
+  @override
+  void didPopNext() => _startBackgroundTimers();
+
   @override
   void dispose() {
+    routeObserver.unsubscribe(this);
     widget.homesController.removeListener(_onHomesChanged);
     _collectionTabController.dispose();
-    _thumbnailRefreshTimer?.cancel();
-    _reachabilityCheckTimer?.cancel();
+    _stopBackgroundTimers();
     super.dispose();
   }
 
@@ -211,11 +247,20 @@ class _DashboardScreenState extends State<DashboardScreen>
     // Only navigates to the results screen once a real (non-cancelled) scan
     // has actually finished, passing its results along so that screen
     // doesn't re-run the same scan a second time.
-    final results = await showDashboardScanningPopup(context);
-    if (results == null || !mounted) return;
+    final result = await showDashboardScanningPopup(context);
+    if (!mounted) return;
+    if (result.addManually) {
+      await showAddCameraManuallyDialog(
+        context,
+        homesController: widget.homesController,
+      );
+      return;
+    }
+    final cameras = result.cameras;
+    if (cameras == null) return;
     context.push(
       '${DashboardScreen.routeName}/${ScannedDevicesScreen.routeName}',
-      extra: results,
+      extra: cameras,
     );
   }
 
@@ -308,6 +353,7 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
           ),
           actions: [
+            const _ForceTransportMenu(),
             if (_isReorderMode)
               Padding(
                 padding: const EdgeInsets.only(right: 8),
@@ -349,6 +395,24 @@ class _DashboardScreenState extends State<DashboardScreen>
                         : Icons.grid_view_outlined,
                   ),
                   onPressed: _toggleLayout,
+                ),
+                IconButton(
+                  key: const Key('DASH-022'),
+                  tooltip: 'Multiview',
+                  icon: const Icon(Icons.dashboard_customize_outlined),
+                  // rootNavigator: true — MultiviewScreen is a modal
+                  // takeover (like CameraLiveScreen's fullscreen/AI Mode),
+                  // not a nested go_router route, so it renders outside
+                  // MainShell's bottom nav bar instead of underneath it.
+                  onPressed: () =>
+                      Navigator.of(context, rootNavigator: true).push(
+                        MaterialPageRoute(
+                          builder: (_) => MultiviewScreen(
+                            home: selectedHome,
+                            homesController: widget.homesController,
+                          ),
+                        ),
+                      ),
                 ),
               ],
             ),
@@ -509,6 +573,46 @@ class _CameraCollection extends StatelessWidget {
               ),
             );
           },
+        );
+      },
+    );
+  }
+}
+
+/// Test-only — see [DebugTransportOverride]'s doc. Global (not per-camera)
+/// LAN/WAN override, applied by every [LiveViewController] (camera live
+/// view and Multiview tiles) for as long as this choice stays set. Remove
+/// this widget once WAN testing no longer needs a manual override.
+class _ForceTransportMenu extends StatelessWidget {
+  const _ForceTransportMenu();
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<LiveViewTransport?>(
+      valueListenable: DebugTransportOverride.instance,
+      builder: (context, forced, _) {
+        return PopupMenuButton<LiveViewTransport?>(
+          key: const Key('DASH-023'),
+          icon: Icon(
+            Icons.bug_report_outlined,
+            color: forced == null ? null : Colors.orangeAccent,
+          ),
+          tooltip: forced == null
+              ? 'Test: force LAN/WAN for all cameras (currently Auto)'
+              : 'Test: forcing ${forced == LiveViewTransport.lan ? 'LAN' : 'WAN'} for all cameras',
+          onSelected: (transport) =>
+              DebugTransportOverride.instance.value = transport,
+          itemBuilder: (context) => const [
+            PopupMenuItem(value: null, child: Text('Auto (normal behavior)')),
+            PopupMenuItem(
+              value: LiveViewTransport.lan,
+              child: Text('Force LAN (all cameras)'),
+            ),
+            PopupMenuItem(
+              value: LiveViewTransport.wan,
+              child: Text('Force WAN (all cameras)'),
+            ),
+          ],
         );
       },
     );

@@ -81,6 +81,12 @@ class IotCommandClient {
   static const setMicGain = 25;
   static const getMicGain = 26;
 
+  /// `FR-NE-087`, added 2026-08-21: local (SD card) storage status/enable — implemented in
+  /// firmware since `FR-CF-044`'s original LAN-only build, never wired into the app until now
+  /// (`FR-MOB-083`, no `StorageSettingsScreen` existed at all before this).
+  static const getLocalStorageStatus = 27;
+  static const setLocalStorageEnabled = 28;
+
   /// `FR-NE-093`/`FR-CF-138`: Full/Zone/None privacy mode — implemented in firmware, never wired
   /// into the app until now (`_PrivacyModeCard` was LAN-only).
   static const setPrivacyMode = 30;
@@ -92,6 +98,13 @@ class IotCommandClient {
   /// read via LAN ONVIF regardless of `isWan`, since no WAN Get existed at all). One combined
   /// command, not three — see its firmware-side doc in `nuraeye_types.h`.
   static const getDeviceIdentity = 49;
+
+  /// `FR-NE-115`, added 2026-08-21: WAN mirror of ONVIF `GetDeviceInformation` (manufacturer/
+  /// model/firmware/serial/hardware ID — the *fixed* build/hardware identity, distinct from
+  /// `getDeviceIdentity` above's user-configurable name/location/timezone). Closes the same
+  /// "Get always LAN regardless of isWan" gap `getDeviceIdentity` closed for the identity card,
+  /// this time for `CameraInfoScreen`'s "Device Information" card.
+  static const getDeviceInfo = 66;
 
   /// `FR-NE-107`: WAN mirror of `AudioVolumeClient`'s `playTestSound`/`stopTestSound`/
   /// `isTestSoundPlaying` — added 2026-08-11, direct user instruction reversing the earlier

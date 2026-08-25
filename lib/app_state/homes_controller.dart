@@ -635,6 +635,24 @@ class HomesController extends ValueNotifier<HomesState> {
     unawaited(_credentialsStore.deletePassword(cameraId));
   }
 
+  void reorderCameras(String homeId, int oldIndex, int newIndex) {
+    final updated = [
+      for (final home in value.homes)
+        if (home.id == homeId)
+          home.copyWith(
+            cameras: () {
+              final newCameras = List<Camera>.from(home.cameras);
+              final camera = newCameras.removeAt(oldIndex);
+              newCameras.insert(newIndex, camera);
+              return newCameras;
+            }(),
+          )
+        else
+          home,
+    ];
+    value = value.copyWith(homes: updated);
+  }
+
   void deleteRoom(String homeId, String roomName) {
     final updated = [
       for (final home in value.homes)

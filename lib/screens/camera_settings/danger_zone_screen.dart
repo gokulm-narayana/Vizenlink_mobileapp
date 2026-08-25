@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../theme/app_colors.dart';
 import '../../widgets/glass_card.dart';
@@ -89,11 +90,17 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
     final connection = widget.camera.connection;
     final bool succeeded;
     if (connection != null) {
-      final client = OnvifDeviceClient(connection);
-      final result = await client.reboot();
-      client.close();
-      var ok = result is CameraSuccess;
       final thingName = connection.thingName;
+      // Skips the LAN attempt entirely when this camera's last confirmed
+      // transport was WAN — see Camera.lastKnownWan's doc.
+      final preferWan = widget.camera.lastKnownWan == true && thingName != null;
+      var ok = false;
+      if (!preferWan) {
+        final client = OnvifDeviceClient(connection);
+        final result = await client.reboot();
+        client.close();
+        ok = result is CameraSuccess;
+      }
       if (!ok && thingName != null) {
         final wanResult = await WanDeviceIdentityClient(thingName).reboot();
         ok = wanResult is CameraSuccess;
@@ -133,18 +140,19 @@ class _DangerZoneScreenState extends State<DangerZoneScreen> {
     final connection = widget.camera.connection;
     final bool succeeded;
     if (connection != null) {
-      final client = OnvifDeviceClient(connection);
-      final result = await client.factoryReset(mode);
-      client.close();
-      var ok = result is CameraSuccess;
       final thingName = connection.thingName;
-      if (!ok && thingName != null) {
-        final wanResult = await WanDeviceIdentityClient(
-          thingName,
-        ).factoryReset(mode);
-        ok = wanResult is CameraSuccess;
-      }
-      succeeded = ok;
+      final result = await callPreferringKnownTransport(
+        camera: widget.camera,
+        thingName: thingName,
+        lan: () async {
+          final client = OnvifDeviceClient(connection);
+          final result = await client.factoryReset(mode);
+          client.close();
+          return result;
+        },
+        wan: () => WanDeviceIdentityClient(thingName!).factoryReset(mode),
+      );
+      succeeded = result is CameraSuccess;
     } else {
       succeeded = await simulateCameraSave();
     }

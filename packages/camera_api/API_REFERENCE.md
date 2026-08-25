@@ -58,6 +58,7 @@ lib/
         network_info_client.dart
         night_vision_client.dart
         privacy_mode_client.dart
+        local_storage_client.dart
         snapshot_client.dart
         webrtc_uri_client.dart
         nuraeye_rest_client.dart    — GENERATED (base REST transport)
@@ -84,6 +85,7 @@ lib/
       wan_night_vision_client.dart
       wan_osd_client.dart
       wan_preview_snapshot_client.dart
+      wan_local_storage_client.dart
       wan_privacy_mode_client.dart
       wan_speaker_volume_client.dart
       wan_video_encoder_client.dart
@@ -122,6 +124,7 @@ network as the camera.
     - [NetworkInfoClient](#networkinfoclient)
     - [NightVisionClient](#nightvisionclient)
     - [PrivacyModeClient](#privacymodeclient)
+    - [LocalStorageClient](#localstorageclient)
     - [SnapshotClient](#snapshotclient)
     - [WebRtcUriClient](#webrtcuriclient)
   - [Generated REST clients](#generated-rest-clients)
@@ -145,6 +148,7 @@ network as the camera.
   - [WanDeterrenceClient](#wandeterrenceclient)
   - [WanNightVisionClient](#wannightvisionclient)
   - [WanOsdClient](#wanosdclient)
+  - [WanLocalStorageClient](#wanlocalstorageclient)
   - [WanPrivacyModeClient](#wanprivacymodeclient)
   - [WanVideoEncoderClient](#wanvideoencoderclient)
   - [WanPreviewSnapshotClient](#wanpreviewsnapshotclient)
@@ -485,7 +489,7 @@ NuraeyeClient(CameraConnection connection, {http.Client? httpClient})
 `GetAudioRecording`, `SetAudioRecording`, `PlayTestSound`, `StopTestSound`,
 `GetTestSoundStatus`, `GetCapabilities`, `GetNightVisionType`, `SetNightVisionType`,
 `GetMirrorFlip`, `SetMirrorFlip`, `GetWebRtcUri`, `GetImageDefaults`, `GetVideoMode`,
-`RegisterPreviewKey`. Prefer the typed wrapper clients below over calling `call()` directly where
+`GetPreviewKey`, `GetLocalStorage`, `SetLocalStorage`. Prefer the typed wrapper clients below over calling `call()` directly where
 one exists.
 
 #### AudioVolumeClient
@@ -521,7 +525,9 @@ CapabilitiesClient(NuraeyeClient nuraeye)
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support), `wanLiveViewCapable` (additionally requires KVS build support — both also require this specific device to have real AWS credentials provisioned, not just build-time support), `supportedEventTypes` (`FR-CF-143`/`FR-NE-111` — the alert event strings this build actually generates; empty on firmware too old to report it), `supportedEventDeterrenceOptions` (`FR-CF-144`/`FR-NE-112` — per detection event type, which response actions are eligible for it; only detection-type events appear as keys, empty map on firmware too old to report it), and `sirenCapable`/`spotlightCapable`/`warningCapable` (`FEAT-236`, 2026-08-14 — same hardware-presence flags `GetDeterrenceCapabilities` reports on its own dedicated endpoint, mirrored here so `DeterrenceClient`-consuming UI can reuse this already-fetched response instead of a second round trip; `false` on firmware too old to report them). |
+| `getCapabilities` | `{Duration timeout}` | `CameraResult<CameraCapabilities>` | `wanCommandCapable` (AWS IoT/MQTT support), `wanLiveViewCapable` (additionally requires KVS build support — both also require this specific device to have real AWS credentials provisioned, not just build-time support), `supportedEventTypes` (`FR-CF-143`/`FR-NE-111` — the alert event strings this build actually generates; empty on firmware too old to report it), `supportedEventDeterrenceOptions` (`FR-CF-144`/`FR-NE-112` — per detection event type, which response actions are eligible for it; only detection-type events appear as keys, empty map on firmware too old to report it), and `sirenCapable`/`spotlightCapable`/`warningCapable` (`FEAT-236`, 2026-08-14 — same hardware-presence flags `GetDeterrenceCapabilities` reports on its own dedicated endpoint, mirrored here so `DeterrenceClient`-consuming UI can reuse this already-fetched response instead of a second round trip; `false` on firmware too old to report them), and `localStorageCapable` (`FR-CF-044`, added
+2026-08-21 — whether this SKU has an SD card slot at all; `false` on firmware too old to report
+it). |
 
 #### EventPreferencesClient
 
@@ -694,6 +700,22 @@ PrivacyModeClient(NuraeyeClient nuraeye)
 
 See `wan/wan_privacy_mode_client.dart`'s `WanPrivacyModeClient` for the WAN counterpart.
 
+#### LocalStorageClient
+
+`lan/nuraeye/local_storage_client.dart` — LAN transport for local (SD card) storage
+(`FR-CF-044`/`FR-NE-087`/`FR-MOB-083`).
+
+```dart
+LocalStorageClient(NuraeyeClient nuraeye)
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getStatus` | `{Duration timeout}` | `CameraResult<LocalStorageStatus>` | Live status: `enabled`, `cardPresent`, `capacityBytes`, `freeBytes`. Always live — never cached. |
+| `setEnabled` | `bool enabled, {Duration timeout}` | `CameraResult<void>` | Turns recording on/off. **The camera rejects `enabled: true` with no SD card present** (`500`) — check `LocalStorageStatus.cardPresent` before calling with `true` rather than relying on the rejection alone. |
+
+See `wan/wan_local_storage_client.dart`'s `WanLocalStorageClient` for the WAN counterpart.
+
 #### SnapshotClient
 
 `lan/nuraeye/snapshot_client.dart` — `GET /snapshot` still-image capture. Notably built directly
@@ -752,7 +774,7 @@ action/params shape `NuraeyeClient.call()` presents.
 | `RestNetworkConnectivityClient` | WiFi get/set, WiFi signal, time zones, cloud parameters. |
 | `RestAudioClient` | Audio recording, audio settings (mic gain + speaker volume), test-sound status. |
 | `RestVideoImageClient` | Image defaults, mirror/flip, night-vision type, video mode. |
-| `RestStreamingClient` | Cloud streaming status/stop, WebRTC URI resolution, preview-key registration. |
+| `RestStreamingClient` | Cloud streaming status/stop, WebRTC URI resolution, shared preview-key fetch. |
 | `RestPrivacyClient` | Privacy mode get/set. |
 | `RestDeterrenceAlarmsClient` | Buzzer and deterrence-action status/control. |
 | `RestStorageClient` | Local storage (SD card) status/enable. |
@@ -815,8 +837,8 @@ in `main.dart`).
 | `awsCredentialsProvider` | `Future<WanAwsCredentials?> Function()?` | Returns real, temporary AWS credentials for the signed-in user's federated Identity Pool role, or `null` if not signed in. Expected to internally cache/refresh. Backs `IotCommandClient`'s direct MQTT-over-WSS connection. |
 | `awsIotEndpoint` | `String?` | AWS IoT Core data-plane endpoint (no scheme, e.g. `xxxxx-ats.iot.ap-south-1.amazonaws.com`) — fleet-wide, same value the camera firmware connects to. Backs `IotCommandClient`. |
 | `awsRegion` | `String?` | AWS region the Identity Pool / IoT endpoint live in (e.g. `ap-south-1`) — needed for SigV4 signing. Backs `IotCommandClient`. |
-| `previewPrivateKeyProvider` | `Future<RSAPrivateKey?> Function()?` | Returns the device's stored RSA private key for the WAN preview-snapshot decrypt path, or `null` if no keypair has been generated/registered yet. Backs `WanPreviewSnapshotClient`. |
-| `onPreviewKeyNeedsRegistration` | `void Function(String thingName)?` | Called when the camera reports its previously-registered preview key is gone (e.g. after a factory reset) — the app should flag that camera for automatic re-registration next time it's reachable on LAN. |
+| `previewSharedKeyProvider` | `Future<Uint8List?> Function(String thingName)?` | Returns this device's cached copy of `thingName`'s camera-generated shared AES-256 preview key, or `null` if never fetched. Backs `WanPreviewSnapshotClient`. Redesigned 2026-08-21 from a single device-wide RSA private key to a per-camera shared symmetric key — see `PreviewKeyStore`'s doc. |
+| `onPreviewKeyNeedsRegistration` | `void Function(String thingName)?` | Called when the camera reports its previously-generated preview key is gone (e.g. after a factory reset) — the app should flag that camera for automatic re-fetch next time it's reachable on LAN. |
 
 `WanAwsCredentials` (`wan/wan_auth.dart`) is a minimal `{accessKeyId, secretKey, sessionToken}`
 value type — a `camera_api`-local copy of `auth_api`'s `AwsCredentials` shape (this package can't
@@ -962,6 +984,7 @@ WanDeviceIdentityClient(String thingName, {IotCommandClient? iotCommandClient})
 | Method | Params | Returns | Description |
 |---|---|---|---|
 | `getDeviceIdentity` | `{Duration timeout}` | `CameraResult<({String name, String location, String timezone})>` | All three fields in one combined WAN read. |
+| `getDeviceInfo` | `{Duration timeout}` | `CameraResult<DeviceInformation>` | `FR-NE-115`, added 2026-08-21 — WAN mirror of `OnvifDeviceClient.getDeviceInformation()` (manufacturer/model/firmware/serial/hardware ID). Returns the same `DeviceInformation` type as the LAN client, since the field set is identical either way. Distinct from `getDeviceIdentity` above (user-configurable name/location/timezone, not this fixed build/hardware identity). |
 | `setDeviceName` | `String name, {Duration timeout}` | `CameraResult<void>` | Sets display name. |
 | `setDeviceLocation` | `String location, {Duration timeout}` | `CameraResult<void>` | Sets location. |
 | `setTimeZone` | `String tz, {Duration timeout}` | `CameraResult<void>` | Sets time zone. |
@@ -1135,6 +1158,20 @@ WanOsdClient(String thingName, {IotCommandClient? iotCommandClient})
 | `setOsd` | `{String token = '', required String textType, String? text, String posType = 'Custom', double? posX, double? posY, String? dateFormat, String? timeFormat, OsdColor? fontColor, Duration timeout}` | `CameraResult<String>` | Empty/omitted `token` creates a new OSD of `textType`; non-empty updates an existing one. Returns the applied token. |
 | `deleteOsd` | `String token, {Duration timeout}` | `CameraResult<void>` | Removes an OSD entry. |
 
+### WanLocalStorageClient
+
+`wan/wan_local_storage_client.dart` — WAN counterpart to `LocalStorageClient`. Same
+`LocalStorageStatus` type as LAN.
+
+```dart
+WanLocalStorageClient(String thingName, {IotCommandClient? iotCommandClient})
+```
+
+| Method | Params | Returns | Description |
+|---|---|---|---|
+| `getStatus` | `{Duration timeout}` | `CameraResult<LocalStorageStatus>` | Live status. |
+| `setEnabled` | `bool enabled, {Duration timeout}` | `CameraResult<void>` | Same card-present rejection behavior as the LAN client. |
+
 ### WanPrivacyModeClient
 
 `wan/wan_privacy_mode_client.dart` — WAN counterpart to `PrivacyModeClient`. Same `PrivacyMode`
@@ -1168,9 +1205,16 @@ WanVideoEncoderClient(String thingName, {IotCommandClient? iotCommandClient})
 
 `wan/wan_preview_snapshot_client.dart` — end-to-end-encrypted WAN reference-snapshot preview,
 distinct from the persisted WAN snapshot mechanism. The camera encrypts the frame before it
-leaves the device (RSA-2048-OAEP-wrapped AES key + AES-GCM payload); this client is the only
-place that ever holds the plaintext again, after decrypting locally with the device's own stored
-private key (`WanAuth.previewPrivateKeyProvider`).
+leaves the device (AES-256-GCM under a shared key); this client is the only place that ever
+holds the plaintext again, after decrypting locally with the device's cached shared key
+(`WanAuth.previewSharedKeyProvider`).
+
+**Redesigned 2026-08-21**: previously each device generated its own RSA-2048 keypair and the
+camera RSA-OAEP-wrapped a fresh per-request AES key to it — a second app registering its own key
+silently locked the first app out (only the most-recently-registered key could ever decrypt).
+The camera now generates and owns one shared AES-256 key (`RestStreamingClient.getPreviewKey()`,
+LAN, `GET /nuraeye/preview-key`) that any authorized app can fetch — no more per-device
+asymmetric key, no more `wrapped_key` field in the response envelope.
 
 ```dart
 WanPreviewSnapshotClient(String thingName, {IotCommandClient? iotCommandClient})
@@ -1178,7 +1222,7 @@ WanPreviewSnapshotClient(String thingName, {IotCommandClient? iotCommandClient})
 
 | Method | Params | Returns | Description |
 |---|---|---|---|
-| `getPreviewSnapshot` | `{Duration timeout = 25s}` | `CameraResult<Uint8List>` | Fetches, decrypts, and returns one preview frame. Returns `CameraFailure` if no local key is registered yet (open a settings screen on LAN once first) — and, if the camera itself reports its registered key is gone, calls `WanAuth.onPreviewKeyNeedsRegistration` as a side effect. |
+| `getPreviewSnapshot` | `{Duration timeout = 25s}` | `CameraResult<Uint8List>` | Fetches, decrypts, and returns one preview frame. Returns `CameraFailure` if no shared key is cached yet (open a settings screen on LAN once first) — and, if the camera itself reports its key is gone (e.g. after a factory reset), calls `WanAuth.onPreviewKeyNeedsRegistration` as a side effect. |
 
 **Callers must not persist the returned bytes** (no gallery save, no cache file) — this is a
 transient configuration-screen backdrop, not a kept/shared snapshot.
@@ -1203,6 +1247,8 @@ and a WAN client pair share them:
   implement — lets UI code hold either behind one reference type.
 - **`privacy_mode_types.dart`** — `enum PrivacyMode { none, zone, full }` plus `PrivacyModeWire`
   extension. Shared by `PrivacyModeClient`/`WanPrivacyModeClient`.
+- **`local_storage_types.dart`** — `LocalStorageStatus` (`enabled`, `cardPresent`,
+  `capacityBytes`, `freeBytes`). Shared by `LocalStorageClient`/`WanLocalStorageClient`.
 - **`device_reset_types.dart`** — `enum FactoryResetMode { soft, hard }` plus
   `FactoryResetModeWire` extension (`.wireValue` getter — `"Soft"`/`"Hard"`, the literal ONVIF
   `FactoryDefault` type values). **Soft** erases camera settings only, network config preserved
