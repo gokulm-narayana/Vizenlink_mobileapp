@@ -1,0 +1,10 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  errors:
+    # This package must never depend on Flutter — see DESIGN.md §2. There is no lint rule that
+    # directly bans a package:flutter import (the dependency graph itself is the real guard,
+    # since pubspec.yaml has no flutter SDK dependency at all and `dart pub get` would fail),
+    # but keep unused/undefined imports as errors so a stray import is never silently ignored.
+    unused_import: error
+    undefined_identifier: error

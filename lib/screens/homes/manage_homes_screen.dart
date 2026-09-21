@@ -20,30 +20,14 @@ class ManageHomesScreen extends StatelessWidget {
     String initialValue = '',
     required ValueChanged<String> onConfirm,
   }) async {
-    final controller = TextEditingController(text: initialValue);
     final name = await showDialog<String>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: Text(title),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            decoration: InputDecoration(labelText: label),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () =>
-                  Navigator.of(dialogContext).pop(controller.text.trim()),
-              child: Text(confirmLabel),
-            ),
-          ],
-        );
-      },
+      builder: (dialogContext) => _HomeNameDialog(
+        title: title,
+        label: label,
+        confirmLabel: confirmLabel,
+        initialValue: initialValue,
+      ),
     );
 
     if (name != null && name.isNotEmpty) {
@@ -328,6 +312,63 @@ class ManageHomesScreen extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// Rename/add-home/add-room text-entry dialog — owns its own
+/// `TextEditingController` in its `State`, disposed via `State.dispose()`
+/// rather than manually right after `showDialog` returns. Manual disposal
+/// there is a real bug, not just style: `showDialog`'s Future completes as
+/// soon as `Navigator.pop()` is called, before the dialog's exit *animation*
+/// finishes, so a manually-disposed controller can still be referenced by a
+/// still-mounted, still-animating `TextField` — same reasoning as
+/// `account_settings_screen.dart`'s `_TextFieldDialog`.
+class _HomeNameDialog extends StatefulWidget {
+  const _HomeNameDialog({
+    required this.title,
+    required this.label,
+    required this.confirmLabel,
+    required this.initialValue,
+  });
+
+  final String title;
+  final String label;
+  final String confirmLabel;
+  final String initialValue;
+
+  @override
+  State<_HomeNameDialog> createState() => _HomeNameDialogState();
+}
+
+class _HomeNameDialogState extends State<_HomeNameDialog> {
+  late final _controller = TextEditingController(text: widget.initialValue);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: InputDecoration(labelText: widget.label),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(_controller.text.trim()),
+          child: Text(widget.confirmLabel),
+        ),
+      ],
     );
   }
 }

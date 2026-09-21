@@ -7,6 +7,7 @@ import '../../widgets/gradient_background.dart';
 import 'intrusion_detection_screen.dart';
 import 'line_crossing_screen.dart';
 import 'motion_detection_screen.dart';
+import 'parking_monitoring_screen.dart';
 import 'person_detection_screen.dart';
 import 'vehicle_detection_screen.dart';
 
@@ -83,6 +84,17 @@ class DetectionsScreen extends StatelessWidget {
               subtitle: 'AI-based vehicle detection',
               onTap: () => context.push(
                 '${GoRouterState.of(context).matchedLocation}/${VehicleDetectionScreen.routeName}',
+                extra: camera,
+              ),
+            ),
+            const SizedBox(height: 12),
+            _DetectionMenuTile(
+              settingsKey: const Key('DETECT-008'),
+              icon: Icons.local_parking_outlined,
+              label: 'Parking Monitoring',
+              subtitle: 'Zone-based parking occupancy tracking',
+              onTap: () => context.push(
+                '${GoRouterState.of(context).matchedLocation}/${ParkingMonitoringScreen.routeName}',
                 extra: camera,
               ),
             ),

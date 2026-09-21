@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../app_state/transport_preference.dart';
@@ -154,7 +155,10 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
     CameraResult<List<MaskEntry>> masksResult;
     final CameraResult<MaskOptions> optionsResult;
     if (preferWan) {
-      optionsResult = await maskClient.getMaskOptions(
+      optionsResult = await NetworkAnswerCache.getOrFetch(
+        connection.host,
+        'maskOptions',
+        fetch: maskClient.getMaskOptions,
         forceRefresh: forceRefresh,
       );
       modeResult = const CameraTimeout<PrivacyMode>();
@@ -163,7 +167,12 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
       final results = await Future.wait([
         PrivacyModeClient(nuraeye).getPrivacyMode(),
         maskClient.getMasks(),
-        maskClient.getMaskOptions(forceRefresh: forceRefresh),
+        NetworkAnswerCache.getOrFetch(
+          connection.host,
+          'maskOptions',
+          fetch: maskClient.getMaskOptions,
+          forceRefresh: forceRefresh,
+        ),
       ]);
       modeResult = results[0] as CameraResult<PrivacyMode>;
       masksResult = results[1] as CameraResult<List<MaskEntry>>;
@@ -613,22 +622,18 @@ class CameraPrivacyModeScreenState extends State<PrivacyModeScreen> {
                 const SizedBox(height: 12),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Text(
-                    key: const Key('PRIV-003'),
-                    switch (_mode) {
-                      CameraPrivacyMode.off =>
-                        'Privacy mode is off — the camera streams and '
-                            'records normally.',
-                      CameraPrivacyMode.full =>
-                        'This camera stops streaming and recording video '
-                            'and audio entirely until a different mode is '
-                            'selected.',
-                      CameraPrivacyMode.zone =>
-                        'Only the privacy zones below are masked — the rest '
-                            'of the feed streams and records normally.',
-                    },
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
+                  child: Text(key: const Key('PRIV-003'), switch (_mode) {
+                    CameraPrivacyMode.off =>
+                      'Privacy mode is off — the camera streams and '
+                          'records normally.',
+                    CameraPrivacyMode.full =>
+                      'This camera stops streaming and recording video '
+                          'and audio entirely until a different mode is '
+                          'selected.',
+                    CameraPrivacyMode.zone =>
+                      'Only the privacy zones below are masked — the rest '
+                          'of the feed streams and records normally.',
+                  }, style: Theme.of(context).textTheme.bodySmall),
                 ),
                 if (_mode == CameraPrivacyMode.zone) ...[
                   const SizedBox(height: 24),
@@ -770,17 +775,24 @@ class _PrivacyPreview extends StatelessWidget {
                                 zones.length < maxZones,
                             onZoneDrawn: onZoneDrawn,
                           ),
-                          for (final zone in zones)
-                            ZoneOverlay(
-                              key: ValueKey(zone.id),
-                              rect: zone.rect,
-                              areaSize: areaSize,
-                              selected: zone.id == selectedZoneId,
-                              icon: Icons.visibility_off,
-                              onTap: () => onZoneSelected(zone.id),
-                              onRectChanged: (rect) =>
-                                  onZoneRectChanged(zone.id, rect),
-                            ),
+                          // Real bug fix: zones only take effect in Zone
+                          // mode (per this widget's own doc comment), but
+                          // these overlays used to render unconditionally —
+                          // they stayed visible and draggable on the preview
+                          // even while Privacy Mode was Off, which reads as
+                          // "the camera is masking regions" when it isn't.
+                          if (mode == CameraPrivacyMode.zone)
+                            for (final zone in zones)
+                              ZoneOverlay(
+                                key: ValueKey(zone.id),
+                                rect: zone.rect,
+                                areaSize: areaSize,
+                                selected: zone.id == selectedZoneId,
+                                icon: Icons.visibility_off,
+                                onTap: () => onZoneSelected(zone.id),
+                                onRectChanged: (rect) =>
+                                    onZoneRectChanged(zone.id, rect),
+                              ),
                         ],
                       );
                     },

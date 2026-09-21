@@ -104,14 +104,18 @@ class CognitoAuthClient {
 
   /// Creates the account; the user is `UNCONFIRMED` until [confirmSignUp].
   /// Throws `CognitoAuthException('UsernameExistsException', ...)` for a duplicate email.
-  Future<void> signUp(String email, String password) => _call('SignUp', {
-    'ClientId': config.appClientId,
-    'Username': email,
-    'Password': password,
-    'UserAttributes': [
-      {'Name': 'email', 'Value': email},
-    ],
-  });
+  /// [name], if given, is stored as Cognito's standard `name` attribute.
+  Future<void> signUp(String email, String password, {String? name}) =>
+      _call('SignUp', {
+        'ClientId': config.appClientId,
+        'Username': email,
+        'Password': password,
+        'UserAttributes': [
+          {'Name': 'email', 'Value': email},
+          if (name != null && name.trim().isNotEmpty)
+            {'Name': 'name', 'Value': name.trim()},
+        ],
+      });
 
   /// Completes sign-up with the code emailed to the user.
   Future<void> confirmSignUp(String email, String code) => _call('ConfirmSignUp', {

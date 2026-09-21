@@ -2,6 +2,7 @@ import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../app_state/transport_preference.dart';
@@ -91,6 +92,7 @@ class CameraInfoScreen extends StatefulWidget {
 
 class _CameraInfoScreenState extends State<CameraInfoScreen> {
   late final TextEditingController _nameController;
+  late final TextEditingController _locationController;
   late final String _originalHomeId;
   late String _homeId;
   late String? _room;
@@ -125,6 +127,10 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     super.initState();
     _nameController = TextEditingController(text: widget.camera.name);
     _nameController.addListener(_markDirty);
+    _locationController = TextEditingController(
+      text: widget.camera.location ?? '',
+    );
+    _locationController.addListener(_markDirty);
     _originalHomeId = _homeContainingCamera(widget.camera.id).id;
     _homeId = _originalHomeId;
     _room = widget.camera.room;
@@ -141,7 +147,11 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     final connection = _camera.connection;
     if (connection == null) return;
     final client = NetworkInfoClient(connection);
-    final result = await client.getSupportedTimezones();
+    final result = await NetworkAnswerCache.getOrFetch(
+      connection.host,
+      'supportedTimezones',
+      fetch: client.getSupportedTimezones,
+    );
     client.close();
     if (!mounted) return;
     if (result case CameraSuccess(:final value)) {
@@ -153,6 +163,8 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
   void dispose() {
     _nameController.removeListener(_markDirty);
     _nameController.dispose();
+    _locationController.removeListener(_markDirty);
+    _locationController.dispose();
     super.dispose();
   }
 
@@ -251,6 +263,48 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
           _originalHomeId,
           widget.camera.id,
           newName,
+        );
+      }
+    }
+
+    final newLocation = _locationController.text.trim();
+    if (newLocation != (_camera.location ?? '')) {
+      // Real gap fixed 2026-09-15: `OnvifDeviceClient`/`WanDeviceIdentityClient
+      // .setDeviceLocation` existed with no UI calling it anywhere — mirrors
+      // the name push above exactly (same ONVIF `SetScopes` mechanism,
+      // LAN-then-WAN convention, local-only fallback with no connection).
+      if (connection != null) {
+        final wanThingName = connection.thingName;
+        final wanEligible =
+            connection.wanCommandCapable != false && wanThingName != null;
+        final result = await callPreferringKnownTransport(
+          camera: _camera,
+          thingName: wanEligible ? wanThingName : null,
+          lan: () async {
+            final client = OnvifDeviceClient(connection);
+            final result = await client.setDeviceLocation(newLocation);
+            client.close();
+            return result;
+          },
+          wan: () => WanDeviceIdentityClient(
+            wanThingName!,
+          ).setDeviceLocation(newLocation),
+        );
+        switch (result) {
+          case CameraSuccess():
+            widget.homesController.updateCamera(
+              widget.camera.id,
+              (camera) => camera.copyWith(location: newLocation),
+            );
+          case CameraFailure(:final reason):
+            failures.add('location ($reason)');
+          case CameraTimeout():
+            failures.add('location (timed out)');
+        }
+      } else {
+        widget.homesController.updateCamera(
+          widget.camera.id,
+          (camera) => camera.copyWith(location: newLocation),
         );
       }
     }
@@ -388,6 +442,29 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
     return choice == _LeaveChoice.discard;
   }
 
+  /// "3d 4h" / "4h 12m" / "42m" — coarse-grained on purpose, this is a
+  /// health indicator (has the camera been unusually stable/unstable), not
+  /// a precise clock.
+  String _formatUptime(int seconds) {
+    final duration = Duration(seconds: seconds);
+    final days = duration.inDays;
+    final hours = duration.inHours % 24;
+    final minutes = duration.inMinutes % 60;
+    if (days > 0) return '${days}d ${hours}h';
+    if (hours > 0) return '${hours}h ${minutes}m';
+    return '${minutes}m';
+  }
+
+  String _formatEpoch(int epochSeconds) {
+    final t = DateTime.fromMillisecondsSinceEpoch(
+      epochSeconds * 1000,
+    ).toLocal();
+    final hour12 = t.hour % 12 == 0 ? 12 : t.hour % 12;
+    final period = t.hour < 12 ? 'AM' : 'PM';
+    return '${t.month}/${t.day}/${t.year} '
+        '$hour12:${t.minute.toString().padLeft(2, '0')} $period';
+  }
+
   Future<void> _openModifyPasswordDialog() async {
     await showDialog<void>(
       context: context,
@@ -500,6 +577,43 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                   ),
                   const SizedBox(height: 24),
                 ],
+                if (_camera.uptimeSeconds != null) ...[
+                  _SectionHeader('Device Health'),
+                  const SizedBox(height: 8),
+                  GlassCard(
+                    padding: EdgeInsets.zero,
+                    child: Column(
+                      children: [
+                        _InfoRow(
+                          settingsKey: const Key('CAMINFO-034'),
+                          icon: Icons.timer_outlined,
+                          label: 'Uptime',
+                          value: _formatUptime(_camera.uptimeSeconds!),
+                          isLast:
+                              _camera.lastRebootUtc == null &&
+                              _camera.rebootCount == null,
+                        ),
+                        if (_camera.lastRebootUtc != null)
+                          _InfoRow(
+                            settingsKey: const Key('CAMINFO-035'),
+                            icon: Icons.restart_alt,
+                            label: 'Last reboot',
+                            value: _formatEpoch(_camera.lastRebootUtc!),
+                            isLast: _camera.rebootCount == null,
+                          ),
+                        if (_camera.rebootCount != null)
+                          _InfoRow(
+                            settingsKey: const Key('CAMINFO-036'),
+                            icon: Icons.history,
+                            label: 'Reboot count',
+                            value: '${_camera.rebootCount}',
+                            isLast: true,
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                ],
                 _SectionHeader('Device Identity'),
                 const SizedBox(height: 8),
                 GlassCard(
@@ -512,6 +626,18 @@ class _CameraInfoScreenState extends State<CameraInfoScreen> {
                         maxLength: kMaxDeviceNameLength,
                         decoration: const InputDecoration(
                           labelText: 'Camera name',
+                        ),
+                        textInputAction: TextInputAction.done,
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        key: const Key('CAMINFO-037'),
+                        controller: _locationController,
+                        decoration: const InputDecoration(
+                          labelText: 'Camera-reported location',
+                          helperText:
+                              'The camera\'s own ONVIF location label — '
+                              'separate from this app\'s Home/Room below',
                         ),
                         textInputAction: TextInputAction.done,
                       ),

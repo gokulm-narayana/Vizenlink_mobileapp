@@ -1,6 +1,5 @@
 import 'package:camera_api/camera_api.dart';
 
-
 /// `FR-NE-099`/`FR-MOB-096`/`FR-MOB-097` (new "Authentication" card): WAN counterpart to
 /// `OnvifDeviceClient`'s `setDeviceName`/`setDeviceLocation`/`setTimeZone`/`setUserPassword` —
 /// there is no WAN transport for ONVIF SOAP at all, so each method here instead calls the
@@ -24,24 +23,47 @@ import 'package:camera_api/camera_api.dart';
 class WanDeviceIdentityClient {
   /// [iotCommandClient] is overridable for tests — defaults to a real [IotCommandClient] for
   /// [thingName].
-  WanDeviceIdentityClient(String thingName, {IotCommandClient? iotCommandClient})
-    : _iot = iotCommandClient ?? IotCommandClient(thingName);
+  WanDeviceIdentityClient(
+    String thingName, {
+    IotCommandClient? iotCommandClient,
+  }) : _iot = iotCommandClient ?? IotCommandClient(thingName);
 
   final IotCommandClient _iot;
 
-  Future<CameraResult<({String name, String location, String timezone})>> getDeviceIdentity({
+  /// [retryOnTimeout] — pass `false` from a caller that polls on its own schedule (the Dashboard's
+  /// 15s reachability ping), where retrying doubles this call's worst-case latency to buy a second
+  /// chance the next tick provides anyway a few seconds later.
+  ///
+  /// **Real bug fixed 2026-09-15**: [timeout] was declared here but never passed to
+  /// [IotCommandClient.sendCommandWithResponse], so it silently fell through to that method's own
+  /// 12s default — and, with the one-shot retry on top, took up to ~24s. `pingCameraReachability`
+  /// asks for 5s and was getting ~24s, overrunning the Dashboard's own 15s poll interval and
+  /// tripping its 2-minute WAN backoff, which showed a perfectly healthy camera as offline.
+  Future<CameraResult<({String name, String location, String timezone})>>
+  getDeviceIdentity({
     Duration timeout = const Duration(seconds: 15),
+    bool retryOnTimeout = true,
   }) async {
     try {
-      final output = await _iot.sendCommandWithResponse(IotCommandClient.getDeviceIdentity);
+      final output = await _iot.sendCommandWithResponse(
+        IotCommandClient.getDeviceIdentity,
+        timeoutSeconds: timeout.inMilliseconds / 1000,
+        retryOnTimeout: retryOnTimeout,
+      );
       if (output == null) return const CameraTimeout();
       final name = output['name'];
       final location = output['location'];
       final timezone = output['timezone'];
       if (name is! String || location is! String || timezone is! String) {
-        return CameraFailure('GetDeviceIdentity response missing fields: $output');
+        return CameraFailure(
+          'GetDeviceIdentity response missing fields: $output',
+        );
       }
-      return CameraSuccess((name: name, location: location, timezone: timezone));
+      return CameraSuccess((
+        name: name,
+        location: location,
+        timezone: timezone,
+      ));
     } catch (e) {
       return CameraFailure(e.toString());
     }
@@ -56,7 +78,9 @@ class WanDeviceIdentityClient {
     Duration timeout = const Duration(seconds: 15),
   }) async {
     try {
-      final output = await _iot.sendCommandWithResponse(IotCommandClient.getDeviceInfo);
+      final output = await _iot.sendCommandWithResponse(
+        IotCommandClient.getDeviceInfo,
+      );
       if (output == null) return const CameraTimeout();
       final manufacturer = output['manufacturer'];
       final model = output['model'];
@@ -70,13 +94,15 @@ class WanDeviceIdentityClient {
           hardwareId is! String) {
         return CameraFailure('GetDeviceInfo response missing fields: $output');
       }
-      return CameraSuccess(DeviceInformation(
-        manufacturer: manufacturer,
-        model: model,
-        firmwareVersion: firmwareVersion,
-        serialNumber: serialNumber,
-        hardwareId: hardwareId,
-      ));
+      return CameraSuccess(
+        DeviceInformation(
+          manufacturer: manufacturer,
+          model: model,
+          firmwareVersion: firmwareVersion,
+          serialNumber: serialNumber,
+          hardwareId: hardwareId,
+        ),
+      );
     } catch (e) {
       return CameraFailure(e.toString());
     }
@@ -113,8 +139,9 @@ class WanDeviceIdentityClient {
   /// exists for ONVIF SOAP at all, so this calls the identical `bsp_rebootAsync()` over MQTT
   /// instead. Same connectivity-gap caveat as the LAN method: a success response does not mean
   /// the device is back yet.
-  Future<CameraResult<void>> reboot({Duration timeout = const Duration(seconds: 15)}) =>
-      _send(IotCommandClient.reboot, const {});
+  Future<CameraResult<void>> reboot({
+    Duration timeout = const Duration(seconds: 15),
+  }) => _send(IotCommandClient.reboot, const {});
 
   /// `FR-NE-110`: WAN mirror of `OnvifDeviceClient.factoryReset` (`SetSystemFactoryDefault`) —
   /// see [FactoryResetMode]'s doc for the Soft/Hard distinction. **[FactoryResetMode.hard] wipes
@@ -127,9 +154,15 @@ class WanDeviceIdentityClient {
     Duration timeout = const Duration(seconds: 15),
   }) => _send(IotCommandClient.factoryReset, {'mode': mode.wireValue});
 
-  Future<CameraResult<void>> _send(int command, Map<String, dynamic> params) async {
+  Future<CameraResult<void>> _send(
+    int command,
+    Map<String, dynamic> params,
+  ) async {
     try {
-      final output = await _iot.sendCommandWithResponse(command, params: params);
+      final output = await _iot.sendCommandWithResponse(
+        command,
+        params: params,
+      );
       if (output == null) return const CameraTimeout();
       return const CameraSuccess(null);
     } catch (e) {

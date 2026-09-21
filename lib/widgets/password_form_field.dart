@@ -11,6 +11,7 @@ class PasswordFormField extends StatefulWidget {
     this.validator,
     this.textInputAction,
     this.onFieldSubmitted,
+    this.matchIndicator,
   });
 
   final TextEditingController? controller;
@@ -18,6 +19,12 @@ class PasswordFormField extends StatefulWidget {
   final String? Function(String?)? validator;
   final TextInputAction? textInputAction;
   final void Function(String)? onFieldSubmitted;
+
+  /// Optional small icon shown to the left of the show/hide toggle — e.g.
+  /// Signup's confirm-password field uses this for a live checkmark once it
+  /// matches the password field, without needing its own reimplementation
+  /// of this widget's show/hide suffix.
+  final Widget? matchIndicator;
 
   @override
   State<PasswordFormField> createState() => _PasswordFormFieldState();
@@ -36,13 +43,19 @@ class _PasswordFormFieldState extends State<PasswordFormField> {
       decoration: InputDecoration(
         labelText: widget.labelText,
         prefixIcon: const Icon(Icons.lock_outline),
-        suffixIcon: IconButton(
-          icon: Icon(
-            _obscure
-                ? Icons.visibility_outlined
-                : Icons.visibility_off_outlined,
-          ),
-          onPressed: () => setState(() => _obscure = !_obscure),
+        suffixIcon: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (widget.matchIndicator != null) widget.matchIndicator!,
+            IconButton(
+              icon: Icon(
+                _obscure
+                    ? Icons.visibility_outlined
+                    : Icons.visibility_off_outlined,
+              ),
+              onPressed: () => setState(() => _obscure = !_obscure),
+            ),
+          ],
         ),
       ),
       validator: widget.validator,

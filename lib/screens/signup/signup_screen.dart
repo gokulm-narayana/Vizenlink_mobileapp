@@ -22,29 +22,43 @@ class SignupScreen extends StatefulWidget {
   State<SignupScreen> createState() => _SignupScreenState();
 }
 
-class _SignupScreenState extends State<SignupScreen>
-    with SingleTickerProviderStateMixin {
-  late final TabController _identifierTabController;
+class _SignupScreenState extends State<SignupScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
-  final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   bool _isSubmitting = false;
 
+  /// LIVE feedback only — the strength bar under SIGNUP-006 (does not affect
+  /// [_validatePassword], which still just enforces the app's actual
+  /// minimum, 6 chars).
+  double _passwordStrength = 0;
+
   @override
   void initState() {
     super.initState();
-    _identifierTabController = TabController(length: 2, vsync: this);
+    _passwordController.addListener(_updatePasswordStrength);
+    _confirmPasswordController.addListener(() => setState(() {}));
+  }
+
+  void _updatePasswordStrength() {
+    final value = _passwordController.text;
+    var score = 0;
+    if (value.length >= 6) score++;
+    if (value.length >= 10) score++;
+    if (RegExp(r'[A-Z]').hasMatch(value) && RegExp(r'[a-z]').hasMatch(value)) {
+      score++;
+    }
+    if (RegExp(r'[0-9]').hasMatch(value)) score++;
+    if (RegExp(r'[^A-Za-z0-9]').hasMatch(value)) score++;
+    setState(() => _passwordStrength = value.isEmpty ? 0 : score / 5);
   }
 
   @override
   void dispose() {
-    _identifierTabController.dispose();
     _nameController.dispose();
     _emailController.dispose();
-    _phoneController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
@@ -59,17 +73,6 @@ class _SignupScreenState extends State<SignupScreen>
     if (value == null || value.trim().isEmpty) return 'Email is required';
     final emailPattern = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
     if (!emailPattern.hasMatch(value.trim())) return 'Enter a valid email';
-    return null;
-  }
-
-  String? _validatePhone(String? value) {
-    if (value == null || value.trim().isEmpty) {
-      return 'Phone number is required';
-    }
-    final phonePattern = RegExp(r'^\+?[0-9]{7,15}$');
-    if (!phonePattern.hasMatch(value.trim())) {
-      return 'Enter a valid phone number';
-    }
     return null;
   }
 
@@ -88,21 +91,13 @@ class _SignupScreenState extends State<SignupScreen>
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
 
-    if (_identifierTabController.index != 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Phone sign-up is not available yet — use email.'),
-        ),
-      );
-      return;
-    }
-
     final email = _emailController.text.trim();
     final password = _passwordController.text;
+    final name = _nameController.text.trim();
 
     setState(() => _isSubmitting = true);
     try {
-      await AuthController.instance.signUp(email, password);
+      await AuthController.instance.signUp(email, password, name: name);
       if (!mounted) return;
       context.push(
         ConfirmSignupScreen.routeName,
@@ -191,51 +186,15 @@ class _SignupScreenState extends State<SignupScreen>
                             validator: _validateName,
                           ),
                           const SizedBox(height: 16),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(14),
-                            child: TabBar(
-                              key: const Key('SIGNUP-003'),
-                              controller: _identifierTabController,
-                              tabs: const [
-                                Tab(text: 'Email'),
-                                Tab(text: 'Phone'),
-                              ],
+                          TextFormField(
+                            key: const Key('SIGNUP-004'),
+                            controller: _emailController,
+                            keyboardType: TextInputType.emailAddress,
+                            decoration: const InputDecoration(
+                              labelText: 'Email',
+                              prefixIcon: Icon(Icons.mail_outline),
                             ),
-                          ),
-                          const SizedBox(height: 16),
-                          SizedBox(
-                            height: 72,
-                            child: TabBarView(
-                              controller: _identifierTabController,
-                              children: [
-                                TextFormField(
-                                  key: const Key('SIGNUP-004'),
-                                  controller: _emailController,
-                                  keyboardType: TextInputType.emailAddress,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Email',
-                                    prefixIcon: Icon(Icons.mail_outline),
-                                  ),
-                                  validator: (value) =>
-                                      _identifierTabController.index == 0
-                                      ? _validateEmail(value)
-                                      : null,
-                                ),
-                                TextFormField(
-                                  key: const Key('SIGNUP-005'),
-                                  controller: _phoneController,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Phone number',
-                                    prefixIcon: Icon(Icons.phone_outlined),
-                                  ),
-                                  validator: (value) =>
-                                      _identifierTabController.index == 1
-                                      ? _validatePhone(value)
-                                      : null,
-                                ),
-                              ],
-                            ),
+                            validator: _validateEmail,
                           ),
                           const SizedBox(height: 4),
                           PasswordFormField(
@@ -244,12 +203,29 @@ class _SignupScreenState extends State<SignupScreen>
                             labelText: 'Password',
                             validator: _validatePassword,
                           ),
+                          if (_passwordController.text.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            _PasswordStrengthBar(
+                              key: const Key('SIGNUP-014'),
+                              strength: _passwordStrength,
+                            ),
+                          ],
                           const SizedBox(height: 16),
                           PasswordFormField(
                             key: const Key('SIGNUP-007'),
                             controller: _confirmPasswordController,
                             labelText: 'Confirm password',
                             validator: _validateConfirmPassword,
+                            matchIndicator:
+                                _confirmPasswordController.text.isNotEmpty &&
+                                    _confirmPasswordController.text ==
+                                        _passwordController.text
+                                ? Icon(
+                                    Icons.check_circle,
+                                    key: const Key('SIGNUP-015'),
+                                    color: Colors.green.shade600,
+                                  )
+                                : null,
                           ),
                           const SizedBox(height: 24),
                           GradientButton(
@@ -291,7 +267,7 @@ class _SignupScreenState extends State<SignupScreen>
                           OutlinedButton.icon(
                             key: const Key('SIGNUP-010'),
                             onPressed: _submitWithGoogle,
-                            icon: const Icon(Icons.g_mobiledata, size: 28),
+                            icon: const Icon(Icons.account_circle_outlined),
                             label: const Text('Continue with Google'),
                           ),
                         ],
@@ -310,6 +286,48 @@ class _SignupScreenState extends State<SignupScreen>
           ),
         ),
       ),
+    );
+  }
+}
+
+/// SIGNUP-014 — live password-strength feedback for SIGNUP-006, purely a
+/// visual hint (length/case/digit/symbol variety); does not affect
+/// [_SignupScreenState._validatePassword]'s actual minimum requirement.
+class _PasswordStrengthBar extends StatelessWidget {
+  const _PasswordStrengthBar({super.key, required this.strength});
+
+  /// 0.0-1.0.
+  final double strength;
+
+  @override
+  Widget build(BuildContext context) {
+    final (label, color) = switch (strength) {
+      <= 0.2 => ('Weak', Colors.red.shade400),
+      <= 0.6 => ('Medium', Colors.orange.shade400),
+      _ => ('Strong', Colors.green.shade600),
+    };
+    return Row(
+      children: [
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: strength,
+              minHeight: 6,
+              backgroundColor: color.withValues(alpha: 0.15),
+              valueColor: AlwaysStoppedAnimation(color),
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text(
+          label,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color: color,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
     );
   }
 }

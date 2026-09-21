@@ -114,19 +114,22 @@ class CameraAlertsHub {
     final body = map['body'];
     if (thingName is String && event is String && body is Map) {
       final decodedBody = Map<String, dynamic>.from(body);
-      _eventsController.add(CameraAlertEvent(
-        thingName: thingName,
-        event: event,
-        body: decodedBody,
-      ));
+      _eventsController.add(
+        CameraAlertEvent(thingName: thingName, event: event, body: decodedBody),
+      );
       onAlertPersist?.call(thingName, event, decodedBody);
     }
   }
 
   void _onStatus(Map<String, dynamic> map) {
-    final connected = (map['connected'] as List?)?.cast<String>().toSet() ?? const {};
-    final watched = (map['watched'] as List?)?.cast<String>().toSet() ?? const {};
-    final status = AlertsStatus(connectedThingNames: connected, watchedThingNames: watched);
+    final connected =
+        (map['connected'] as List?)?.cast<String>().toSet() ?? const {};
+    final watched =
+        (map['watched'] as List?)?.cast<String>().toSet() ?? const {};
+    final status = AlertsStatus(
+      connectedThingNames: connected,
+      watchedThingNames: watched,
+    );
     _lastStatus = status;
     _statusController.add(status);
   }
@@ -135,7 +138,13 @@ class CameraAlertsHub {
   /// that wants to persist alert history without needing its own separate subscription. Not a
   /// static [AlertsAuth] hook (unlike config/credentials) since it's instance-scoped state, not
   /// startup wiring — set it directly on [instance] if needed.
-  void Function(String thingName, String event, Map<String, dynamic> body)? onAlertPersist;
+  void Function(String thingName, String event, Map<String, dynamic> body)?
+  onAlertPersist;
+
+  /// Minimum gap between two real [ensureRunning] runs — see that method's doc for the bug this
+  /// guards against.
+  static const _minRunInterval = Duration(seconds: 5);
+  DateTime? _lastRunAt;
 
   /// Starts (or updates) the background alert listener for every camera [AlertsAuth
   /// .cameraListProvider] currently returns, and pushes fresh credentials down to it via
@@ -143,12 +152,38 @@ class CameraAlertsHub {
   /// signed in. Best-effort and silent: never throws, since this must never block a screen or
   /// login flow — a failure here just means live alerts stay unavailable until the next call
   /// succeeds.
+  ///
+  /// **Debounced to at most once every [_minRunInterval] — real bug found 2026-09-15.** The
+  /// app's own `didChangeAppLifecycleState(resumed)` calls this on *every* resume with no
+  /// debounce of its own (per this doc's "call... on app resume"), and this method used to
+  /// unconditionally re-check/re-request the Android 13+ notification permission on every call.
+  /// On a device where that permission is denied, requesting it starts a self-sustaining loop:
+  /// request → the permission dialog itself is a lifecycle event → app resumes again the moment
+  /// it's dismissed → `resumed` fires again → this runs again → requests again → hundreds of
+  /// times a minute. Real-device symptom: this method's status broadcast
+  /// ([CameraAlertsHub.statusUpdates]) firing 5-10x/second continuously, main-thread contention
+  /// severe enough to look like slow WAN connects, flickering connected/offline camera state, and
+  /// (most likely) the app being killed and cold-restarted by the OS as an ANR-style recovery.
+  /// The debounce makes every call past the first in [_minRunInterval] a cheap, immediate no-op.
   Future<void> ensureRunning() async {
-    if (!Platform.isAndroid) return; // iOS foreground-service model differs; not built yet.
+    if (!Platform.isAndroid) {
+      return; // iOS foreground-service model differs; not built yet.
+    }
+    final now = DateTime.now();
+    final lastRunAt = _lastRunAt;
+    if (lastRunAt != null && now.difference(lastRunAt) < _minRunInterval) {
+      return;
+    }
+    _lastRunAt = now;
+
     final config = AlertsAuth.config;
     final cameraListProvider = AlertsAuth.cameraListProvider;
     final credentialsProvider = AlertsAuth.credentialsProvider;
-    if (config == null || cameraListProvider == null || credentialsProvider == null) return;
+    if (config == null ||
+        cameraListProvider == null ||
+        credentialsProvider == null) {
+      return;
+    }
 
     _init();
 
@@ -166,7 +201,8 @@ class CameraAlertsHub {
     }
 
     try {
-      final permission = await FlutterForegroundTask.checkNotificationPermission();
+      final permission =
+          await FlutterForegroundTask.checkNotificationPermission();
       if (permission != NotificationPermission.granted) {
         await FlutterForegroundTask.requestNotificationPermission();
       }
@@ -199,7 +235,10 @@ class CameraAlertsHub {
       // Best-effort — see doc comment above.
     }
 
-    _refreshTimer ??= Timer.periodic(const Duration(minutes: 20), (_) => ensureRunning());
+    _refreshTimer ??= Timer.periodic(
+      const Duration(minutes: 20),
+      (_) => ensureRunning(),
+    );
   }
 
   /// Stops the service entirely — call on logout, since the background isolate otherwise has

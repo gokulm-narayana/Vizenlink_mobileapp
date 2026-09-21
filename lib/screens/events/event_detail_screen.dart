@@ -1,12 +1,11 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:video_player/video_player.dart';
 
 import '../../app_state/events_controller.dart';
 import '../../app_state/homes_controller.dart';
@@ -18,11 +17,6 @@ import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../camera_live/camera_live_screen.dart';
 import '../dashboard/dashboard_screen.dart';
-
-/// Placeholder sample stream used until a real CCTV protocol (RTSP/ONVIF/
-/// HLS) is chosen — see CLAUDE.md. Same asset the Alerts/camera-live
-/// screens use for their dummy playback.
-const _dummyVideoAsset = 'assets/videos/camera_dummy.mp4';
 
 class EventDetailScreen extends StatefulWidget {
   const EventDetailScreen({
@@ -43,10 +37,7 @@ class EventDetailScreen extends StatefulWidget {
 }
 
 class _EventDetailScreenState extends State<EventDetailScreen> {
-  VideoPlayerController? _videoController;
-  bool _isPlaying = false;
   bool _isDownloadingSnapshot = false;
-  bool _isDownloadingClip = false;
   bool _isSharing = false;
 
   RecordedEvent get event => widget.event;
@@ -71,54 +62,6 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
       '${DashboardScreen.routeName}/${CameraLiveScreen.routeName}/${camera.id}',
       extra: camera,
     );
-  }
-
-  @override
-  void dispose() {
-    _videoController?.dispose();
-    super.dispose();
-  }
-
-  Future<void> _startPlayback() async {
-    if (_videoController != null) {
-      setState(() => _isPlaying = true);
-      await _videoController!.play();
-      return;
-    }
-
-    final controller = VideoPlayerController.asset(_dummyVideoAsset);
-    await controller.initialize();
-    if (!mounted) {
-      await controller.dispose();
-      return;
-    }
-    setState(() {
-      _videoController = controller;
-      _isPlaying = true;
-    });
-    await controller.play();
-  }
-
-  Future<void> _openFullscreen() async {
-    final controller = _videoController;
-    if (controller == null) return;
-    await SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-    if (!mounted) return;
-    // rootNavigator: true — this screen lives inside a StatefulShellRoute
-    // branch with its own nested Navigator; pushing on the branch Navigator
-    // alone would keep MainShell's bottom nav bar visible underneath.
-    await Navigator.of(context, rootNavigator: true).push(
-      MaterialPageRoute(
-        builder: (_) => _FullscreenVideo(controller: controller),
-      ),
-    );
-    await SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
   }
 
   String _formattedTimestamp() {
@@ -166,32 +109,6 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
       ).showSnackBar(const SnackBar(content: Text('Could not save snapshot')));
     } finally {
       if (mounted) setState(() => _isDownloadingSnapshot = false);
-    }
-  }
-
-  Future<void> _downloadClip() async {
-    if (_isDownloadingClip) return;
-    setState(() => _isDownloadingClip = true);
-    try {
-      final bytes = await rootBundle.load(_dummyVideoAsset);
-      final tempDir = await getTemporaryDirectory();
-      final file = File(
-        '${tempDir.path}/cctv_event_clip_${event.id}_'
-        '${DateTime.now().millisecondsSinceEpoch}.mp4',
-      );
-      await file.writeAsBytes(bytes.buffer.asUint8List());
-      await Gal.putVideo(file.path);
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Clip saved')));
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Could not save clip')));
-    } finally {
-      if (mounted) setState(() => _isDownloadingClip = false);
     }
   }
 
@@ -291,12 +208,8 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
                     borderRadius: BorderRadius.circular(20),
                     child: _MediaView(
                       event: event,
-                      videoController: _videoController,
-                      isPlaying: _isPlaying,
                       colorScheme: colorScheme,
                       isDark: isDark,
-                      onPlayTap: _startPlayback,
-                      onFullscreenTap: _openFullscreen,
                     ),
                   ),
                 ),
@@ -349,40 +262,22 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
                 ),
               ),
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const Key('EVTDET-012'),
-                      onPressed: event.thumbnailUrl == null
-                          ? null
-                          : (_isDownloadingSnapshot ? null : _downloadSnapshot),
-                      icon: _isDownloadingSnapshot
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.photo_camera_back_outlined),
-                      label: const Text('Download snapshot'),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const Key('EVTDET-011'),
-                      onPressed: _isDownloadingClip ? null : _downloadClip,
-                      icon: _isDownloadingClip
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.download_outlined),
-                      label: const Text('Download clip'),
-                    ),
-                  ),
-                ],
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  key: const Key('EVTDET-012'),
+                  onPressed: event.thumbnailUrl == null
+                      ? null
+                      : (_isDownloadingSnapshot ? null : _downloadSnapshot),
+                  icon: _isDownloadingSnapshot
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.photo_camera_back_outlined),
+                  label: const Text('Download snapshot'),
+                ),
               ),
               const SizedBox(height: 20),
               Text(
@@ -442,71 +337,33 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
   }
 }
 
+/// Thumbnail-only media view — no video, real or fake. There's no real
+/// per-event clip API yet, so this used to fall back to playing a bundled
+/// dummy video asset in place of "the recording"; removed entirely
+/// 2026-09-07 per direct user request ("remove the dummy video in the app
+/// completely") rather than keep showing fake footage. Add real inline clip
+/// playback back here once a real per-event clip URL exists.
 class _MediaView extends StatelessWidget {
   const _MediaView({
     required this.event,
-    required this.videoController,
-    required this.isPlaying,
     required this.colorScheme,
     required this.isDark,
-    required this.onPlayTap,
-    required this.onFullscreenTap,
   });
 
   final RecordedEvent event;
-  final VideoPlayerController? videoController;
-  final bool isPlaying;
   final ColorScheme colorScheme;
   final bool isDark;
-  final VoidCallback onPlayTap;
-  final VoidCallback onFullscreenTap;
 
   @override
   Widget build(BuildContext context) {
-    final controller = videoController;
-    if (isPlaying && controller != null && controller.value.isInitialized) {
-      return Stack(
-        alignment: Alignment.bottomRight,
-        children: [
-          AspectRatio(
-            aspectRatio: controller.value.aspectRatio,
-            child: InteractiveViewer(
-              maxScale: 4,
-              child: VideoPlayer(controller),
-            ),
-          ),
-          IconButton(
-            key: const Key('EVTDET-009'),
-            tooltip: 'Fullscreen',
-            icon: const Icon(Icons.fullscreen_rounded, color: Colors.white),
-            onPressed: onFullscreenTap,
-          ),
-        ],
-      );
-    }
-
-    return Stack(
-      alignment: Alignment.center,
-      children: [
-        Positioned.fill(
-          child: event.thumbnailUrl == null
-              ? _thumbnailPlaceholder()
-              : Image.network(
-                  event.thumbnailUrl!,
-                  fit: BoxFit.cover,
-                  errorBuilder: (context, error, stackTrace) =>
-                      _thumbnailPlaceholder(),
-                ),
-        ),
-        IconButton(
-          key: const Key('EVTDET-004'),
-          iconSize: 56,
-          color: Colors.white,
-          icon: const Icon(Icons.play_circle_fill_rounded),
-          onPressed: onPlayTap,
-        ),
-      ],
-    );
+    return event.thumbnailUrl == null
+        ? _thumbnailPlaceholder()
+        : Image.network(
+            event.thumbnailUrl!,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) =>
+                _thumbnailPlaceholder(),
+          );
   }
 
   Widget _thumbnailPlaceholder() {
@@ -569,43 +426,6 @@ class _RelatedEventCard extends StatelessWidget {
               ),
             ],
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _FullscreenVideo extends StatelessWidget {
-  const _FullscreenVideo({required this.controller});
-
-  final VideoPlayerController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Stack(
-          children: [
-            Center(
-              child: AspectRatio(
-                aspectRatio: controller.value.aspectRatio,
-                child: InteractiveViewer(
-                  maxScale: 4,
-                  child: VideoPlayer(controller),
-                ),
-              ),
-            ),
-            Positioned(
-              bottom: 8,
-              right: 8,
-              child: IconButton(
-                tooltip: 'Exit fullscreen',
-                icon: const Icon(Icons.fullscreen_exit, color: Colors.white),
-                onPressed: () => Navigator.of(context).pop(),
-              ),
-            ),
-          ],
         ),
       ),
     );

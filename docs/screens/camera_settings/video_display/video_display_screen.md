@@ -14,7 +14,7 @@
 | VIDDISP-005 | Privacy Mode row | ListTile (in GlassCard) | navigates to [privacy_mode_screen.md](privacy_mode_screen.md); subtitle "Block the feed fully or mask zones" |
 | VIDDISP-006 | On-Screen Display row | ListTile (in GlassCard) | navigates to [on_screen_display_screen.md](on_screen_display_screen.md); subtitle "Time and custom text overlays" |
 | VIDDISP-007 | Imaging row | ListTile (in GlassCard) | navigates to [imaging_screen.md](imaging_screen.md); subtitle "Brightness, contrast, WDR, exposure" |
-| VIDDISP-008 | Video Encoder row | ListTile (in GlassCard) | navigates to [video_encoder_screen.md](video_encoder_screen.md); subtitle "Resolution, frame rate, bitrate, codec" |
+| VIDDISP-008 | Video Encoder row | ListTile (in GlassCard) | navigates to [video_encoder_screen.md](video_encoder_screen.md) (a landing list of the camera's encoder streams — High-res / Medium / Low — each opening its own settings form); subtitle "Per-stream resolution, frame rate, bitrate, codec" |
 | VIDDISP-011 | Tags row | ListTile (in GlassCard) | navigates to [tags_screen.md](tags_screen.md); subtitle "Live, bitrate, and signal strength badges" |
 
 Each row's `ListTile.subtitle` is a short static description of what that sub-screen configures — pure copy, not tied to a design ID of its own.

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../app_state/transport_preference.dart';
@@ -94,7 +95,11 @@ class _VideoModeScreenState extends State<VideoModeScreen> {
     final client = OnvifImagingClient(connection);
     final results = await Future.wait([
       client.getImagingSettings(),
-      client.getImagingOptions(),
+      NetworkAnswerCache.getOrFetch(
+        connection.host,
+        'imagingOptions',
+        fetch: client.getImagingOptions,
+      ),
     ]);
     client.close();
 

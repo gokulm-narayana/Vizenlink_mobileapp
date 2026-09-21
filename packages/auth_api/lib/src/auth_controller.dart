@@ -134,10 +134,10 @@ class AuthController extends ChangeNotifier {
     }
   }
 
-  Future<void> signUp(String email, String password) async {
+  Future<void> signUp(String email, String password, {String? name}) async {
     lastError = null;
     try {
-      await _requireClient.signUp(email, password);
+      await _requireClient.signUp(email, password, name: name);
     } on CognitoAuthException catch (e) {
       lastError = e.code == 'UsernameExistsException'
           ? 'An account with this email already exists.'

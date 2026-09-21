@@ -5,9 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'package:mobilecctvapp/app_state/ai_model_manager.dart';
 import 'package:mobilecctvapp/app_state/alerts_controller.dart';
-import 'package:mobilecctvapp/app_state/chat_controller.dart';
 import 'package:mobilecctvapp/app_state/events_controller.dart';
 import 'package:mobilecctvapp/app_state/homes_controller.dart';
 import 'package:mobilecctvapp/main.dart';
@@ -163,11 +161,10 @@ void _mockSecureStorageChannel() {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  // AiModelManager/ThemeController.load() both call
-  // SharedPreferences.getInstance(), which never resolves in a test
-  // environment without a mock store — SplashScreen (the app's initial
-  // route) waits on both before navigating to the dashboard, so every test
-  // that pumps the full app needs this.
+  // ThemeController.load() calls SharedPreferences.getInstance(), which
+  // never resolves in a test environment without a mock store —
+  // SplashScreen (the app's initial route) waits on it before navigating to
+  // the dashboard, so every test that pumps the full app needs this.
   SharedPreferences.setMockInitialValues({});
   _mockSecureStorageChannel();
 
@@ -195,19 +192,12 @@ void main() {
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
-    final aiModelManager = AiModelManager();
-    addTearDown(aiModelManager.dispose);
-    final chatController = ChatController();
-    addTearDown(chatController.dispose);
-
     await tester.pumpWidget(
       MaterialApp(
         home: DashboardScreen(
           homesController: homesController,
           alertsController: alertsController,
           eventsController: eventsController,
-          aiModelManager: aiModelManager,
-          chatController: chatController,
         ),
       ),
     );
@@ -242,19 +232,12 @@ void main() {
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
-    final aiModelManager = AiModelManager();
-    addTearDown(aiModelManager.dispose);
-    final chatController = ChatController();
-    addTearDown(chatController.dispose);
-
     await tester.pumpWidget(
       MaterialApp(
         home: DashboardScreen(
           homesController: homesController,
           alertsController: alertsController,
           eventsController: eventsController,
-          aiModelManager: aiModelManager,
-          chatController: chatController,
         ),
       ),
     );
@@ -278,19 +261,12 @@ void main() {
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
-    final aiModelManager = AiModelManager();
-    addTearDown(aiModelManager.dispose);
-    final chatController = ChatController();
-    addTearDown(chatController.dispose);
-
     await tester.pumpWidget(
       MaterialApp(
         home: DashboardScreen(
           homesController: homesController,
           alertsController: alertsController,
           eventsController: eventsController,
-          aiModelManager: aiModelManager,
-          chatController: chatController,
         ),
       ),
     );
@@ -319,19 +295,12 @@ void main() {
     addTearDown(alertsController.dispose);
     final eventsController = EventsController();
     addTearDown(eventsController.dispose);
-    final aiModelManager = AiModelManager();
-    addTearDown(aiModelManager.dispose);
-    final chatController = ChatController();
-    addTearDown(chatController.dispose);
-
     await tester.pumpWidget(
       MaterialApp(
         home: DashboardScreen(
           homesController: homesController,
           alertsController: alertsController,
           eventsController: eventsController,
-          aiModelManager: aiModelManager,
-          chatController: chatController,
         ),
       ),
     );

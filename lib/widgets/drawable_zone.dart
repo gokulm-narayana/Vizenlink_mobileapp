@@ -353,6 +353,198 @@ class _ZoneDrawPreviewPainter extends CustomPainter {
       oldDelegate.points != points;
 }
 
+/// Lets the user trace a free-form polygon zone directly on the preview in
+/// one continuous drag, as an alternative to placing vertices one at a time
+/// (the `Add point`/`Finish zone` flow most polygon-zone screens use).
+/// Reports the traced outline as fractional (0-1) points via [onZoneDrawn]
+/// once the gesture ends (only if it closes into [minPolygonPoints]+ real
+/// vertices — a tap or a too-short drag is discarded, same "must actually
+/// mean it" threshold [ZoneDrawSurface] applies to its own tap-for-a-zone
+/// shortcut).
+///
+/// A raw finger drag samples a new point on nearly every frame — capturing
+/// all of them and handing them straight to the caller produces a "wall of
+/// dots" polygon (one drag handle per sample) instead of a clean shape with
+/// only its real corners, like [ZoneOverlay]'s 4-handle rectangle. Fixed by
+/// running the finished trace through [_simplifyPolygon] (Ramer–Douglas–
+/// Peucker) once the gesture ends — it keeps only the points a straight
+/// line between neighbors can't already stand in for, collapsing a mostly-
+/// straight edge traced as 40 wobbly samples down to the 2 points that
+/// actually define it. A rough rectangle-ish trace comes out as ~4-6
+/// vertices, the same ballpark a careful point-by-point trace would
+/// produce; a genuinely curved boundary keeps more points, proportionally.
+///
+/// Same [Stack] placement rule as [ZoneDrawSurface]: put this *underneath*
+/// existing [PolygonOverlay]s so a drag starting on an existing zone still
+/// moves that zone's vertex instead of starting a new trace.
+class PolygonDrawSurface extends StatefulWidget {
+  const PolygonDrawSurface({
+    super.key,
+    required this.areaSize,
+    required this.enabled,
+    required this.onZoneDrawn,
+  });
+
+  final Size areaSize;
+  final bool enabled;
+  final ValueChanged<List<Offset>> onZoneDrawn;
+
+  @override
+  State<PolygonDrawSurface> createState() => _PolygonDrawSurfaceState();
+}
+
+class _PolygonDrawSurfaceState extends State<PolygonDrawSurface> {
+  /// Minimum raw-sample spacing during the drag itself, before
+  /// simplification — just enough to avoid recording literally every pixel
+  /// of jitter. The real vertex-count control is [_simplifyPolygon] below,
+  /// run once the gesture ends.
+  static const _minSampleDistance = 0.01;
+
+  /// Starting point (fractional, of the preview's shorter side) for how far
+  /// a point may deviate from the straight line between its neighbors
+  /// before [_simplifyPolygon] keeps it as a real corner — [_finishTrace]
+  /// grows this until the result is reasonably clean (see
+  /// [_maxTracedVertices]) rather than using one fixed pass.
+  static const _simplifyTolerance = 0.02;
+
+  /// Real bug fix: a single fixed [_simplifyTolerance] pass left a
+  /// traced shape's vertex count entirely at the mercy of how steady the
+  /// user's hand was — normal small wobble on a phone screen easily
+  /// produced 9-10 vertices for what was intended as a simple 4-5 sided
+  /// shape. Matches PARK-007's fixed 5-point default pentagon exactly —
+  /// an 8-vertex cap tried first still looked noticeably busier than the
+  /// one-tap default, so both creation methods now converge on the same
+  /// vertex count. [_finishTrace] keeps re-simplifying at a growing
+  /// tolerance until the result is at or under this count (or gives up
+  /// after enough attempts) so a rough trace ends up exactly as clean as
+  /// the default shape; a trace that genuinely needs more corners still
+  /// keeps them if repeated widening can't get under the cap.
+  static const _maxTracedVertices = 5;
+
+  final _points = <Offset>[];
+
+  double get _minSamplePixels =>
+      _minSampleDistance *
+      (widget.areaSize.shortestSide == 0 ? 1 : widget.areaSize.shortestSide);
+
+  void _addSample(Offset point) {
+    if (_points.isEmpty ||
+        (point - _points.last).distance >= _minSamplePixels) {
+      setState(() => _points.add(point));
+    }
+  }
+
+  void _finishTrace() {
+    final areaSize = widget.areaSize;
+    final traced = List<Offset>.of(_points);
+    setState(() => _points.clear());
+    if (traced.length < minPolygonPoints ||
+        areaSize.width == 0 ||
+        areaSize.height == 0) {
+      return;
+    }
+    var tolerance = _simplifyTolerance * areaSize.shortestSide;
+    var best = _simplifyPolygon(traced, tolerance);
+    if (best.length < minPolygonPoints) {
+      // Real bug fix: a trace close enough to a straight line has no real
+      // corners, so RDP correctly collapses it to just its 2 endpoints —
+      // below what a polygon needs. The previous fallback here used the
+      // full raw, unsimplified `traced` list instead, which for a
+      // mostly-straight drag meant every single touch sample along the
+      // line (often dozens) rendered as its own vertex handle — a dense
+      // trail of dots, not a usable shape. A straight line isn't a valid
+      // enclosed zone at all, so discard the trace outright instead, the
+      // same as a too-short drag already does just above.
+      return;
+    }
+    var attempts = 0;
+    // Keeps the last simplification that still has enough points to be a
+    // valid polygon, rather than only checking the final attempt — a fixed
+    // growth factor can overshoot past `minPolygonPoints` before reaching
+    // `_maxTracedVertices` on some shapes, and naively using whatever the
+    // loop lands on would then fall all the way back to the raw, messy
+    // `traced` points instead of the best clean-but-still-valid result
+    // found along the way.
+    while (best.length > _maxTracedVertices && attempts < 8) {
+      tolerance *= 1.5;
+      final candidate = _simplifyPolygon(traced, tolerance);
+      if (candidate.length < minPolygonPoints) break;
+      best = candidate;
+      attempts++;
+    }
+    final result = best;
+    widget.onZoneDrawn([
+      for (final point in result)
+        Offset(
+          (point.dx / areaSize.width).clamp(0.0, 1.0),
+          (point.dy / areaSize.height).clamp(0.0, 1.0),
+        ),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.enabled) return const SizedBox.shrink();
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onPanStart: (details) => setState(
+        () => _points
+          ..clear()
+          ..add(details.localPosition),
+      ),
+      onPanUpdate: (details) => _addSample(details.localPosition),
+      onPanEnd: (_) => _finishTrace(),
+      child: CustomPaint(
+        painter: _points.length > 1
+            ? _ZoneDrawPreviewPainter(points: _points)
+            : null,
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+/// Ramer–Douglas–Peucker polyline simplification — recursively keeps only
+/// the point farthest from the straight line between the current segment's
+/// endpoints, as long as that distance exceeds [tolerance]; drops everything
+/// closer than that, since a straight line through the endpoints already
+/// represents it well enough. Always keeps [points]' first and last point.
+List<Offset> _simplifyPolygon(List<Offset> points, double tolerance) {
+  if (points.length <= 2 || tolerance <= 0) return points;
+
+  var maxDistance = 0.0;
+  var maxIndex = 0;
+  final first = points.first;
+  final last = points.last;
+  for (var i = 1; i < points.length - 1; i++) {
+    final distance = _perpendicularDistance(points[i], first, last);
+    if (distance > maxDistance) {
+      maxDistance = distance;
+      maxIndex = i;
+    }
+  }
+
+  if (maxDistance <= tolerance) return [first, last];
+
+  final left = _simplifyPolygon(points.sublist(0, maxIndex + 1), tolerance);
+  final right = _simplifyPolygon(points.sublist(maxIndex), tolerance);
+  // `left`'s last point and `right`'s first point are both `points[maxIndex]`
+  // — drop one copy where they join.
+  return [...left.sublist(0, left.length - 1), ...right];
+}
+
+double _perpendicularDistance(Offset point, Offset lineStart, Offset lineEnd) {
+  final dx = lineEnd.dx - lineStart.dx;
+  final dy = lineEnd.dy - lineStart.dy;
+  final lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared == 0) return (point - lineStart).distance;
+  final t =
+      ((point.dx - lineStart.dx) * dx + (point.dy - lineStart.dy) * dy) /
+      lengthSquared;
+  final closest = Offset(lineStart.dx + t * dx, lineStart.dy + t * dy);
+  return (point - closest).distance;
+}
+
 enum _ZoneCorner { topLeft, topRight, bottomLeft, bottomRight }
 
 class _CornerHandle extends StatelessWidget {
@@ -416,12 +608,32 @@ class PolygonOverlay extends StatelessWidget {
     required this.areaSize,
     required this.selected,
     required this.onVertexChanged,
+    this.unselectedColor,
   });
 
   final PolygonZone zone;
   final Size areaSize;
   final bool selected;
   final void Function(int vertexIndex, Offset fractionalOffset) onVertexChanged;
+
+  /// Overrides the default amber/selected-primary outline with a fixed
+  /// per-zone color — used by screens with more than one zone type (e.g.
+  /// Parking Monitoring's Slot/Open Area/Restricted) so each type stays
+  /// identifiable by color at a glance.
+  ///
+  /// Real bug fix: this used to still lose to [selected]'s
+  /// `colorScheme.primary` override, so a zone's very first moments — it's
+  /// always auto-selected the instant it's finished drawing — showed the
+  /// generic selection color instead of its own type color, which is
+  /// exactly when a user is looking to confirm "did this draw as the type
+  /// I picked?". Now, when [unselectedColor] is given, it wins regardless
+  /// of [selected]; selection shows instead as a thicker outline/brighter
+  /// fill and a highlighted vertex-handle ring (see [_PolygonPainter],
+  /// [_PolygonVertexHandle]) rather than a hue swap. Screens with only one
+  /// zone kind (e.g. Person Detection's exclusion zones, which pass no
+  /// [unselectedColor]) keep their original selected-is-primary behavior
+  /// unchanged — there's no per-type color to protect there.
+  final Color? unselectedColor;
 
   List<Offset> _pixelPoints() => [
     for (final p in zone.points)
@@ -431,25 +643,41 @@ class PolygonOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final pixelPoints = _pixelPoints();
-    final color = selected
-        ? Theme.of(context).colorScheme.primary
-        : Colors.amber;
+    final color =
+        unselectedColor ??
+        (selected ? Theme.of(context).colorScheme.primary : Colors.amber);
 
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        CustomPaint(
-          size: areaSize,
-          painter: _PolygonPainter(
-            points: pixelPoints,
-            color: color,
-            filled: zone.isClosed,
+        // Real bug fix: `CustomPaint`'s `size` here is the *whole preview
+        // area* (so the outline/fill paint the full canvas coordinate
+        // space it needs), not just this polygon's own small bounding box
+        // — and by default a `CustomPaint` claims hit-testing across its
+        // entire declared size, not just the pixels it actually painted.
+        // Left un-ignored, the very first finished zone's `CustomPaint`
+        // silently covered the *entire* preview with an invisible hit
+        // box, swallowing every touch anywhere on it from then on —
+        // including a brand-new `PolygonDrawSurface` trace attempted
+        // nowhere near this zone. This layer is purely decorative (only
+        // the vertex handles below need to be interactive), so it must
+        // never intercept a touch at all.
+        IgnorePointer(
+          child: CustomPaint(
+            size: areaSize,
+            painter: _PolygonPainter(
+              points: pixelPoints,
+              color: color,
+              filled: zone.isClosed,
+              selected: selected,
+            ),
           ),
         ),
         for (var i = 0; i < pixelPoints.length; i++)
           _PolygonVertexHandle(
             position: pixelPoints[i],
             color: color,
+            selected: selected,
             onPanUpdate: (delta) {
               if (areaSize.width == 0 || areaSize.height == 0) return;
               final newPixel = pixelPoints[i] + delta;
@@ -471,11 +699,18 @@ class _PolygonPainter extends CustomPainter {
     required this.points,
     required this.color,
     required this.filled,
+    required this.selected,
   });
 
   final List<Offset> points;
   final Color color;
   final bool filled;
+
+  /// Shown as a thicker outline + brighter fill rather than a color swap —
+  /// see [PolygonOverlay.unselectedColor]'s doc for why: a hue swap would
+  /// hide which zone type this is at exactly the moment (just after
+  /// drawing it) a user most wants to confirm that.
+  final bool selected;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -489,7 +724,7 @@ class _PolygonPainter extends CustomPainter {
       canvas.drawPath(
         path,
         Paint()
-          ..color = color.withValues(alpha: 0.3)
+          ..color = color.withValues(alpha: selected ? 0.45 : 0.3)
           ..style = PaintingStyle.fill,
       );
     }
@@ -497,7 +732,7 @@ class _PolygonPainter extends CustomPainter {
       path,
       Paint()
         ..color = color
-        ..strokeWidth = 2
+        ..strokeWidth = selected ? 3 : 2
         ..style = PaintingStyle.stroke,
     );
   }
@@ -506,18 +741,25 @@ class _PolygonPainter extends CustomPainter {
   bool shouldRepaint(covariant _PolygonPainter oldDelegate) =>
       oldDelegate.points != points ||
       oldDelegate.color != color ||
-      oldDelegate.filled != filled;
+      oldDelegate.filled != filled ||
+      oldDelegate.selected != selected;
 }
 
 class _PolygonVertexHandle extends StatelessWidget {
   const _PolygonVertexHandle({
     required this.position,
     required this.color,
+    required this.selected,
     required this.onPanUpdate,
   });
 
   final Offset position;
   final Color color;
+
+  /// A brighter, thicker ring instead of a color swap — see
+  /// [PolygonOverlay.unselectedColor]'s doc for why the zone's own color
+  /// must survive selection.
+  final bool selected;
   final ValueChanged<Offset> onPanUpdate;
 
   @override
@@ -534,7 +776,10 @@ class _PolygonVertexHandle extends StatelessWidget {
           decoration: BoxDecoration(
             color: color,
             shape: BoxShape.circle,
-            border: Border.all(color: Colors.black, width: 1.5),
+            border: Border.all(
+              color: selected ? Colors.white : Colors.black,
+              width: selected ? 2.5 : 1.5,
+            ),
           ),
         ),
       ),

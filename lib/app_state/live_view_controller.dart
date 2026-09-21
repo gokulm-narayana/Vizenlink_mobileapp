@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
 
+import 'package:alerts_api/alerts_api.dart';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -9,28 +10,8 @@ import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:video_player/video_player.dart';
 
-/// Debug helper for [LiveViewController.startTalk]'s diagnostic logging —
-/// pulls the `a=sendrecv`/`a=recvonly`/etc. direction attribute out of the
-/// `m=audio` section of a raw SDP string, so the log can show whether the
-/// offer/answer actually negotiated a sending audio leg without dumping the
-/// entire SDP.
-String _extractAudioDirection(String? sdp) {
-  if (sdp == null) return '(no sdp)';
-  final lines = sdp.split('\r\n');
-  final audioIndex = lines.indexWhere((line) => line.startsWith('m=audio'));
-  if (audioIndex == -1) return '(no m=audio section)';
-  for (var i = audioIndex + 1; i < lines.length; i++) {
-    final line = lines[i];
-    if (line.startsWith('m=')) break;
-    if (line == 'a=sendrecv' ||
-        line == 'a=sendonly' ||
-        line == 'a=recvonly' ||
-        line == 'a=inactive') {
-      return line.substring(2);
-    }
-  }
-  return '(no direction attribute found)';
-}
+import '../rtsp/rtsp_live_view_proxy.dart';
+import '../rtsp/rtsp_talk_session.dart';
 
 enum LiveViewStatus { connecting, connected, reconnecting, failed, stopped }
 
@@ -49,7 +30,7 @@ enum TalkStatus { idle, connecting, talking, busy, error }
 
 /// LAN WebRTC live-view session for one camera — implements
 /// `packages/camera_api/STREAMING_GUIDE.md`'s §2 LAN path end to end:
-/// `GetWebRtcUri` discovery, offer/answer signaling (no STUN/TURN — host
+/// `GetLiveStreamUri` discovery, offer/answer signaling (no STUN/TURN — host
 /// candidates only, per the guide), a grace window before an ICE
 /// `disconnected` blip is treated as a real drop (the guide flags skipping
 /// this as a real bug hit before), fresh-offer reconnect on a genuine drop,
@@ -68,22 +49,63 @@ enum TalkStatus { idle, connecting, talking, busy, error }
 /// loop).
 class LiveViewController extends ChangeNotifier {
   /// [initialProfile] — one of [_profileLadder] (`Profile_1`/`Profile_2`/
-  /// `Profile_3`), defaulting to the highest-resolution `Profile_1` if
-  /// omitted. Lets a caller that already knows it only has a small display
-  /// budget for this session (e.g. a Multiview grid tile) start below full
-  /// resolution instead of connecting at `Profile_1` and immediately
-  /// stepping down — the automatic ladder in [_maybeStepDownProfile]/
-  /// [_maybeStepUpProfile] still applies on top of whatever this starts at.
+  /// `Profile_3`). Lets a caller that already knows it only has a small
+  /// display budget for this session (e.g. a Multiview grid tile) start
+  /// below full resolution — the automatic ladder in
+  /// [_maybeStepDownProfile]/[_maybeStepUpProfile] still applies on top of
+  /// whatever this starts at.
+  ///
+  /// **Real bug fix, 2026-09-11**: when omitted, this used to default to
+  /// [_profileLadder]'s first entry (`Profile_1`, the full-resolution
+  /// NVR/VMS-facing main stream) — per `STREAMING_GUIDE.md` §2.1, this
+  /// app's own live view must always default to
+  /// `kMobileOnlyStreamProfileToken` (`Profile_3`, the dedicated
+  /// mobile-only stream) instead, never fall through to `Profile_1`/
+  /// `Profile_2`. Only a caller that explicitly passes a different valid
+  /// profile (Multiview's own bandwidth-budget reasoning above) still gets
+  /// it — this only changes the *unset* default.
   LiveViewController(
     this.connection, {
     http.Client? httpClient,
     String? initialProfile,
     this.forceTransport,
   }) : _http = httpClient ?? http.Client(),
+       _profileLadderEnabled =
+           initialProfile != null && _profileLadder.contains(initialProfile),
        _profileToken =
            (initialProfile != null && _profileLadder.contains(initialProfile))
            ? initialProfile
-           : _profileLadder.first;
+           : kMobileOnlyStreamProfileToken;
+
+  /// Real bug fix, 2026-09-11: fixing just the *default* starting profile
+  /// (above) wasn't enough — [_nextLowerProfile]/[_nextHigherProfile]'s
+  /// ladder-stepping could still auto-*promote* a healthy `Profile_3`
+  /// session up to `Profile_2`/`Profile_1` later (on a sustained good-link
+  /// run), which `STREAMING_GUIDE.md` §2.1 forbids outright: "live view
+  /// must never fall through to `Profile_1`/`Profile_2` under any
+  /// circumstance, including sustained LAN trouble." True only when a
+  /// caller explicitly passed a valid [initialProfile] — i.e. Multiview's
+  /// own per-tile bandwidth-budget use case, which legitimately wants
+  /// automatic quality adjustment across all three tiers. The Live tab's
+  /// default (no [initialProfile]) gets `false` here, pinning it to
+  /// `Profile_3` permanently — [_nextLowerProfile]/[_nextHigherProfile]
+  /// short-circuit to `null` in that case, so the ladder can never move it.
+  bool _profileLadderEnabled;
+
+  /// Opts this session into (or out of) the automatic profile ladder after
+  /// construction — used by the Live tab's Stream Quality picker when the
+  /// user selects/deselects "Auto" (`CameraStreamQuality.auto`). Historically
+  /// (STREAMING_GUIDE.md §2.1) the Live tab's default session was pinned to
+  /// never auto-switch at all, since a background change the user didn't ask
+  /// for was found confusing; as of 2026-09-15 automatic switching is
+  /// allowed again, but only while "Auto" is the user's own explicit choice
+  /// — a manual High/Medium/Low pick must still stay pinned exactly as
+  /// selected. [camera_live_screen.dart]'s `_onLiveViewChanged` surfaces
+  /// every automatic change via [autoQualityChangeMessage] so it's never
+  /// silent this time.
+  void setAutoQualityLadder(bool enabled) {
+    _profileLadderEnabled = enabled;
+  }
 
   final CameraConnection connection;
   final http.Client _http;
@@ -93,7 +115,7 @@ class LiveViewController extends ChangeNotifier {
   /// drop — see STREAMING_GUIDE.md §2.4.
   static const _iceDisconnectGrace = Duration(seconds: 5);
 
-  /// How long the LAN discovery probe (`GetWebRtcUri`) waits before deciding
+  /// How long the LAN discovery probe (`GetLiveStreamUri`) waits before deciding
   /// the camera isn't reachable on this network — tuned against real WiFi
   /// testing (matches the sibling `nuraeye-rt` app's `lanProbeTimeout`): long
   /// enough to absorb normal same-subnet variance, short enough that a phone
@@ -101,12 +123,25 @@ class LiveViewController extends ChangeNotifier {
   /// even attempted.
   static const _lanProbeTimeout = Duration(seconds: 4);
 
-  /// How many times [_connectLan] retries `GetWebRtcUri` before falling
-  /// through to [_handleLanExhausted]'s reachability recheck.
-  static const _maxLanReconnectAttempts = 1;
+  /// How many times [_connectLan] retries `GetLiveStreamUri` before falling
+  /// through to [_handleLanExhausted]'s reachability recheck. Raised from 1
+  /// to 2, 2026-09-08, per a direct user report of the Live tab
+  /// intermittently landing on the "Remote" (WAN) badge while genuinely on
+  /// the same LAN as the camera — a single retry gives a real same-LAN
+  /// camera only one extra chance to answer `GetLiveStreamUri` before this whole
+  /// controller escalates to the much-higher-latency WAN path; a transient
+  /// hiccup (the camera's embedded HTTP server briefly busy serving another
+  /// concurrent LAN request from this same screen's other polls — signal
+  /// strength, shortcut state, etc. — or ordinary same-subnet jitter) can
+  /// plausibly outlast that in real conditions. This doesn't weaken the
+  /// LAN-first/WAN-only-after-genuine-failure policy — [_handleLanExhausted]
+  /// still independently reachability-checks before conceding to WAN either
+  /// way — it just gives a real LAN camera a little more slack before that
+  /// escalation happens at all.
+  static const _maxLanReconnectAttempts = 2;
   static const _lanRetryPollInterval = Duration(seconds: 1);
 
-  /// Once `GetWebRtcUri` has exhausted its retries, how long the independent
+  /// Once `GetLiveStreamUri` has exhausted its retries, how long the independent
   /// `AreYouNuraeyeDevice` reachability probe waits — distinguishes "camera
   /// isn't on this network at all" (falls to WAN) from "camera IS on this
   /// network but the signaling call itself glitched" (retries LAN instead of
@@ -127,7 +162,71 @@ class LiveViewController extends ChangeNotifier {
   /// this ladder on sustained LAN trouble and back up once the link recovers
   /// — see [_maybeStepDownProfile]/[_maybeStepUpProfile].
   static const _profileLadder = ['Profile_1', 'Profile_2', 'Profile_3'];
+  static const _profileDisplayName = {
+    'Profile_1': 'High',
+    'Profile_2': 'Medium',
+    'Profile_3': 'Low',
+  };
   String _profileToken;
+
+  /// The ONVIF profile token this session is currently requesting on LAN —
+  /// read by the Stream Quality sheet to cross-reference against
+  /// [lanProfiles] and highlight the actually-active tile.
+  String get currentProfileToken => _profileToken;
+
+  /// Set right before an automatic (ladder- or stall-driven, not a direct
+  /// user pick) quality change reconnects — the screen shows this once as a
+  /// SnackBar and clears it, so an "Auto" adjustment is always visible
+  /// rather than a silent background change. `null` most of the time.
+  String? autoQualityChangeMessage;
+
+  /// Every media profile this camera currently reports (token/name/native
+  /// resolution) — the real backing for the Stream Quality picker
+  /// (LIVE-058/059), added 2026-09-11 alongside `OnvifVideoEncoderClient
+  /// .getProfiles()`. `null` until [loadLanProfiles] has resolved at least
+  /// once; a camera unreachable on LAN never populates this.
+  List<MediaProfile>? get lanProfiles => _lanProfiles;
+  List<MediaProfile>? _lanProfiles;
+
+  /// Discovers (and caches) this camera's real media profiles via ONVIF
+  /// Media2 `GetProfiles`. Cached after the first successful call — pass
+  /// [forceRefresh] to re-fetch (e.g. the picker's own pull-to-refresh, or
+  /// after a Video Encoder settings change that could have altered a
+  /// profile's resolution).
+  Future<List<MediaProfile>?> loadLanProfiles({
+    bool forceRefresh = false,
+  }) async {
+    if (_lanProfiles != null && !forceRefresh) return _lanProfiles;
+    final client = OnvifVideoEncoderClient(connection);
+    final result = await client.getProfiles();
+    client.close();
+    debugPrint('[LiveView] getProfiles() -> $result');
+    if (_disposed) return _lanProfiles;
+    if (result case CameraSuccess<List<MediaProfile>>(:final value)) {
+      _lanProfiles = value;
+      debugPrint(
+        '[LiveView] discovered profiles: '
+        '${value.map((p) => '${p.token}(${p.name}, ${p.videoEncoderConfigToken}, '
+            '${p.resolution.width}x${p.resolution.height})').join(', ')}',
+      );
+      notifyListeners();
+    }
+    return _lanProfiles;
+  }
+
+  /// Switches which profile [connect]/[_tryLan] requests next — e.g. the
+  /// user picking a specific quality tier from LIVE-059. [token] should be
+  /// one of [lanProfiles]' tokens (typically `Profile_1`/`_2`/`_3`), though
+  /// any token the camera accepts works. Reconnects immediately so the
+  /// switch actually takes effect on-screen rather than only on the next
+  /// unrelated reconnect. A no-op if [token] already matches the live
+  /// profile — avoids tearing down and rebuilding an already-correct
+  /// session (e.g. re-selecting the same chip twice).
+  Future<void> setPreferredProfile(String token) async {
+    if (_disposed || token == _profileToken) return;
+    _profileToken = token;
+    await _reconnect();
+  }
 
   /// Recent ICE drops within [_lanTroubleWindow] — [_lanTroubleThreshold] or
   /// more within that window steps the resolution ladder down a tier instead
@@ -153,12 +252,17 @@ class LiveViewController extends ChangeNotifier {
   TalkStatus talkStatus = TalkStatus.idle;
   String? talkErrorMessage;
 
-  /// Defaulted on — TWO_WAY_TALK_GUIDE.md §5.2: a quiet earpiece-routed
+  /// Defaulted on — TWO_WAY_TALK_GUIDE.md §6.2: a quiet earpiece-routed
   /// default reproduces a real "too quiet" complaint this app hit before.
   bool speakerphoneOn = true;
 
+  /// The active dedicated talk RTSPS session (`RtspTalkSession`), or `null`
+  /// when [talkStatus] is [TalkStatus.idle]. Entirely independent of [_pc] —
+  /// see [startTalk]'s doc comment.
+  RtspTalkSession? _talkSession;
+  StreamSubscription<void>? _talkEndedSub;
+
   RTCPeerConnection? _pc;
-  MediaStream? _localAudioStream;
   Uri? _signalingUrl;
   Timer? _disconnectGraceTimer;
   bool _rendererInitialized = false;
@@ -210,12 +314,155 @@ class LiveViewController extends ChangeNotifier {
   /// everything else; the UI just renders it.
   VideoPlayerController? wanVideoController;
 
+  /// Non-null only while [transport] is [LiveViewTransport.lan] *and* the
+  /// camera resolved `LiveStreamTransport.rtsp` for this profile (its
+  /// firmware build has `WEBRTC_STREAMING` disabled — the documented
+  /// current default, STREAMING_GUIDE.md §2.5) — plays the local loopback
+  /// URL [_rtspProxy] serves. The UI checks this (not just [transport])
+  /// to decide between `RTCVideoView` (WebRTC) and a plain
+  /// `video_player`-backed surface (this, same as the WAN path) for a
+  /// `lan`-transport session.
+  VideoPlayerController? lanRtspVideoController;
+
+  RtspLiveViewProxy? _rtspProxy;
+  Timer? _rtspHealthTimer;
+  static const _rtspHealthCheckInterval = Duration(seconds: 5);
+
+  /// Same delta-over-interval bitrate computation [_pollBitrate] does from
+  /// WebRTC's `getStats()`, fed from [RtspLiveViewProxy.bytesReceived]
+  /// instead — this camera's firmware has WebRTC disabled, so RTSP-over-LAN
+  /// is this app's actual default LAN path, and it never populated
+  /// [measuredBitrateKbps] (the LIVE-038 badge's number) at all before this
+  /// (real gap, 2026-09-15).
+  int? _lastRtspBytesReceived;
+  double? _lastRtspStatsTimestampMs;
+
   /// Tracks whether `StartCloudStreaming` was actually sent, independent of
   /// [status]/[transport] — STREAMING_GUIDE.md §3 "Ending the session" is
   /// explicit that Stop must be sent even if the session never reached
   /// "playing" (a real bug found in this app: skipping it left the camera
   /// publishing to KVS with no viewer).
   bool _wanStreamStarted = false;
+
+  /// This viewer's lease token from `startCloudStreaming` (`FR-CF-154`,
+  /// 2026-09-15) — every later `getCloudStreamingStatus`/`stopCloudStreaming`
+  /// call for this session must pass it back. `null` until a WAN session has
+  /// actually started.
+  int? _wanLeaseToken;
+
+  /// The KVS quality tier this app requests over WAN. Defaults to
+  /// [StreamQuality.medium] — matches this class's own pre-`FR-CF-154`
+  /// implicit default ("Stream 1", `Profile_2`/`VideoEncoderCfg_2` — the
+  /// medium tier, per `onvif_video_encoder_client.dart`'s token mapping)
+  /// rather than surprising a WAN viewer with a heavier "high" request.
+  /// Settable via [setWanQuality] (the Stream Quality sheet's WAN branch).
+  StreamQuality _wanQuality = StreamQuality.medium;
+
+  /// The WAN quality tier currently requested — read by the Stream Quality
+  /// sheet to highlight the active choice.
+  StreamQuality get wanQuality => _wanQuality;
+
+  /// Whether WAN is currently in "Auto" mode — [_pollWanStall] then steps
+  /// [_wanQuality] up/down on its own instead of the user picking a fixed
+  /// tier. Added 2026-09-15 alongside the LAN ladder reopening (see
+  /// [setAutoQualityLadder]) — HLS has no bitrate telemetry (STREAMING_GUIDE
+  /// .md §8), so this is driven by stall/rebuffer detection instead, the
+  /// guide's own suggested fallback signal.
+  bool get wanAutoQuality => _wanAutoEnabled;
+  bool _wanAutoEnabled = false;
+
+  /// How many consecutive non-stalled [_pollWanStall] ticks (at
+  /// [_wanStallPollInterval]) justify stepping [_wanQuality] up a tier —
+  /// deliberately slower than stepping down (immediate on
+  /// [_wanStallThreshold]), same asymmetric reasoning as the LAN ladder's
+  /// [_healthyPollThreshold]: a marginal link should recover fast, but
+  /// shouldn't flap back to the heaviest, most expensive tier on one good
+  /// sample.
+  int _wanHealthyPollCount = 0;
+  static const _wanHealthyPollThreshold = 10;
+
+  void setWanAutoQuality(bool enabled) {
+    _wanAutoEnabled = enabled;
+    _wanHealthyPollCount = 0;
+    _wanStallPollCount = 0;
+  }
+
+  StreamQuality? _nextLowerWanQuality() {
+    final i = StreamQuality.values.indexOf(_wanQuality);
+    if (i == -1 || i + 1 >= StreamQuality.values.length) return null;
+    return StreamQuality.values[i + 1];
+  }
+
+  StreamQuality? _nextHigherWanQuality() {
+    final i = StreamQuality.values.indexOf(_wanQuality);
+    if (i <= 0) return null;
+    return StreamQuality.values[i - 1];
+  }
+
+  String _wanQualityDisplayName(StreamQuality quality) => switch (quality) {
+    StreamQuality.high => 'High',
+    StreamQuality.medium => 'Medium',
+    StreamQuality.low => 'Low',
+  };
+
+  /// User-driven quality switch — the Stream Quality sheet's manual
+  /// High/Medium/Low picks. See [_switchWanQuality] for the shared
+  /// teardown/reconnect mechanics this and the automatic ladder both use.
+  Future<void> setWanQuality(StreamQuality quality) =>
+      _switchWanQuality(quality);
+
+  /// Switches the WAN quality tier (`FR-CF-154`). A no-op field update if no
+  /// WAN session is active yet — the next [_connectWan] call already picks
+  /// up the new value. Otherwise tears down the current KVS viewer lease and
+  /// reconnects directly on the new tier. [automatic] marks a
+  /// [_pollWanStall]-driven change (as opposed to [setWanQuality]'s direct
+  /// user pick) so [autoQualityChangeMessage] surfaces it instead of leaving
+  /// it silent.
+  ///
+  /// Goes straight to [_connectWan] rather than the general
+  /// [_reconnect]/[connect] path: [transport] can only be
+  /// [LiveViewTransport.wan] right now because LAN was already confirmed
+  /// unreachable for this session (or [forceTransport] is `wan`) — retrying
+  /// LAN first would just cost a predictable couple of `AreYouNuraeyeDevice`
+  /// timeouts (per [_maxLanReconnectAttempts]) before falling back to WAN
+  /// anyway, stalling the quality switch for no benefit.
+  Future<void> _switchWanQuality(
+    StreamQuality quality, {
+    bool automatic = false,
+  }) async {
+    if (quality == _wanQuality) return;
+    _wanQuality = quality;
+    _wanHealthyPollCount = 0;
+    _wanStallPollCount = 0;
+    if (automatic) {
+      autoQualityChangeMessage =
+          'Auto adjusted stream quality to ${_wanQualityDisplayName(quality)}';
+    }
+    if (_disposed ||
+        transport != LiveViewTransport.wan ||
+        status != LiveViewStatus.connected) {
+      return;
+    }
+    status = LiveViewStatus.reconnecting;
+    notifyListeners();
+    await _stopWanIfNeeded();
+    if (_disposed) return;
+    if (!await _connectWan() && !_disposed) {
+      _fail(errorMessage ?? 'Could not switch stream quality');
+    }
+  }
+
+  /// Best-effort fast-path for a camera-initiated `CloudStreamStopped`
+  /// (`STREAMING_GUIDE.md` §6, `FR-CF-154`) — reacts immediately instead of
+  /// waiting for the next up-to-10s [_wanHealthTimer] poll to notice via
+  /// `idle`/`degraded`. Purely additive: [CameraAlertsHub.events] is an
+  /// already-running, app-wide relay (`alerts_api`), so this adds no new
+  /// connection — and if the event name/shape here turns out wrong or never
+  /// fires, the poll-based recovery above still catches it regardless, just
+  /// up to 10s slower. **Event name unconfirmed against real hardware** —
+  /// unlike the rest of this rework, no wire-format sample exists for it;
+  /// the debug log below makes a mismatch obvious on a real device.
+  StreamSubscription<CameraAlertEvent>? _cloudStreamStoppedSub;
   Timer? _wanHealthTimer;
 
   /// STREAMING_GUIDE.md §5 — poll cadence for `GetCloudStreamingStatus`
@@ -304,7 +551,7 @@ class LiveViewController extends ChangeNotifier {
     await [Permission.microphone, Permission.bluetoothConnect].request();
   }
 
-  /// LAN WebRTC path (STREAMING_GUIDE.md §2). Retries `GetWebRtcUri` up to
+  /// LAN WebRTC path (STREAMING_GUIDE.md §2). Retries `GetLiveStreamUri` up to
   /// [_maxLanReconnectAttempts] times before falling through to
   /// [_handleLanExhausted]'s independent reachability recheck — a single
   /// transient failure no longer sends this straight to the much
@@ -332,18 +579,30 @@ class LiveViewController extends ChangeNotifier {
     if (_disposed) return false;
 
     final nuraeye = NuraeyeClient(connection);
-    final result = await WebRtcUriClient(
+    final result = await LiveStreamUriClient(
       nuraeye,
-    ).getWebRtcUri(_profileToken, timeout: _lanProbeTimeout);
+    ).getLiveStreamUri(_profileToken, timeout: _lanProbeTimeout);
     nuraeye.close();
     if (_disposed) return false;
 
-    final WebRtcTarget target;
     final String failureReason;
     switch (result) {
       case CameraSuccess(:final value):
-        target = value;
-        return _negotiate(target.signalingUrl, talk: false);
+        switch (value.transport) {
+          case LiveStreamTransport.webrtc:
+            return _negotiate(value.mediaUri);
+          case LiveStreamTransport.rtsp:
+            // The camera's firmware build has WEBRTC_STREAMING disabled —
+            // the documented current default (STREAMING_GUIDE.md §1/§2) —
+            // so it reports RTSP for this profile instead. Same
+            // return-immediately contract as the webrtc case just above:
+            // a failure here is downstream of discovery (a bad RTSP
+            // negotiation, not a bad GetLiveStreamUri call), so retrying
+            // the same discovery call wouldn't help — go straight to
+            // connect()'s WAN fallback instead of this method's own LAN
+            // retry loop below.
+            return _connectRtsp(value);
+        }
       case CameraFailure(:final reason):
         failureReason = reason;
       case CameraTimeout():
@@ -368,7 +627,7 @@ class LiveViewController extends ChangeNotifier {
     return _handleLanExhausted(failureReason);
   }
 
-  /// `GetWebRtcUri` has exhausted its retries — before treating that as
+  /// `GetLiveStreamUri` has exhausted its retries — before treating that as
   /// "camera isn't on this network" and falling to WAN, confirm that verdict
   /// with one cheap, independent reachability probe (`AreYouNuraeyeDevice`).
   /// A camera that's still genuinely on this LAN gets one more LAN attempt
@@ -380,7 +639,7 @@ class LiveViewController extends ChangeNotifier {
     final nuraeye = NuraeyeClient(connection);
     final bool reachable;
     try {
-      reachable = await WebRtcUriClient(
+      reachable = await LiveStreamUriClient(
         nuraeye,
       ).checkReachable(timeout: _lanReachabilityCheckTimeout);
     } finally {
@@ -396,61 +655,198 @@ class LiveViewController extends ChangeNotifier {
     return false;
   }
 
-  /// Negotiates a brand-new `RTCPeerConnection` against [signalingUrl] —
-  /// plain live view (`talk: false`) or with talk's sendrecv audio leg
-  /// (`talk: true`, captures the phone's mic and attaches it before the
-  /// offer is even created). **Always builds a fresh peer connection —
-  /// never renegotiates an existing one.** `module_webrtc.c` holds exactly
-  /// one `RTCPeerConnection` per signaling port and tears down whatever
-  /// connection currently exists on every accepted offer before rebuilding
-  /// it server-side (STREAMING_GUIDE.md §2.3). Sending a second offer over
-  /// the *phone's own already-connected* `RTCPeerConnection` (the original
-  /// [startTalk] approach) reliably completes the SDP handshake — offer and
-  /// answer both say `sendrecv` — but the connection then dies a few
-  /// seconds later, because the local ICE agent is still holding
-  /// candidates/consent state for a server-side session the camera already
-  /// discarded the moment the second offer arrived (confirmed via
-  /// real-device log capture, 2026-08-17: every talk attempt reconnected
-  /// cleanly then closed ~5s later, exactly matching this app's own
-  /// `_iceDisconnectGrace` timeout). The fix, matching the sibling
-  /// `vizenlinkvms/nuraeye-rt` app's `WebRtcLiveViewSession.connect`: treat
-  /// every negotiation — including toggling talk — as a full replacement,
-  /// so the local and remote sides always start ICE in lockstep. Callers
-  /// ([_connectLan], [startTalk]) must have already torn down any previous
-  /// [_pc] (and told the camera so via `POST /webrtc/stop`, for the talk
-  /// case) before calling this. Returns true on success.
-  Future<bool> _negotiate(Uri signalingUrl, {required bool talk}) async {
-    MediaStream? localStream;
-    if (talk) {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        'audio': true,
-        'video': false,
-      });
-    } else {
-      // iOS-only (no-op elsewhere, see AppleNativeAudioManagement's own
-      // platform check): configures AVAudioSession for receive-only remote
-      // audio playback before the peer connection exists. Without this,
-      // the native WebRTC audio engine renders against an unconfigured
-      // session — reproduced as a real SIGSEGV inside WebRTC's own audio
-      // unit callback (crash report 2026-08-14, iOS Simulator) once the
-      // remote audio track went live. Talk's `localAndRemote` equivalent
-      // is set further below, once the mic track is actually attached —
-      // that ordering was already what [startTalk] did before this and is
-      // not implicated in that crash.
-      await AppleNativeAudioManagement.setAppleAudioConfiguration(
-        AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
-          AppleAudioIOMode.remoteOnly,
-        ),
-      );
+  /// Opens the RTSP fallback session against [target] (STREAMING_GUIDE.md
+  /// §2.5), remuxes it to fMP4 over a local loopback via
+  /// [RtspLiveViewProxy], and points [lanRtspVideoController] at that
+  /// loopback URL — same `video_player`-backed rendering path the WAN/KVS
+  /// transport already uses, just fed by a local URI instead of a remote
+  /// one. [transport] stays [LiveViewTransport.lan] (this is still a LAN
+  /// session, just not the WebRTC leg) — the UI distinguishes the two by
+  /// checking [lanRtspVideoController] rather than transport alone. Tears
+  /// down its own proxy on any failure before returning false.
+  Future<bool> _connectRtsp(LiveStreamTarget target) async {
+    // Best-effort — a camera unreachable for this alone shouldn't block the
+    // RTSP connection itself; [RtspLiveViewProxy]'s own 1280x720 default
+    // covers the "couldn't discover profiles" case.
+    final profiles = _lanProfiles ?? await loadLanProfiles();
+    final matchedResolution = profiles
+        ?.where((p) => p.token == _profileToken)
+        .map((p) => p.resolution)
+        .firstOrNull;
+    final proxy = RtspLiveViewProxy(
+      host: target.mediaUri.host,
+      port: target.port,
+      path: target.mediaUri.path,
+      username: connection.username,
+      password: connection.password,
+      fallbackResolution: matchedResolution ?? (width: 1280, height: 720),
+    );
+    try {
+      await proxy.start();
+    } catch (e) {
+      await proxy.stop();
+      if (!_disposed) errorMessage = 'Could not start RTSP live view: $e';
+      return false;
     }
     if (_disposed) {
-      if (localStream != null) {
-        for (final track in localStream.getTracks()) {
-          await track.stop();
-        }
+      await proxy.stop();
+      return false;
+    }
+
+    final playUrl = proxy.url;
+    if (playUrl == null || !await _playLanRtspUrl(playUrl)) {
+      await proxy.stop();
+      if (!_disposed) {
+        errorMessage = 'Could not start RTSP live view playback';
       }
       return false;
     }
+    if (_disposed) {
+      await proxy.stop();
+      return false;
+    }
+
+    _rtspProxy = proxy;
+    transport = LiveViewTransport.lan;
+    status = LiveViewStatus.connected;
+    _startRtspHealthMonitor();
+    notifyListeners();
+    return true;
+  }
+
+  /// Initializes and starts playback of [uri] (the RTSP proxy's local
+  /// loopback URL) on [lanRtspVideoController] — mirrors [_playWanUrl]
+  /// exactly, just for the LAN-RTSP-fallback case instead of WAN. Returns
+  /// whether playback actually started.
+  Future<bool> _playLanRtspUrl(Uri uri) async {
+    final videoController = VideoPlayerController.networkUrl(uri);
+    try {
+      await videoController.initialize();
+    } catch (_) {
+      await videoController.dispose();
+      return false;
+    }
+    if (_disposed) {
+      await videoController.dispose();
+      return false;
+    }
+    await videoController.setLooping(false);
+    await videoController.play();
+    final oldController = lanRtspVideoController;
+    lanRtspVideoController = videoController;
+    if (oldController != null) unawaited(oldController.dispose());
+    return true;
+  }
+
+  void _startRtspHealthMonitor() {
+    _rtspHealthTimer?.cancel();
+    _rtspHealthTimer = Timer.periodic(
+      _rtspHealthCheckInterval,
+      (_) => _pollRtspHealth(),
+    );
+  }
+
+  /// Client-side stall detection for the RTSP-over-LAN path — same
+  /// reasoning [_pollWanStall] documents for the WAN transport: the
+  /// underlying RTSP feed can die (camera reboot, network drop) without
+  /// `video_player`'s own state necessarily reflecting it promptly, and
+  /// [RtspLiveViewProxy.isSessionEnded] is the server-side-authoritative
+  /// signal for "this feed is genuinely gone," same role
+  /// `RtspRemuxProxy.isSessionEnded` plays for Playback's own stall
+  /// detection. Either signal triggers the same [_reconnect] a dropped
+  /// WebRTC/WAN session already uses — a plain retry against a
+  /// freshly-resolved `getLiveStreamUri()` target, per STREAMING_GUIDE.md
+  /// §2.4's reconnect posture.
+  void _pollRtspHealth() {
+    if (_disposed ||
+        transport != LiveViewTransport.lan ||
+        status != LiveViewStatus.connected ||
+        lanRtspVideoController == null) {
+      return;
+    }
+    _pollRtspBitrate();
+    final proxyEnded = _rtspProxy?.isSessionEnded ?? false;
+    final playerErrored = lanRtspVideoController?.value.hasError ?? false;
+    if (proxyEnded || playerErrored) {
+      unawaited(_reconnect());
+    }
+  }
+
+  void _pollRtspBitrate() {
+    final proxy = _rtspProxy;
+    if (proxy == null) return;
+    final bytesReceived = proxy.bytesReceived;
+    final timestampMs = DateTime.now().millisecondsSinceEpoch.toDouble();
+
+    final prevBytes = _lastRtspBytesReceived;
+    final prevTimestampMs = _lastRtspStatsTimestampMs;
+    _lastRtspBytesReceived = bytesReceived;
+    _lastRtspStatsTimestampMs = timestampMs;
+
+    if (prevBytes == null || prevTimestampMs == null) return;
+    final deltaBytes = bytesReceived - prevBytes;
+    final deltaSeconds = (timestampMs - prevTimestampMs) / 1000;
+    if (deltaSeconds <= 0 || deltaBytes < 0) return;
+    measuredBitrateKbps = (deltaBytes * 8) / 1000 / deltaSeconds;
+    if (!_disposed) notifyListeners();
+  }
+
+  Future<void> _stopRtspIfNeeded() async {
+    _rtspHealthTimer?.cancel();
+    _rtspHealthTimer = null;
+    _lastRtspBytesReceived = null;
+    _lastRtspStatsTimestampMs = null;
+    if (measuredBitrateKbps != null) {
+      measuredBitrateKbps = null;
+      if (!_disposed) notifyListeners();
+    }
+    final proxy = _rtspProxy;
+    _rtspProxy = null;
+    final controller = lanRtspVideoController;
+    lanRtspVideoController = null;
+    if (controller != null) {
+      try {
+        await controller.pause();
+      } catch (_) {
+        // Best-effort — nothing more to do if the player's already broken.
+      }
+      unawaited(controller.dispose());
+    }
+    if (proxy != null) await proxy.stop();
+  }
+
+  /// Negotiates a brand-new `RTCPeerConnection` against [signalingUrl] for
+  /// plain live view — video recvonly, plus a recvonly audio leg (for
+  /// hearing the camera's own ambient mic, rendered implicitly by
+  /// `renderer.srcObject`'s associated audio track — unrelated to two-way
+  /// talk). **Always builds a fresh peer connection — never renegotiates an
+  /// existing one.** `module_webrtc.c` holds exactly one `RTCPeerConnection`
+  /// per signaling port and tears down whatever connection currently exists
+  /// on every accepted offer before rebuilding it server-side
+  /// (STREAMING_GUIDE.md §2.3).
+  ///
+  /// **No longer used for two-way talk** (2026-09-15) — talk moved to its
+  /// own dedicated RTSPS connection ([RtspTalkSession],
+  /// `TWO_WAY_TALK_GUIDE.md`) after the camera's firmware removed the
+  /// `{"talk": true}` flag on `POST /webrtc` entirely (2026-09-11); the old
+  /// approach of renegotiating this exact peer connection with a sendrecv
+  /// audio leg is stale — see git history if that mechanism is ever needed
+  /// for reference. Callers ([_connectLan]) must have already torn down any
+  /// previous [_pc] before calling this. Returns true on success.
+  Future<bool> _negotiate(Uri signalingUrl) async {
+    // iOS-only (no-op elsewhere, see AppleNativeAudioManagement's own
+    // platform check): configures AVAudioSession for receive-only remote
+    // audio playback before the peer connection exists. Without this, the
+    // native WebRTC audio engine renders against an unconfigured session —
+    // reproduced as a real SIGSEGV inside WebRTC's own audio unit callback
+    // (crash report 2026-08-14, iOS Simulator) once the remote audio track
+    // went live.
+    await AppleNativeAudioManagement.setAppleAudioConfiguration(
+      AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
+        AppleAudioIOMode.remoteOnly,
+      ),
+    );
+    if (_disposed) return false;
 
     try {
       // No STUN/TURN — this is a same-LAN connection with host candidates
@@ -458,11 +854,6 @@ class LiveViewController extends ChangeNotifier {
       final pc = await createPeerConnection({'iceServers': <dynamic>[]});
       if (_disposed) {
         await pc.close();
-        if (localStream != null) {
-          for (final track in localStream.getTracks()) {
-            await track.stop();
-          }
-        }
         return false;
       }
       _pc = pc;
@@ -479,38 +870,12 @@ class LiveViewController extends ChangeNotifier {
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
-      final audioTransceiver = await pc.addTransceiver(
+      await pc.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-        init: RTCRtpTransceiverInit(
-          direction: talk
-              ? TransceiverDirection.SendRecv
-              : TransceiverDirection.RecvOnly,
-        ),
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
-      if (talk && localStream != null) {
-        await audioTransceiver.sender.replaceTrack(
-          localStream.getAudioTracks().first,
-        );
-        _localAudioStream = localStream;
-        // Sending *and* receiving audio now — reconfigure the iOS session
-        // accordingly (see the `remoteOnly` call above for why this
-        // matters at all; `localAndRemote` is talk's equivalent).
-        await AppleNativeAudioManagement.setAppleAudioConfiguration(
-          AppleNativeAudioManagement.getAppleAudioConfigurationForMode(
-            AppleAudioIOMode.localAndRemote,
-            preferSpeakerOutput: speakerphoneOn,
-          ),
-        );
-      }
 
       final offer = await pc.createOffer();
-      if (talk) {
-        // ignore: avoid_print
-        print(
-          '[Talk] offer audio direction line: '
-          '${_extractAudioDirection(offer.sdp)}',
-        );
-      }
       await pc.setLocalDescription(offer);
 
       // This camera's WebRTC signaling is non-trickle — it needs host ICE
@@ -524,11 +889,6 @@ class LiveViewController extends ChangeNotifier {
       await _waitForIceGatheringComplete(pc);
       if (_disposed) {
         await pc.close();
-        if (localStream != null) {
-          for (final track in localStream.getTracks()) {
-            await track.stop();
-          }
-        }
         return false;
       }
       final localDescription = await pc.getLocalDescription();
@@ -538,62 +898,29 @@ class LiveViewController extends ChangeNotifier {
           .post(
             signalingUrl,
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'type': 'offer', 'sdp': offerSdp, 'talk': talk}),
+            body: jsonEncode({'type': 'offer', 'sdp': offerSdp}),
           )
           .timeout(_webrtcSignalingTimeout);
       if (_disposed) return false;
-      if (talk) {
-        // ignore: avoid_print
-        print('[Talk] signaling response: ${response.statusCode}');
-      }
 
-      // TWO_WAY_TALK_GUIDE.md §4 — a 409 means another talk session already
-      // holds the camera's speaker; nothing to roll back locally since this
-      // is always a fresh pc/offer now, just report busy (talk) or a
-      // generic rejection (plain connect, though 409 shouldn't occur there).
       if (response.statusCode == 409) {
-        if (talk) {
-          talkStatus = TalkStatus.busy;
-          notifyListeners();
-        } else {
-          errorMessage = 'Camera rejected the connection (409)';
-        }
+        errorMessage = 'Camera rejected the connection (409)';
         await _teardownPeerConnection();
-        await _releaseLocalAudio();
         return false;
       }
       if (response.statusCode != 200) {
-        final reason =
+        errorMessage =
             'Camera rejected the connection (${response.statusCode})';
-        if (talk) {
-          _failTalk(reason);
-        } else {
-          errorMessage = reason;
-        }
         await _teardownPeerConnection();
-        await _releaseLocalAudio();
         return false;
       }
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       final answerSdp = body['sdp'] as String?;
       final answerType = body['type'] as String?;
       if (answerSdp == null || answerType == null) {
-        const reason = 'Malformed answer from camera';
-        if (talk) {
-          _failTalk(reason);
-        } else {
-          errorMessage = reason;
-        }
+        errorMessage = 'Malformed answer from camera';
         await _teardownPeerConnection();
-        await _releaseLocalAudio();
         return false;
-      }
-      if (talk) {
-        // ignore: avoid_print
-        print(
-          '[Talk] answer audio direction line: '
-          '${_extractAudioDirection(answerSdp)}',
-        );
       }
       await pc.setRemoteDescription(
         RTCSessionDescription(answerSdp, answerType),
@@ -605,10 +932,6 @@ class LiveViewController extends ChangeNotifier {
       status = LiveViewStatus.connected;
       _retryAttempt = 0;
       _startStatsPolling();
-      if (talk) {
-        talkStatus = TalkStatus.talking;
-        talkErrorMessage = null;
-      }
       // See _applySpeakerphoneRoute's doc comment — a single call right
       // after signaling isn't reliable, the native audio device module can
       // reset the route once media actually starts flowing.
@@ -623,13 +946,8 @@ class LiveViewController extends ChangeNotifier {
       return true;
     } catch (e) {
       if (_disposed) return false;
-      if (talk) {
-        _failTalk(e.toString());
-      } else {
-        errorMessage = e.toString();
-      }
+      errorMessage = e.toString();
       await _teardownPeerConnection();
-      await _releaseLocalAudio();
       return false;
     }
   }
@@ -740,12 +1058,14 @@ class LiveViewController extends ChangeNotifier {
   }
 
   String? _nextLowerProfile() {
+    if (!_profileLadderEnabled) return null;
     final i = _profileLadder.indexOf(_profileToken);
     if (i == -1 || i + 1 >= _profileLadder.length) return null;
     return _profileLadder[i + 1];
   }
 
   String? _nextHigherProfile() {
+    if (!_profileLadderEnabled) return null;
     final i = _profileLadder.indexOf(_profileToken);
     if (i <= 0) return null;
     return _profileLadder[i - 1];
@@ -786,35 +1106,38 @@ class LiveViewController extends ChangeNotifier {
     _healthyPollCount = 0;
     _stallPollCount = 0;
     _lowBitratePollCount = 0;
+    // Every caller of _switchProfile is the automatic ladder (a direct user
+    // pick goes through setPreferredProfile/_reconnect instead) — always an
+    // Auto-driven change, so always worth a message.
+    autoQualityChangeMessage =
+        'Auto adjusted stream quality to '
+        '${_profileDisplayName[newProfile] ?? newProfile}';
     status = LiveViewStatus.reconnecting;
     notifyListeners();
     await _teardownPeerConnection();
     if (!_disposed) await connect();
   }
 
-  Future<void> _reconnect() async {
+  /// [preferLan] — set only by [_checkWanHealth]'s own LAN-reachability
+  /// precheck, which has *just* confirmed the camera is reachable directly —
+  /// threaded down to [_stopWanIfNeeded] so that one call skips straight to
+  /// the LAN `StopCloudStreaming` action instead of paying its normal
+  /// AWS/MQTT round trip (STREAMING_GUIDE.md §3 "Ending the session"). Every
+  /// other caller has no such signal and must not guess one — see
+  /// [_stopWanIfNeeded]'s own doc for why guessing was itself a real,
+  /// user-facing latency bug.
+  Future<void> _reconnect({bool preferLan = false}) async {
     if (_disposed) return;
-    // An ICE failure/close tears down this exact peer connection — the talk
-    // leg (if any) dies with it, and the fresh connection `connect()` below
-    // creates is recvonly-only (talk is only ever added via a later
-    // `startTalk()` renegotiation, same as TWO_WAY_TALK_GUIDE.md §3's
-    // "`/webrtc/stop` tears down the entire connection, not just the talk
-    // leg"). Without resetting `talkStatus` here, the TALK-001 status bar
-    // would keep showing "Talking" indefinitely after an automatic
-    // reconnect even though the mic leg is gone and nothing is actually
-    // being sent — silently stuck, not just briefly wrong. Landing on
-    // [TalkStatus.error] rather than [TalkStatus.idle] keeps the status bar
-    // visible with an explanation instead of it just vanishing, same as any
-    // other talk failure — the user dismisses it via TALK-005 same as usual.
-    if (talkStatus != TalkStatus.idle) {
-      await _releaseLocalAudio();
-      talkStatus = TalkStatus.error;
-      talkErrorMessage = 'Talk ended: connection was interrupted';
-    }
+    // Talk runs on its own dedicated RTSPS connection now (2026-09-15),
+    // entirely independent of live view's own connection — a live-view
+    // reconnect (ICE failure, RTSP/WAN health check) no longer touches
+    // `talkStatus`/[_talkSession] at all, matching TWO_WAY_TALK_GUIDE.md §1
+    // ("completely independent of whatever the live-view screen is doing").
     status = LiveViewStatus.reconnecting;
     notifyListeners();
     await _teardownPeerConnection();
-    await _stopWanIfNeeded();
+    await _stopWanIfNeeded(preferLan: preferLan);
+    await _stopRtspIfNeeded();
     if (!_disposed) await connect();
   }
 
@@ -954,9 +1277,10 @@ class LiveViewController extends ChangeNotifier {
   /// needing to change `camera_api` itself.
   Future<CameraResult<StreamStatus>> _getCloudStreamingStatus(
     AwsWanLiveViewClient client,
+    int token,
   ) async {
     try {
-      return await client.getCloudStreamingStatus();
+      return await client.getCloudStreamingStatus(token);
     } catch (e) {
       return CameraFailure(e.toString());
     }
@@ -971,16 +1295,49 @@ class LiveViewController extends ChangeNotifier {
     if (thingName == null) return false;
     final client = AwsWanLiveViewClient(thingName);
 
-    final startResult = await client.startCloudStreaming();
-    if (_disposed) return false;
-    if (startResult is! CameraSuccess) {
+    final startResult = await client.startCloudStreaming(_wanQuality);
+    if (startResult is! CameraSuccess<int>) {
+      if (_disposed) return false;
       errorMessage = 'Could not reach this camera remotely';
       return false;
     }
+    // Captured and stored *before* the `_disposed` check below, even
+    // though nothing else has run yet — `startCloudStreaming` already
+    // succeeded by this point, meaning a real, billable camera-side lease
+    // now exists whether or not this controller is still around to use it.
+    // Checking `_disposed` first (the old order) could skip storing the
+    // token entirely on a `dispose()` that raced this call, leaking the
+    // lease with no record of it anywhere — worse than the bug described
+    // below, since there'd be no token left to even send a Stop for.
     // Independent of status/transport from here — STREAMING_GUIDE.md §3
     // "Ending the session" requires Stop to be sent even if the rest of
     // this sequence never completes.
     _wanStreamStarted = true;
+    final leaseToken = startResult.value;
+    _wanLeaseToken = leaseToken;
+    if (_disposed) return _stopWanIfNeeded().then((_) => false);
+
+    // Real bug fix, 2026-09-15: every return-false path below this point
+    // used to abandon the lease just acquired above instead of releasing
+    // it — `_wanStreamStarted`/`_wanLeaseToken` stayed set, so a later
+    // retry's `startCloudStreaming` silently overwrote `_wanLeaseToken`
+    // with a new lease, permanently losing the reference to this one. That
+    // orphaned lease was never stopped by this app again — only the
+    // camera's own 30s idle-lease timeout would eventually release it.
+    // `_stopWanIfNeeded` is idempotent/safe to call here (every timer/
+    // controller it tears down is still null at this point) and does the
+    // one thing that actually matters: send the Stop for `leaseToken`
+    // before this method's own state moves on.
+    Future<bool> failWan(String reason) async {
+      errorMessage = reason;
+      await _stopWanIfNeeded();
+      return false;
+    }
+
+    Future<bool> abortWanForDispose() async {
+      await _stopWanIfNeeded();
+      return false;
+    }
 
     // Step 2 — `idle` is a normal transient state right after Start while
     // the substream spins up; retry before treating it as a real problem.
@@ -989,48 +1346,44 @@ class LiveViewController extends ChangeNotifier {
     // covers the longer spin-up window a fresh Start can still need.)
     var active = false;
     for (var attempt = 0; attempt < 5 && !_disposed; attempt++) {
-      final statusResult = await _getCloudStreamingStatus(client);
+      final statusResult = await _getCloudStreamingStatus(client, leaseToken);
       if (statusResult case CameraSuccess(:final value)) {
         if (value == StreamStatus.active) {
           active = true;
           break;
         }
         if (value == StreamStatus.notCompiled) {
-          errorMessage = 'This camera does not support remote viewing';
-          return false;
+          return failWan('This camera does not support remote viewing');
         }
       }
       if (attempt < 4) await Future.delayed(const Duration(seconds: 2));
     }
-    if (_disposed) return false;
+    if (_disposed) return abortWanForDispose();
     if (!active) {
-      errorMessage = 'Camera is not streaming to the cloud right now';
-      return false;
+      return failWan('Camera is not streaming to the cloud right now');
     }
 
     // Step 3 — resolve a playable URL, retrying a few times since the
     // substream can still be spinning up for a few seconds after `active`.
     Uri? playbackUri;
     for (var attempt = 0; attempt < 3 && !_disposed; attempt++) {
-      final uriResult = await client.resolvePlaybackUri();
+      final uriResult = await client.resolvePlaybackUri(_wanQuality);
       if (uriResult case CameraSuccess(:final value)) {
         playbackUri = value;
         break;
       }
       if (attempt < 2) await Future.delayed(const Duration(seconds: 2));
     }
-    if (_disposed) return false;
+    if (_disposed) return abortWanForDispose();
     if (playbackUri == null) {
-      errorMessage = 'Could not start remote playback';
-      return false;
+      return failWan('Could not start remote playback');
     }
 
     // Step 4 — play the resolved HLS URL.
     if (!await _playWanUrl(playbackUri)) {
-      errorMessage = 'Could not play the remote stream';
-      return false;
+      return failWan('Could not play the remote stream');
     }
-    if (_disposed) return false;
+    if (_disposed) return abortWanForDispose();
 
     transport = LiveViewTransport.wan;
     status = LiveViewStatus.connected;
@@ -1038,7 +1391,24 @@ class LiveViewController extends ChangeNotifier {
     notifyListeners();
     _startWanHealthMonitor();
     _startWanStallMonitor();
+    _startCloudStreamStoppedWatch();
     return true;
+  }
+
+  void _startCloudStreamStoppedWatch() {
+    _cloudStreamStoppedSub?.cancel();
+    final thingName = connection.thingName;
+    if (thingName == null) return;
+    _cloudStreamStoppedSub = CameraAlertsHub.instance.events.listen((event) {
+      if (event.thingName != thingName || event.event != 'CloudStreamStopped') {
+        return;
+      }
+      debugPrint(
+        '[LiveView] CloudStreamStopped alert for $thingName — reconnecting immediately',
+      );
+      if (_disposed || transport != LiveViewTransport.wan) return;
+      unawaited(_reconnect());
+    });
   }
 
   /// Initializes and starts playback of [uri] on [wanVideoController],
@@ -1097,6 +1467,13 @@ class LiveViewController extends ChangeNotifier {
   /// reporting `active`, since the camera side really is fine. Detects that
   /// case directly from the player's own state (an error, or playback
   /// position not advancing) rather than waiting for the next health tick.
+  ///
+  /// Doubles as the WAN "Auto" quality signal (2026-09-15) — with no
+  /// bitrate telemetry available over HLS (STREAMING_GUIDE.md §8), a
+  /// sustained stall is this app's only real proxy for "this tier is too
+  /// heavy for the current connection." When [_wanAutoEnabled], a sustained
+  /// stall steps [_wanQuality] down a tier instead of just retrying the same
+  /// one, and a sustained stall-free run steps it back up.
   Future<void> _pollWanStall() async {
     if (_disposed ||
         transport != LiveViewTransport.wan ||
@@ -1112,9 +1489,33 @@ class LiveViewController extends ChangeNotifier {
         (value.isPlaying && value.position == _lastWanPosition);
     _lastWanPosition = value.position;
 
-    _wanStallPollCount = stalled ? _wanStallPollCount + 1 : 0;
+    if (!stalled) {
+      _wanStallPollCount = 0;
+      if (_wanAutoEnabled) {
+        final higher = _nextHigherWanQuality();
+        if (higher == null) {
+          _wanHealthyPollCount = 0;
+        } else {
+          _wanHealthyPollCount++;
+          if (_wanHealthyPollCount >= _wanHealthyPollThreshold) {
+            _wanHealthyPollCount = 0;
+            await _switchWanQuality(higher, automatic: true);
+          }
+        }
+      }
+      return;
+    }
+
+    _wanStallPollCount++;
     if (_wanStallPollCount < _wanStallThreshold) return;
     _wanStallPollCount = 0;
+    if (_wanAutoEnabled) {
+      final lower = _nextLowerWanQuality();
+      if (lower != null) {
+        await _switchWanQuality(lower, automatic: true);
+        return;
+      }
+    }
     await _recoverWanStallLocalFirst();
   }
 
@@ -1160,21 +1561,23 @@ class LiveViewController extends ChangeNotifier {
       final nuraeye = NuraeyeClient(connection);
       final bool reachableOnLan;
       try {
-        reachableOnLan = await WebRtcUriClient(nuraeye).checkReachable();
+        reachableOnLan = await LiveStreamUriClient(nuraeye).checkReachable();
       } finally {
         nuraeye.close();
       }
       if (_disposed || transport != LiveViewTransport.wan) return;
       if (reachableOnLan) {
-        unawaited(_reconnect());
+        unawaited(_reconnect(preferLan: true));
         return;
       }
     }
 
     final thingName = connection.thingName;
-    if (thingName == null) return;
+    final leaseToken = _wanLeaseToken;
+    if (thingName == null || leaseToken == null) return;
     final result = await _getCloudStreamingStatus(
       AwsWanLiveViewClient(thingName),
+      leaseToken,
     );
     if (_disposed || transport != LiveViewTransport.wan) return;
     switch (result) {
@@ -1184,11 +1587,20 @@ class LiveViewController extends ChangeNotifier {
         await _stopWanIfNeeded();
         _fail('This camera no longer supports remote viewing');
       case CameraSuccess():
-        // idle/degraded — the camera-side producer likely restarted (a
-        // mic on/off toggle is one real trigger, §6). Re-resolve a fresh
-        // playback URL rather than assuming the already-issued one still
-        // works — §5's known gap is trusting a stale URL indefinitely.
-        unawaited(_recoverWanPlayback());
+        // idle/degraded — real integration gap found and fixed 2026-09-15:
+        // `FR-CF-154` changed what this means. The camera no longer
+        // self-restarts its KVS producer on a mic-toggle/resolution-change
+        // trigger (§6) — it just stops the stream outright, and won't bring
+        // it back without a fresh `startCloudStreaming` (Step 1). Calling
+        // `_recoverWanPlayback` here (a same-URL `resolvePlaybackUri` retry,
+        // no new Start) would now reliably fail its own 3-attempt budget
+        // every single time before falling through to `_reconnect` anyway
+        // — wasting ~6s. Go straight to a full reconnect instead, per
+        // STREAMING_GUIDE.md §5's explicit recommendation. (`_recoverWanPlayback`
+        // itself stays correct for the *other* caller, [_recoverWanStallLocalFirst]
+        // — a purely client-side player stall where the camera's own KVS
+        // session is presumed still alive, a genuinely different case.)
+        unawaited(_reconnect());
       case CameraFailure():
       case CameraTimeout():
         // Transient relay hiccup — leave the current session alone and
@@ -1211,7 +1623,7 @@ class LiveViewController extends ChangeNotifier {
 
     Uri? playbackUri;
     for (var attempt = 0; attempt < 3 && !_disposed; attempt++) {
-      final result = await client.resolvePlaybackUri();
+      final result = await client.resolvePlaybackUri(_wanQuality);
       if (result case CameraSuccess(:final value)) {
         playbackUri = value;
         break;
@@ -1232,13 +1644,27 @@ class LiveViewController extends ChangeNotifier {
   /// **Sends Stop even if [_wanStreamStarted] is the only surviving fact**
   /// (status/transport may have already moved on) — see STREAMING_GUIDE.md
   /// §3's "Ending the session", and [_wanStreamStarted]'s own doc comment.
-  /// Prefers the LAN stop call when the camera is reachable right now, to
-  /// avoid an unnecessary AWS/Lambda round trip.
-  Future<void> _stopWanIfNeeded() async {
+  ///
+  /// [preferLan] — STREAMING_GUIDE.md §3 says to prefer the LAN stop call
+  /// only "if you've just confirmed the camera is reachable on LAN", not
+  /// unconditionally. **Real latency bug found 2026-09-15**: this method
+  /// used to always attempt the LAN call first regardless of context, paying
+  /// its full 3s timeout on every single teardown where LAN is predictably
+  /// unreachable (a plain `stop()`/`dispose()` while genuinely WAN-only, or
+  /// — the case that surfaced this — [setWanQuality] switching tiers, which
+  /// stalled a full 3s before even starting the new tier's connect
+  /// sequence). Now skipped by default; the one caller that's actually just
+  /// confirmed reachability ([_checkWanHealth]'s LAN precheck, via
+  /// [_reconnect]) opts in explicitly instead.
+  Future<void> _stopWanIfNeeded({bool preferLan = false}) async {
     if (!_wanStreamStarted) return;
     _wanStreamStarted = false;
+    final leaseToken = _wanLeaseToken;
+    _wanLeaseToken = null;
     _wanHealthTimer?.cancel();
     _wanHealthTimer = null;
+    unawaited(_cloudStreamStoppedSub?.cancel());
+    _cloudStreamStoppedSub = null;
     _stopWanStallMonitor();
     _lastWanPlaybackUri = null;
     final controller = wanVideoController;
@@ -1252,20 +1678,22 @@ class LiveViewController extends ChangeNotifier {
       unawaited(controller.dispose());
     }
 
-    final nuraeye = NuraeyeClient(connection);
-    try {
-      final lanResult = await CloudStreamingLanClient(
-        nuraeye,
-      ).stopCloudStreaming(timeout: const Duration(seconds: 3));
-      if (lanResult is CameraSuccess) return;
-    } finally {
-      nuraeye.close();
+    if (preferLan) {
+      final nuraeye = NuraeyeClient(connection);
+      try {
+        final lanResult = await CloudStreamingLanClient(
+          nuraeye,
+        ).stopCloudStreaming(timeout: const Duration(seconds: 3));
+        if (lanResult is CameraSuccess) return;
+      } finally {
+        nuraeye.close();
+      }
     }
 
     final thingName = connection.thingName;
-    if (thingName == null) return;
+    if (thingName == null || leaseToken == null) return;
     try {
-      await AwsWanLiveViewClient(thingName).stopCloudStreaming();
+      await AwsWanLiveViewClient(thingName).stopCloudStreaming(leaseToken);
     } catch (_) {
       // Best-effort — nothing more to do if the camera/relay is
       // unreachable at teardown time.
@@ -1302,81 +1730,92 @@ class LiveViewController extends ChangeNotifier {
     }
   }
 
-  final _recorder = MediaRecorder();
-  bool _isRecording = false;
-
-  /// Starts native recording of the remote video (+ rendered/`OUTPUT`
-  /// audio) track straight to [path], returning whether it actually
-  /// started (false if there's no remote track yet). **Known limitation,
-  /// not yet hardware-verified**: if the connection drops and
-  /// auto-reconnects (a fresh `RTCPeerConnection`, see [_reconnect]) while a
-  /// recording is in flight, the recorder still references the old
-  /// connection's track — [stopRecording] may then fail or produce a
-  /// truncated file. No mid-recording-reconnect recovery is implemented.
-  Future<bool> startRecording(String path) async {
-    final track = _remoteVideoTrack;
-    if (track == null) return false;
-    try {
-      await _recorder.start(
-        path,
-        videoTrack: track,
-        audioChannel: RecorderAudioChannel.OUTPUT,
-      );
-      _isRecording = true;
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<void> stopRecording() async {
-    if (!_isRecording) return;
-    _isRecording = false;
-    try {
-      await _recorder.stop();
-    } catch (_) {
-      // Best-effort — nothing more to do if the underlying track/connection
-      // is already gone.
-    }
-  }
-
-  /// Starts a two-way-talk session. Requires [status] to already be
-  /// [LiveViewStatus.connected] over LAN; no-op otherwise.
+  /// Starts a two-way-talk session over the camera's **dedicated** audio-only
+  /// RTSPS talk module (`RtspTalkSession`, `TWO_WAY_TALK_GUIDE.md`) — a
+  /// completely separate TLS connection from whatever live view is doing,
+  /// discovered fresh via `TalkUriClient.getTalkUri()` every call (talk has
+  /// no persistent URI to cache; §3 "no WAN leg" also means this is always
+  /// a live LAN call). Requires [transport] to already be
+  /// [LiveViewTransport.lan] as a proxy for "the phone is on this camera's
+  /// LAN" (talk is LAN-only, §1) — no longer requires an existing WebRTC
+  /// `_pc`, so talk now works during the RTSP-over-LAN live-view fallback
+  /// too, not just when the camera reports WebRTC for this profile.
   ///
-  /// **Does not renegotiate the existing connection in place** — explicitly
-  /// ends it (`POST /webrtc/stop`) and negotiates a completely fresh one
-  /// with `talk: true` baked into the very first offer, via [_negotiate].
-  /// See [_negotiate]'s doc comment for why: this camera's firmware tears
-  /// down and rebuilds its side on every accepted offer regardless, so a
-  /// second in-place offer over the phone's already-connected pc leaves the
-  /// two sides' ICE state out of sync — it was found to reconnect at the
-  /// SDP level but then die a few seconds later, every single time.
+  /// **Replaces the old same-`RTCPeerConnection`-renegotiation mechanism**
+  /// (2026-09-15) — see [_negotiate]'s doc comment for why that had to
+  /// change: the camera's firmware removed the `{"talk": true}` flag on
+  /// `POST /webrtc` entirely on 2026-09-11.
   Future<void> startTalk() async {
-    if (_disposed ||
-        status != LiveViewStatus.connected ||
-        transport != LiveViewTransport.lan ||
-        _pc == null ||
-        _signalingUrl == null) {
-      return;
-    }
+    if (_disposed || transport != LiveViewTransport.lan) return;
 
     talkStatus = TalkStatus.connecting;
     talkErrorMessage = null;
     notifyListeners();
 
-    final signalingUrl = _signalingUrl!;
-    await _postStop(signalingUrl);
-    await _teardownPeerConnection();
+    final nuraeye = NuraeyeClient(connection);
+    final uriResult = await TalkUriClient(nuraeye).getTalkUri();
+    nuraeye.close();
     if (_disposed) return;
 
-    final succeeded = await _negotiate(signalingUrl, talk: true);
-    // Whatever the outcome, the old connection is already gone (stopped
-    // above) — on failure, [_negotiate] has already set talkStatus to
-    // busy/error, but live view itself is now dead too unless a fresh
-    // plain reconnect is kicked off.
-    if (!succeeded && !_disposed) {
-      unawaited(connect());
+    final TalkTarget target;
+    switch (uriResult) {
+      case CameraSuccess(:final value):
+        target = value;
+      case CameraFailure(:final reason):
+        _failTalk(reason);
+        return;
+      case CameraTimeout():
+        _failTalk('Timed out');
+        return;
     }
+
+    final session = RtspTalkSession(
+      target.mediaUri,
+      connection.username,
+      connection.password,
+    );
+    final connectResult = await session.connect();
+    if (_disposed) {
+      await session.close();
+      return;
+    }
+    switch (connectResult) {
+      case TalkConnectResult.connected:
+        _talkSession = session;
+        _talkEndedSub = session.onEnded.listen(
+          (_) => unawaited(_handleTalkSessionEnded()),
+        );
+        talkStatus = TalkStatus.talking;
+        talkErrorMessage = null;
+        await Helper.setSpeakerphoneOn(speakerphoneOn);
+        notifyListeners();
+      case TalkConnectResult.busy:
+        talkStatus = TalkStatus.busy;
+        notifyListeners();
+      case TalkConnectResult.micPermissionDenied:
+        _failTalk('Microphone permission denied');
+      case TalkConnectResult.error:
+        _failTalk('Could not start talk session');
+    }
+  }
+
+  /// The talk session dropped on its own (network blip, camera-side
+  /// eviction) — distinct from [endTalk], which the user triggers. Live
+  /// view itself is untouched (talk no longer shares its connection).
+  Future<void> _handleTalkSessionEnded() async {
+    if (_disposed || talkStatus != TalkStatus.talking) return;
+    await _releaseTalkSession();
+    talkStatus = TalkStatus.error;
+    talkErrorMessage = 'Talk ended: connection was interrupted';
+    notifyListeners();
+  }
+
+  Future<void> _releaseTalkSession() async {
+    await _talkEndedSub?.cancel();
+    _talkEndedSub = null;
+    final session = _talkSession;
+    _talkSession = null;
+    if (session != null) await session.close();
   }
 
   void _failTalk(String reason) {
@@ -1386,7 +1825,7 @@ class LiveViewController extends ChangeNotifier {
   }
 
   /// Route-to-loudspeaker toggle, live during an active talk session —
-  /// TWO_WAY_TALK_GUIDE.md §5.2. Distinct from [setAudioEnabled], which
+  /// TWO_WAY_TALK_GUIDE.md §6.2. Distinct from [setAudioEnabled], which
   /// mutes plain live-view playback, not an active call.
   Future<void> setSpeakerphoneOn(bool enabled) async {
     speakerphoneOn = enabled;
@@ -1394,30 +1833,17 @@ class LiveViewController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _releaseLocalAudio() async {
-    final stream = _localAudioStream;
-    _localAudioStream = null;
-    if (stream == null) return;
-    for (final track in stream.getTracks()) {
-      await track.stop();
-    }
-  }
-
-  /// Ends the talk session. **Per TWO_WAY_TALK_GUIDE.md §3, `POST
-  /// /webrtc/stop` tears down the entire connection, not just the talk
-  /// leg** — so if talk actually reached [TalkStatus.talking], this ends
-  /// live view too; callers should [connect] again afterward if they want
-  /// live view to keep playing. Closing out of a [TalkStatus.busy] or
-  /// [TalkStatus.error] state (talk was never actually granted) only
-  /// resets local state — the live-view connection was never touched.
+  /// Ends the talk session — [RtspTalkSession.close] (sends `TEARDOWN`,
+  /// stops the mic/recorder and the return-audio player). **Live view is
+  /// untouched** (2026-09-15) — talk runs on its own dedicated connection
+  /// now, so ending a call no longer means reconnecting live view
+  /// afterward the way the old shared-`RTCPeerConnection` mechanism did.
   Future<void> endTalk() async {
     if (talkStatus == TalkStatus.idle) return;
-    final wasTalking = talkStatus == TalkStatus.talking;
-    await _releaseLocalAudio();
+    await _releaseTalkSession();
     talkStatus = TalkStatus.idle;
     talkErrorMessage = null;
     if (!_disposed) notifyListeners();
-    if (wasTalking) await stop();
   }
 
   /// Ends the session — best-effort `POST /webrtc/stop`, sent even if the
@@ -1429,13 +1855,13 @@ class LiveViewController extends ChangeNotifier {
     _disconnectGraceTimer = null;
     _autoRetryTimer?.cancel();
     _autoRetryTimer = null;
-    await stopRecording();
-    await _releaseLocalAudio();
+    await _releaseTalkSession();
     talkStatus = TalkStatus.idle;
     await _teardownPeerConnection();
     final signalingUrl = _signalingUrl;
     if (signalingUrl != null) await _postStop(signalingUrl);
     await _stopWanIfNeeded();
+    await _stopRtspIfNeeded();
     if (_disposed) return;
     status = LiveViewStatus.stopped;
     notifyListeners();
@@ -1463,9 +1889,12 @@ class LiveViewController extends ChangeNotifier {
     _wanHealthTimer?.cancel();
     _wanStallTimer?.cancel();
     _statsTimer?.cancel();
-    unawaited(_releaseLocalAudio());
+    _rtspHealthTimer?.cancel();
+    unawaited(_cloudStreamStoppedSub?.cancel());
+    unawaited(_releaseTalkSession());
     unawaited(_teardownPeerConnection());
     unawaited(_stopWanIfNeeded());
+    unawaited(_stopRtspIfNeeded());
     if (_rendererInitialized) unawaited(renderer.dispose());
     super.dispose();
   }

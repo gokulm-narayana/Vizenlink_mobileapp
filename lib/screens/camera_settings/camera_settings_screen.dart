@@ -10,7 +10,6 @@ import 'audio_screen.dart';
 import 'camera_info_screen.dart';
 import 'danger_zone_screen.dart';
 import 'detections_screen.dart';
-import 'recording_screen.dart';
 import 'storage_screen.dart';
 import 'video_display_screen.dart';
 
@@ -88,20 +87,9 @@ class CameraSettingsScreen extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _SettingsMenuTile(
-              settingsKey: const Key('CAMSET-008'),
-              icon: Icons.fiber_manual_record_outlined,
-              label: 'Recording',
-              enabled: isOnline,
-              onTap: () => context.push(
-                '${GoRouterState.of(context).matchedLocation}/${RecordingScreen.routeName}',
-                extra: camera,
-              ),
-            ),
-            const SizedBox(height: 12),
-            _SettingsMenuTile(
               settingsKey: const Key('CAMSET-009'),
               icon: Icons.sd_storage_outlined,
-              label: 'Storage',
+              label: 'Storage & Recordings',
               enabled: isOnline,
               onTap: () => context.push(
                 '${GoRouterState.of(context).matchedLocation}/${StorageScreen.routeName}',

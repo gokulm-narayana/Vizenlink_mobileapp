@@ -89,8 +89,148 @@ enum CameraEncoderProfile { baseline, main, high }
 /// Video Encoder screen — constant vs. variable bitrate.
 enum CameraBitrateMode { cbr, vbr }
 
+/// Video Encoder screen — which of the camera's independently-configurable
+/// encoder streams a `VideoStreamEncoderScreen` instance is editing.
+/// [highRes] (Stream 0, ONVIF `VideoEncoderCfg_1`) is the only one with a
+/// firmware API today; [medium] and [low] are staged locally until the
+/// senior engineer sends a client for the extra stream(s) — see
+/// `docs/screens/camera_settings/video_display/video_encoder_screen.md`.
+enum VideoStream { highRes, medium, low }
+
+/// Camera Live screen — the viewer's requested live-stream quality
+/// (LIVE-058's chip/LIVE-059's sheet), auto vs manual. [auto] both picks a
+/// displayed effective level from the live-measured bitrate
+/// (`LiveViewController.measuredBitrateKbps`) and (2026-09-15) enables real
+/// automatic step-down/step-up via `LiveViewController.setAutoQualityLadder`.
+/// On LAN, [high]/[medium]/[low] no longer carry their literal meaning for a
+/// manual pick — the real chosen profile lives on
+/// [Camera.preferredLanProfileToken] instead, since a camera's real profile
+/// count/resolutions can't be assumed to be exactly this 3-way split (see
+/// that field's doc). These three values are still used as-is for WAN's
+/// separate, session-only quality selection (`LiveViewController.wanQuality`
+/// / `StreamQuality`), where the tiers really are fixed, named KVS streams.
+enum CameraStreamQuality { auto, high, medium, low }
+
 /// Line Crossing screen — which direction(s) count as a crossing.
 enum CameraCrossingDirection { both, aToB, bToA }
+
+/// One encoder stream's full settings — the field set
+/// `VideoStreamEncoderScreen` edits. A value type with real `==`/`hashCode`
+/// (per `.claude/rules/mobile-app-screen-conventions.md`'s pending/applied
+/// equality rule). [Camera]'s own top-level `videoResolution`/`encoderType`/
+/// … fields hold the [VideoStream.highRes] stream's values (unchanged, so
+/// the retention estimate and bitrate badges keep reading them directly);
+/// [Camera.mediumStreamEncoder]/[Camera.lowStreamEncoder] hold the other
+/// two. Use [Camera.encoderConfigFor]/[Camera.copyWithEncoderConfig] rather
+/// than touching either representation directly.
+class StreamEncoderConfig {
+  const StreamEncoderConfig({
+    required this.resolution,
+    required this.encoderType,
+    required this.encoderProfile,
+    required this.frameRate,
+    required this.govLength,
+    required this.quality,
+    required this.bitrateMode,
+    required this.bitrateKbps,
+  });
+
+  final CameraResolution resolution;
+  final CameraEncoderType encoderType;
+  final CameraEncoderProfile encoderProfile;
+  final double frameRate;
+  final double govLength;
+  final double quality;
+  final CameraBitrateMode bitrateMode;
+  final double bitrateKbps;
+
+  static const highResDefaults = StreamEncoderConfig(
+    resolution: CameraResolution.p1080,
+    encoderType: CameraEncoderType.h265,
+    encoderProfile: CameraEncoderProfile.main,
+    frameRate: 15,
+    govLength: 30,
+    quality: 3,
+    bitrateMode: CameraBitrateMode.cbr,
+    bitrateKbps: 4096,
+  );
+
+  static const mediumDefaults = StreamEncoderConfig(
+    resolution: CameraResolution.p720,
+    encoderType: CameraEncoderType.h264,
+    encoderProfile: CameraEncoderProfile.main,
+    frameRate: 15,
+    govLength: 30,
+    quality: 3,
+    bitrateMode: CameraBitrateMode.cbr,
+    bitrateKbps: 1536,
+  );
+
+  static const lowDefaults = StreamEncoderConfig(
+    resolution: CameraResolution.p480,
+    encoderType: CameraEncoderType.h264,
+    encoderProfile: CameraEncoderProfile.baseline,
+    frameRate: 15,
+    govLength: 30,
+    quality: 3,
+    bitrateMode: CameraBitrateMode.cbr,
+    bitrateKbps: 512,
+  );
+
+  /// This stream's hardcoded default preset — Reset (SENC-004) restores to
+  /// this, and it's the constructor default for [Camera.mediumStreamEncoder]/
+  /// [Camera.lowStreamEncoder].
+  static StreamEncoderConfig defaultsFor(VideoStream stream) =>
+      switch (stream) {
+        VideoStream.highRes => highResDefaults,
+        VideoStream.medium => mediumDefaults,
+        VideoStream.low => lowDefaults,
+      };
+
+  StreamEncoderConfig copyWith({
+    CameraResolution? resolution,
+    CameraEncoderType? encoderType,
+    CameraEncoderProfile? encoderProfile,
+    double? frameRate,
+    double? govLength,
+    double? quality,
+    CameraBitrateMode? bitrateMode,
+    double? bitrateKbps,
+  }) => StreamEncoderConfig(
+    resolution: resolution ?? this.resolution,
+    encoderType: encoderType ?? this.encoderType,
+    encoderProfile: encoderProfile ?? this.encoderProfile,
+    frameRate: frameRate ?? this.frameRate,
+    govLength: govLength ?? this.govLength,
+    quality: quality ?? this.quality,
+    bitrateMode: bitrateMode ?? this.bitrateMode,
+    bitrateKbps: bitrateKbps ?? this.bitrateKbps,
+  );
+
+  @override
+  bool operator ==(Object other) =>
+      other is StreamEncoderConfig &&
+      other.resolution == resolution &&
+      other.encoderType == encoderType &&
+      other.encoderProfile == encoderProfile &&
+      other.frameRate == frameRate &&
+      other.govLength == govLength &&
+      other.quality == quality &&
+      other.bitrateMode == bitrateMode &&
+      other.bitrateKbps == bitrateKbps;
+
+  @override
+  int get hashCode => Object.hash(
+    resolution,
+    encoderType,
+    encoderProfile,
+    frameRate,
+    govLength,
+    quality,
+    bitrateMode,
+    bitrateKbps,
+  );
+}
 
 class Camera {
   const Camera({
@@ -103,6 +243,7 @@ class Camera {
     this.thumbnailUrl,
     this.lastSeen,
     this.timezone = 'UTC',
+    this.location,
     this.recordingStatus = RecordingStatus.off,
     this.recordingScheduleWindows = const [],
     this.wifiNetwork = '—',
@@ -120,6 +261,8 @@ class Camera {
     this.signalStrengthOsdEnabled = false,
     this.signalStrengthOsdPosition = OsdCorner.topRight,
     this.liveTagOsdEnabled = true,
+    this.streamQuality = CameraStreamQuality.auto,
+    this.preferredLanProfileToken,
     this.videoMode = CameraVideoMode.auto,
     this.nightMode = CameraNightMode.smart,
     this.nightVisionColorCapable,
@@ -146,6 +289,8 @@ class Camera {
     this.encoderQuality = 3,
     this.bitrateMode = CameraBitrateMode.cbr,
     this.bitrateKbps = 2048,
+    this.mediumStreamEncoder = StreamEncoderConfig.mediumDefaults,
+    this.lowStreamEncoder = StreamEncoderConfig.lowDefaults,
     this.motionDetectionEnabled = false,
     this.motionSensitivity = 50,
     this.intrusionDetectionEnabled = false,
@@ -159,8 +304,14 @@ class Camera {
     this.personDetectionEnabled = false,
     this.personDetectionConfidence = 50,
     this.personDetectionZones = const [],
+    this.loiteringDurationSeconds,
+    this.bboxOverlayEnabled,
     this.vehicleDetectionEnabled = false,
     this.vehicleDetectionConfidence = 50,
+    this.parkingMonitoringEnabled = false,
+    this.parkingZones = const [],
+    this.parkingRestrictedDwellSeconds = 30,
+    this.parkingWrongBayDwellSeconds = 60,
     this.speakerVolume = 50,
     this.micGain = 50,
     this.audioRecordingEnabled = false,
@@ -182,6 +333,10 @@ class Camera {
     this.sirenCapable,
     this.spotlightCapable,
     this.warningCapable,
+    this.rebootCount,
+    this.lastRebootUtc,
+    this.uptimeSeconds,
+    this.clockSyncUncertain,
   });
 
   final String id;
@@ -209,6 +364,14 @@ class Camera {
   /// CLAUDE.md) — they are not hardcoded on the display screen itself, so
   /// swapping in a real device query later only touches the data source.
   final String timezone;
+
+  /// The camera's own ONVIF `Scopes`-reported location string
+  /// (`OnvifDeviceClient`/`WanDeviceIdentityClient.setDeviceLocation`) —
+  /// `null` until synced or set. Distinct from [room]/the Home/Room
+  /// organizational hierarchy shown in this app's own "Location" section on
+  /// `CameraInfoScreen` (labeled "Camera-reported location" there to avoid
+  /// the name collision).
+  final String? location;
   final RecordingStatus recordingStatus;
 
   /// Only meaningful while [recordingStatus] is [RecordingStatus.scheduled].
@@ -240,10 +403,28 @@ class Camera {
   final OsdCorner signalStrengthOsdPosition;
   final bool liveTagOsdEnabled;
 
+  /// User's preferred live-stream quality (LIVE-058/059) — [auto] vs
+  /// manual. When manual, the actual requested profile is
+  /// [preferredLanProfileToken], not derived from this enum's value (see
+  /// that field's own doc for why).
+  final CameraStreamQuality streamQuality;
+
+  /// The real ONVIF profile token (e.g. `"Profile_1"`) requested when
+  /// [streamQuality] is a manual (non-[CameraStreamQuality.auto]) pick.
+  /// Added 2026-09-15: replaces the old approach of bucketing the camera's
+  /// real profiles into exactly High/Medium/Low by sorted index, which
+  /// `MediaProfile`'s own doc comment (`onvif_video_encoder_client.dart`)
+  /// explicitly warns never to do ("never hardcode 3 streams... always read
+  /// this list and its length") — a camera with only 2 profiles silently
+  /// collapsed Medium and Low onto the same token under the old scheme.
+  /// `null` means "no manual pick recorded yet" (falls back to whatever
+  /// [LiveViewController] is currently using) — this stays `null` while
+  /// [streamQuality] is [CameraStreamQuality.auto].
+  final String? preferredLanProfileToken;
+
   /// The following settings are persisted here so that once a real
   /// CCTV protocol/stream is wired up (see CLAUDE.md), applying them is
   /// just a matter of reading these fields — no further plumbing needed.
-  /// They currently have no visible effect on the dummy preview video.
   final CameraVideoMode videoMode;
   final CameraNightMode nightMode;
 
@@ -272,6 +453,13 @@ class Camera {
   /// (microseconds / dB), not independently re-derived here.
   final double exposureTime;
   final double exposureGain;
+
+  /// These eight fields are the [VideoStream.highRes] stream's encoder
+  /// settings (ONVIF `VideoEncoderCfg_1`) — kept as top-level fields, not
+  /// folded into a [StreamEncoderConfig], so the retention estimate and the
+  /// bitrate badges keep reading `bitrateKbps`/etc. directly. The other two
+  /// streams live in [mediumStreamEncoder]/[lowStreamEncoder]. Read/write
+  /// any stream uniformly via [encoderConfigFor]/[copyWithEncoderConfig].
   final CameraResolution videoResolution;
   final CameraEncoderType encoderType;
   final CameraEncoderProfile encoderProfile;
@@ -280,6 +468,14 @@ class Camera {
   final double encoderQuality;
   final CameraBitrateMode bitrateMode;
   final double bitrateKbps;
+
+  /// Medium/Low encoder streams — no firmware API yet (see
+  /// `docs/screens/camera_settings/video_display/video_encoder_screen.md`),
+  /// so these are local-only staged state that `VideoStreamEncoderScreen`
+  /// edits and `simulateCameraSave` persists.
+  final StreamEncoderConfig mediumStreamEncoder;
+  final StreamEncoderConfig lowStreamEncoder;
+
   final bool motionDetectionEnabled;
   final double motionSensitivity;
   final bool intrusionDetectionEnabled;
@@ -293,8 +489,39 @@ class Camera {
   final bool personDetectionEnabled;
   final double personDetectionConfidence;
   final List<PolygonZone> personDetectionZones;
+
+  /// Dwell threshold (whole seconds) before a `Loitering` event fires —
+  /// `LoiteringDurationClient`/`WanLoiteringDurationClient`, independent of
+  /// whether [personDetectionEnabled] itself is on. Null means "not yet
+  /// synced from the camera", same convention as [nightVisionColorCapable].
+  final int? loiteringDurationSeconds;
+
+  /// Whether the camera draws its AI detection bounding-box overlay
+  /// (OSD burn-in) on the video — `BboxOverlayClient`/`WanBboxOverlayClient`.
+  /// Null means "not yet synced".
+  final bool? bboxOverlayEnabled;
   final bool vehicleDetectionEnabled;
   final double vehicleDetectionConfidence;
+
+  /// Zone-based parking occupancy monitoring — distinct from
+  /// [vehicleDetectionEnabled]'s plain "did a vehicle appear" toggle. Master
+  /// enable; zones can still be configured while this is off. Entirely
+  /// local-only for now — no `camera_api` capability exists yet for
+  /// per-zone vehicle occupancy classification.
+  final bool parkingMonitoringEnabled;
+  final List<ParkingZone> parkingZones;
+
+  /// Seconds a vehicle must remain inside a [ParkingZoneType.restricted]
+  /// zone before a violation fires — avoids flagging a car briefly cutting
+  /// across the area. Local-only value; no camera-sourced bounds exist yet.
+  final int parkingRestrictedDwellSeconds;
+
+  /// Seconds a vehicle must remain overlapping a neighboring
+  /// [ParkingZoneType.slot]'s line before it's flagged as "wrong bay" —
+  /// deliberately a separate, usually-shorter-tolerance threshold from
+  /// [parkingRestrictedDwellSeconds] since straddling a line briefly while
+  /// parking isn't itself a violation.
+  final int parkingWrongBayDwellSeconds;
   final double speakerVolume;
   final double micGain;
 
@@ -370,8 +597,38 @@ class Camera {
   /// LAN first and paying its full timeout before falling back to WAN.
   final bool? lastKnownWan;
 
+  /// The following four fields are `GetDeviceHealth`'s real telemetry
+  /// (`HealthClient`/`WanHealthClient`, `packages/camera_api`), synced by
+  /// `syncCameraFromDevice` — added 2026-09-08, closing the `ui-api-gap-audit`
+  /// "Health section is real client code, not wired" finding: this section
+  /// previously only ever showed storage-derived conditions
+  /// ([healthConditionMessages]), never anything from the camera's actual
+  /// `GetDeviceHealth` response. Null means "not yet synced" for all four,
+  /// same null-means-unknown convention this model already uses elsewhere.
+  final int? rebootCount;
+
+  /// UTC epoch seconds of the camera's last reboot.
+  final int? lastRebootUtc;
+  final int? uptimeSeconds;
+
+  /// True only when the camera itself reports its clock as unsynced
+  /// (`HealthStatus.clockSyncState == ClockSyncState.uncertain`) — a real
+  /// health condition (timestamps on recordings/events become unreliable),
+  /// surfaced via [healthConditionMessages] same as a storage failure.
+  final bool? clockSyncUncertain;
+
   /// Builds a [CameraConnection] from this camera's saved credentials, or
   /// null if it doesn't have any yet (see [host]'s doc).
+  ///
+  /// **Real bug fix, 2026-09-15**: never threaded [wanCommandCapable] through
+  /// (only [wanLiveViewCapable] was) — every `connection.wanCommandCapable`
+  /// read (`camera_sync.dart`'s `syncCameraFromDevice`, `camera_info_screen
+  /// .dart`'s WAN-eligibility checks) always saw `null` regardless of what
+  /// `CapabilitiesClient.getCapabilities()` actually confirmed, silently
+  /// disabling their "skip WAN once we know this camera doesn't support it"
+  /// optimization — those calls just kept attempting (and failing/timing
+  /// out) a WAN command round trip forever on a camera that had already
+  /// reported it can't take one.
   CameraConnection? get connection {
     if (host == null || username == null || password == null) return null;
     return CameraConnection(
@@ -380,9 +637,48 @@ class Camera {
       password: password!,
       thingName: thingName,
       wanLiveViewCapable: wanLiveViewCapable,
+      wanCommandCapable: wanCommandCapable,
       macAddress: macAddress == '—' ? null : macAddress,
     );
   }
+
+  /// This camera's encoder settings for [stream] as a uniform
+  /// [StreamEncoderConfig], hiding that [VideoStream.highRes] is stored in
+  /// the top-level fields while the other two are stored as objects.
+  StreamEncoderConfig encoderConfigFor(VideoStream stream) => switch (stream) {
+    VideoStream.highRes => StreamEncoderConfig(
+      resolution: videoResolution,
+      encoderType: encoderType,
+      encoderProfile: encoderProfile,
+      frameRate: frameRate,
+      govLength: govLength,
+      quality: encoderQuality,
+      bitrateMode: bitrateMode,
+      bitrateKbps: bitrateKbps,
+    ),
+    VideoStream.medium => mediumStreamEncoder,
+    VideoStream.low => lowStreamEncoder,
+  };
+
+  /// A copy of this camera with [stream]'s encoder settings replaced by
+  /// [config] — the write-side counterpart to [encoderConfigFor].
+  Camera copyWithEncoderConfig(
+    VideoStream stream,
+    StreamEncoderConfig config,
+  ) => switch (stream) {
+    VideoStream.highRes => copyWith(
+      videoResolution: config.resolution,
+      encoderType: config.encoderType,
+      encoderProfile: config.encoderProfile,
+      frameRate: config.frameRate,
+      govLength: config.govLength,
+      encoderQuality: config.quality,
+      bitrateMode: config.bitrateMode,
+      bitrateKbps: config.bitrateKbps,
+    ),
+    VideoStream.medium => copyWith(mediumStreamEncoder: config),
+    VideoStream.low => copyWith(lowStreamEncoder: config),
+  };
 
   /// Free local storage in GB, derived from [sdCardCapacityGb] minus
   /// [sdCardUsedGb]. Zero (not negative) if the card is disabled/absent.
@@ -413,6 +709,13 @@ class Camera {
     if (sdCardPresent && sdCardHealthPercent < 50) {
       messages.add('SD card wearing out — consider replacing soon');
     }
+    // Real `GetDeviceHealth` condition (`HealthClient`/`WanHealthClient`) —
+    // an unsynced camera clock makes recording/event timestamps unreliable.
+    if (clockSyncUncertain == true) {
+      messages.add(
+        'Camera clock not synced — recording timestamps may be wrong',
+      );
+    }
     return messages;
   }
 
@@ -440,6 +743,7 @@ class Camera {
     String? thumbnailUrl,
     DateTime? lastSeen,
     String? timezone,
+    String? location,
     RecordingStatus? recordingStatus,
     List<RecordingScheduleWindow>? recordingScheduleWindows,
     String? wifiNetwork,
@@ -462,11 +766,17 @@ class Camera {
     bool? sirenCapable,
     bool? spotlightCapable,
     bool? warningCapable,
+    int? rebootCount,
+    int? lastRebootUtc,
+    int? uptimeSeconds,
+    bool? clockSyncUncertain,
     bool? bitrateOsdEnabled,
     OsdCorner? bitrateOsdPosition,
     bool? signalStrengthOsdEnabled,
     OsdCorner? signalStrengthOsdPosition,
     bool? liveTagOsdEnabled,
+    CameraStreamQuality? streamQuality,
+    String? preferredLanProfileToken,
     CameraVideoMode? videoMode,
     CameraNightMode? nightMode,
     bool? nightVisionColorCapable,
@@ -493,6 +803,8 @@ class Camera {
     double? encoderQuality,
     CameraBitrateMode? bitrateMode,
     double? bitrateKbps,
+    StreamEncoderConfig? mediumStreamEncoder,
+    StreamEncoderConfig? lowStreamEncoder,
     bool? motionDetectionEnabled,
     double? motionSensitivity,
     bool? intrusionDetectionEnabled,
@@ -506,8 +818,14 @@ class Camera {
     bool? personDetectionEnabled,
     double? personDetectionConfidence,
     List<PolygonZone>? personDetectionZones,
+    int? loiteringDurationSeconds,
+    bool? bboxOverlayEnabled,
     bool? vehicleDetectionEnabled,
     double? vehicleDetectionConfidence,
+    bool? parkingMonitoringEnabled,
+    List<ParkingZone>? parkingZones,
+    int? parkingRestrictedDwellSeconds,
+    int? parkingWrongBayDwellSeconds,
     double? speakerVolume,
     double? micGain,
     bool? audioRecordingEnabled,
@@ -530,6 +848,7 @@ class Camera {
       thumbnailUrl: thumbnailUrl ?? this.thumbnailUrl,
       lastSeen: lastSeen ?? this.lastSeen,
       timezone: timezone ?? this.timezone,
+      location: location ?? this.location,
       recordingStatus: recordingStatus ?? this.recordingStatus,
       recordingScheduleWindows:
           recordingScheduleWindows ?? this.recordingScheduleWindows,
@@ -553,6 +872,10 @@ class Camera {
       sirenCapable: sirenCapable ?? this.sirenCapable,
       spotlightCapable: spotlightCapable ?? this.spotlightCapable,
       warningCapable: warningCapable ?? this.warningCapable,
+      rebootCount: rebootCount ?? this.rebootCount,
+      lastRebootUtc: lastRebootUtc ?? this.lastRebootUtc,
+      uptimeSeconds: uptimeSeconds ?? this.uptimeSeconds,
+      clockSyncUncertain: clockSyncUncertain ?? this.clockSyncUncertain,
       bitrateOsdEnabled: bitrateOsdEnabled ?? this.bitrateOsdEnabled,
       bitrateOsdPosition: bitrateOsdPosition ?? this.bitrateOsdPosition,
       signalStrengthOsdEnabled:
@@ -560,6 +883,9 @@ class Camera {
       signalStrengthOsdPosition:
           signalStrengthOsdPosition ?? this.signalStrengthOsdPosition,
       liveTagOsdEnabled: liveTagOsdEnabled ?? this.liveTagOsdEnabled,
+      streamQuality: streamQuality ?? this.streamQuality,
+      preferredLanProfileToken:
+          preferredLanProfileToken ?? this.preferredLanProfileToken,
       videoMode: videoMode ?? this.videoMode,
       nightMode: nightMode ?? this.nightMode,
       nightVisionColorCapable:
@@ -588,6 +914,8 @@ class Camera {
       encoderQuality: encoderQuality ?? this.encoderQuality,
       bitrateMode: bitrateMode ?? this.bitrateMode,
       bitrateKbps: bitrateKbps ?? this.bitrateKbps,
+      mediumStreamEncoder: mediumStreamEncoder ?? this.mediumStreamEncoder,
+      lowStreamEncoder: lowStreamEncoder ?? this.lowStreamEncoder,
       motionDetectionEnabled:
           motionDetectionEnabled ?? this.motionDetectionEnabled,
       motionSensitivity: motionSensitivity ?? this.motionSensitivity,
@@ -607,10 +935,20 @@ class Camera {
       personDetectionConfidence:
           personDetectionConfidence ?? this.personDetectionConfidence,
       personDetectionZones: personDetectionZones ?? this.personDetectionZones,
+      loiteringDurationSeconds:
+          loiteringDurationSeconds ?? this.loiteringDurationSeconds,
+      bboxOverlayEnabled: bboxOverlayEnabled ?? this.bboxOverlayEnabled,
       vehicleDetectionEnabled:
           vehicleDetectionEnabled ?? this.vehicleDetectionEnabled,
       vehicleDetectionConfidence:
           vehicleDetectionConfidence ?? this.vehicleDetectionConfidence,
+      parkingMonitoringEnabled:
+          parkingMonitoringEnabled ?? this.parkingMonitoringEnabled,
+      parkingZones: parkingZones ?? this.parkingZones,
+      parkingRestrictedDwellSeconds:
+          parkingRestrictedDwellSeconds ?? this.parkingRestrictedDwellSeconds,
+      parkingWrongBayDwellSeconds:
+          parkingWrongBayDwellSeconds ?? this.parkingWrongBayDwellSeconds,
       speakerVolume: speakerVolume ?? this.speakerVolume,
       micGain: micGain ?? this.micGain,
       audioRecordingEnabled:

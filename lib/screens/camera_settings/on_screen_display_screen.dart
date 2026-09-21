@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
@@ -410,7 +411,11 @@ class _OnScreenDisplayScreenState extends State<OnScreenDisplayScreen> {
     final capabilitiesClient = Media2CapabilitiesClient(connection);
     final results = await Future.wait([
       client.getOsds(),
-      client.getOsdOptions(),
+      NetworkAnswerCache.getOrFetch(
+        connection.host,
+        'osdOptions',
+        fetch: client.getOsdOptions,
+      ),
       capabilitiesClient.getServiceCapabilities(),
     ]);
     client.close();

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Allows plain (cleartext) HTTP only to 127.0.0.1/localhost — needed for
+  RtspRemuxProxy (mobile_app/lib/features/recordings/rtsp/rtsp_remux_proxy.dart, FR-MOB-114): a
+  local loopback HTTP server this app runs itself, remuxing the camera's RTSPS playback stream
+  into fMP4 for VideoPlayerController.networkUrl()/ExoPlayer to consume (ExoPlayer has no RTSP
+  support at all, see rtsp_replay_client.dart's doc comment for the full reasoning). Traffic to
+  this loopback address never leaves the device, so this is not the security regression a
+  blanket `cleartextTrafficPermitted="true"` (every domain) would be — every other domain still
+  requires HTTPS by Android's own default policy, unchanged. This is exactly the officially
+  documented pattern for a local-loopback-only exception, see
+  https://developer.android.com/guide/topics/media/issues/cleartext-not-permitted's own
+  suggested fix.
+
+  Real bug found 2026-09-01: without this file, ExoPlayer's OkHttp-based data source refused to
+  even connect to the local proxy at all — "Cleartext HTTP traffic to 127.0.0.1 not permitted" —
+  which looked identical to a broken RTSP/muxer pipeline (a PlatformException with no further
+  detail visible in the app's own UI) until the real cause was found via a direct logcat pull.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

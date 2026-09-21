@@ -1,13 +1,12 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../app_state/ai_model_manager.dart';
 import '../../app_state/alerts_controller.dart';
 import '../../app_state/camera_sync.dart';
-import '../../app_state/chat_controller.dart';
 import '../../app_state/debug_transport_override.dart';
 import '../../app_state/events_controller.dart';
 import '../../app_state/homes_controller.dart';
@@ -15,10 +14,10 @@ import '../../app_state/live_view_controller.dart';
 import '../../app_state/route_observer.dart';
 import '../../models/camera.dart';
 import '../../models/home.dart';
-import '../../widgets/camera_chatbot.dart';
 import '../../widgets/camera_tile.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/gradient_fab.dart';
+import '../../widgets/glass_snackbar.dart';
 import '../camera_live/camera_live_screen.dart';
 import '../homes/manage_homes_screen.dart';
 import '../multiview/multiview_screen.dart';
@@ -51,8 +50,6 @@ class DashboardScreen extends StatefulWidget {
     required this.homesController,
     required this.alertsController,
     required this.eventsController,
-    required this.aiModelManager,
-    required this.chatController,
   });
 
   static const routeName = '/dashboard';
@@ -60,8 +57,6 @@ class DashboardScreen extends StatefulWidget {
   final HomesController homesController;
   final AlertsController alertsController;
   final EventsController eventsController;
-  final AiModelManager aiModelManager;
-  final ChatController chatController;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -89,15 +84,29 @@ class _DashboardScreenState extends State<DashboardScreen>
     _startBackgroundTimers();
   }
 
+  /// Real bug fix, 2026-09-15: `Timer.periodic` only fires its *first* tick
+  /// after the full interval elapses, never immediately — so every time this
+  /// screen (re)starts these timers (app launch, or returning from a pushed
+  /// screen via [didPopNext]), the UI kept trusting whatever `isOnline` was
+  /// last known for a full [_reachabilityCheckInterval] before the first real
+  /// check ran. A camera that went offline/online while this screen wasn't
+  /// polling (app closed, or covered by another screen) showed the wrong
+  /// status for that entire window. Fires an immediate check up front now, on
+  /// top of the periodic timer — thumbnails stay periodic-only since a stale
+  /// image for a few minutes is much lower-stakes than a wrong online/offline
+  /// badge.
   void _startBackgroundTimers() {
     _thumbnailRefreshTimer ??= Timer.periodic(
       _thumbnailRefreshInterval,
       (_) => _refreshAllThumbnails(),
     );
-    _reachabilityCheckTimer ??= Timer.periodic(
-      _reachabilityCheckInterval,
-      (_) => _checkAllReachability(),
-    );
+    if (_reachabilityCheckTimer == null) {
+      _checkAllReachability();
+      _reachabilityCheckTimer = Timer.periodic(
+        _reachabilityCheckInterval,
+        (_) => _checkAllReachability(),
+      );
+    }
   }
 
   void _stopBackgroundTimers() {
@@ -353,7 +362,9 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
           ),
           actions: [
-            const _ForceTransportMenu(),
+            // Dev/test only — never shown to a real user in a release
+            // build. See _ForceTransportMenu's doc comment.
+            if (kDebugMode) const _ForceTransportMenu(),
             if (_isReorderMode)
               Padding(
                 padding: const EdgeInsets.only(right: 8),
@@ -381,7 +392,27 @@ class _DashboardScreenState extends State<DashboardScreen>
                     controller: _collectionTabController,
                     isScrollable: true,
                     tabAlignment: TabAlignment.start,
-                    tabs: [for (final label in _tabLabels) Tab(text: label)],
+                    tabs: [
+                      for (final label in _tabLabels)
+                        Tab(
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(label),
+                              const SizedBox(width: 4),
+                              Text(
+                                '(${_camerasForTab(selectedHome, label).length})',
+                                style: Theme.of(context).textTheme.labelSmall
+                                    ?.copyWith(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
                   ),
                 ),
                 IconButton(
@@ -418,38 +449,53 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
           ),
         ),
-        body: NotificationListener<UserScrollNotification>(
-          onNotification: _onUserScroll,
-          child: TabBarView(
-            controller: _collectionTabController,
-            children: [
-              for (final label in _tabLabels)
-                _CameraCollection(
-                  key: Key('DASH-005-$label'),
-                  home: selectedHome,
-                  layout: _layout,
-                  cameras: _camerasForTab(selectedHome, label),
-                  isAllTab: label == _allTabLabel,
-                  isReorderMode: _isReorderMode,
-                  onEnterReorderMode: () =>
-                      setState(() => _isReorderMode = true),
-                  emptyMessage: label == _allTabLabel
-                      ? 'No cameras in ${selectedHome.name} yet'
-                      : 'No cameras in $label',
-                  homesController: widget.homesController,
-                  alertsController: widget.alertsController,
+        body: Column(
+          children: [
+            if (selectedHome.cameras.isNotEmpty)
+              _StatusSummaryBar(
+                key: const Key('DASH-024'),
+                cameras: selectedHome.cameras,
+              ),
+            Expanded(
+              child: NotificationListener<UserScrollNotification>(
+                onNotification: _onUserScroll,
+                child: TabBarView(
+                  controller: _collectionTabController,
+                  children: [
+                    for (final label in _tabLabels)
+                      _CameraCollection(
+                        key: Key('DASH-005-$label'),
+                        home: selectedHome,
+                        layout: _layout,
+                        cameras: _camerasForTab(selectedHome, label),
+                        isAllTab: label == _allTabLabel,
+                        isReorderMode: _isReorderMode,
+                        onEnterReorderMode: () =>
+                            setState(() => _isReorderMode = true),
+                        emptyMessage: label == _allTabLabel
+                            ? 'No cameras in ${selectedHome.name} yet'
+                            : 'No cameras in $label',
+                        onAddCamera: _startAddCameraFlow,
+                        homesController: widget.homesController,
+                        alertsController: widget.alertsController,
+                      ),
+                  ],
                 ),
-            ],
-          ),
+              ),
+            ),
+          ],
         ),
+        // The on-device AI chatbot (llamadart/Qwen) was removed — this stays
+        // a visible, tappable stub rather than a disabled control, same
+        // "not yet implemented" convention camera_live_screen.dart's
+        // Playback tab uses for its Snapshot/Download-clip buttons.
         floatingActionButton: GradientFab(
           key: const Key('DASH-020'),
           expanded: _isFabExpanded,
-          onPressed: () => showCameraChatbot(
+          onPressed: () => showGlassSnackBar(
             context,
-            homesController: widget.homesController,
-            aiModelManager: widget.aiModelManager,
-            chatController: widget.chatController,
+            message: 'AI assistant coming soon',
+            icon: Icons.smart_toy_outlined,
           ),
           icon: const Icon(Icons.smart_toy_outlined),
           label: const Text('Ask AI'),
@@ -469,6 +515,7 @@ class _CameraCollection extends StatelessWidget {
     required this.isReorderMode,
     required this.onEnterReorderMode,
     required this.emptyMessage,
+    required this.onAddCamera,
     required this.homesController,
     required this.alertsController,
   });
@@ -484,6 +531,12 @@ class _CameraCollection extends StatelessWidget {
   final bool isReorderMode;
   final VoidCallback onEnterReorderMode;
   final String emptyMessage;
+
+  /// DASH-025 — only shown on the "All" tab's empty state (see [isAllTab]):
+  /// a filtered-empty tab (Favourites/a room) needs the user to favourite
+  /// or assign an *existing* camera, not add a new one, so this CTA
+  /// wouldn't make sense there.
+  final VoidCallback onAddCamera;
   final HomesController homesController;
   final AlertsController alertsController;
 
@@ -503,11 +556,36 @@ class _CameraCollection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (cameras.isEmpty) {
+      final colorScheme = Theme.of(context).colorScheme;
       return Center(
-        child: Text(
-          key: const Key('DASH-007'),
-          emptyMessage,
-          style: Theme.of(context).textTheme.bodyMedium,
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.videocam_off_outlined,
+                size: 64,
+                color: colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                key: const Key('DASH-007'),
+                emptyMessage,
+                style: Theme.of(context).textTheme.bodyMedium,
+                textAlign: TextAlign.center,
+              ),
+              if (isAllTab) ...[
+                const SizedBox(height: 20),
+                FilledButton.icon(
+                  key: const Key('DASH-025'),
+                  onPressed: onAddCamera,
+                  icon: const Icon(Icons.add_a_photo_outlined),
+                  label: const Text('Add your first camera'),
+                ),
+              ],
+            ],
+          ),
         ),
       );
     }
@@ -575,6 +653,57 @@ class _CameraCollection extends StatelessWidget {
           },
         );
       },
+    );
+  }
+}
+
+/// DASH-024 — quick "is anything offline" awareness without opening each
+/// tile, shown above the tab content for every camera in the *selected*
+/// home (not filtered per-tab — matches the whole-home scope of the home
+/// switcher itself). Hidden when the home has no cameras at all (nothing
+/// to summarize).
+class _StatusSummaryBar extends StatelessWidget {
+  const _StatusSummaryBar({super.key, required this.cameras});
+
+  final List<Camera> cameras;
+
+  @override
+  Widget build(BuildContext context) {
+    final onlineCount = cameras.where((c) => c.isOnline).length;
+    final offlineCount = cameras.length - onlineCount;
+    final colorScheme = Theme.of(context).colorScheme;
+
+    Widget dot(Color color) => Container(
+      width: 8,
+      height: 8,
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    );
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Row(
+        children: [
+          dot(Colors.green),
+          const SizedBox(width: 6),
+          Text(
+            '$onlineCount online',
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+          if (offlineCount > 0) ...[
+            const SizedBox(width: 14),
+            dot(colorScheme.error),
+            const SizedBox(width: 6),
+            Text(
+              '$offlineCount offline',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

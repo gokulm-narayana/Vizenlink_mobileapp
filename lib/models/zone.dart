@@ -45,3 +45,60 @@ class PolygonZone {
   PolygonZone copyWith({List<Offset>? points}) =>
       PolygonZone(id: id, points: points ?? this.points);
 }
+
+/// Higher than [maxDrawableZones]/[maxPersonDetectionZones]-style caps — a
+/// real parking lot easily has more than 8 bays, unlike an exclusion zone
+/// count.
+const maxParkingZones = 20;
+
+/// What a [ParkingZone] represents and how it counts toward occupancy:
+/// - [slot]: a real, countable bay — contributes to the occupied/free tally
+///   and can be flagged if a vehicle overlaps a neighboring slot's line.
+/// - [openArea]: an unmarked lot/section with no painted lines — counts
+///   vehicles inside the boundary against [ParkingZone.estimatedCapacity]
+///   rather than judging position against a grid.
+/// - [restricted]: never counts as a space; a vehicle inside fires a
+///   violation after a dwell-time threshold (fire lanes, loading zones).
+enum ParkingZoneType { slot, openArea, restricted }
+
+/// A free-form polygon parking zone — see `parking_monitoring_screen.dart`'s
+/// own doc comment for the product reasoning behind the three [type]s.
+/// Distinct from [PolygonZone] since neither that nor [DrawableZone] carries
+/// a type/label/capacity.
+class ParkingZone {
+  const ParkingZone({
+    required this.id,
+    required this.type,
+    required this.points,
+    this.label,
+    this.estimatedCapacity,
+  });
+
+  final int id;
+  final ParkingZoneType type;
+  final List<Offset> points;
+
+  /// User-entered display name, e.g. "Reserved — Manager". Null means show
+  /// the auto-generated default ("Slot 3", "Open Area 1", "Restricted 2").
+  final String? label;
+
+  /// Only meaningful for [ParkingZoneType.openArea] — the user's own
+  /// estimate of how many vehicles the area fits, since there are no
+  /// painted slots to count. Null excludes this zone from the capacity
+  /// total shown on the summary card.
+  final int? estimatedCapacity;
+
+  bool get isClosed => points.length >= minPolygonPoints;
+
+  ParkingZone copyWith({
+    List<Offset>? points,
+    String? label,
+    int? estimatedCapacity,
+  }) => ParkingZone(
+    id: id,
+    type: type,
+    points: points ?? this.points,
+    label: label ?? this.label,
+    estimatedCapacity: estimatedCapacity ?? this.estimatedCapacity,
+  );
+}

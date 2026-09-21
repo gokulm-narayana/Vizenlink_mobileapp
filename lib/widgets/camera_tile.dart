@@ -160,7 +160,8 @@ Widget _unreadAlertBadge(
 }
 
 Widget _statusDot(Color statusColor, {double size = 8}) {
-  return Container(
+  return AnimatedContainer(
+    duration: const Duration(milliseconds: 300),
     width: size,
     height: size,
     decoration: BoxDecoration(
@@ -399,14 +400,20 @@ class _CameraTileState extends State<CameraTile> {
                 fit: StackFit.expand,
                 children: [
                   if (thumbnailUrl != null)
-                    CameraThumbnailImage(
-                      thumbnailUrl: thumbnailUrl,
-                      fit: BoxFit.cover,
-                      placeholderBuilder: () =>
-                          _thumbnailPlaceholder(colorScheme, isDark),
+                    Hero(
+                      tag: 'camera_hero_${camera.id}',
+                      child: CameraThumbnailImage(
+                        thumbnailUrl: thumbnailUrl,
+                        fit: BoxFit.cover,
+                        placeholderBuilder: () =>
+                            _thumbnailPlaceholder(colorScheme, isDark),
+                      ),
                     )
                   else
-                    _thumbnailPlaceholder(colorScheme, isDark),
+                    Hero(
+                      tag: 'camera_hero_${camera.id}',
+                      child: _thumbnailPlaceholder(colorScheme, isDark),
+                    ),
                   // Scrim so the overlaid text stays legible over any thumbnail.
                   const DecoratedBox(
                     decoration: BoxDecoration(
@@ -604,19 +611,26 @@ class _CameraListTileState extends State<CameraListTile> {
                       fit: StackFit.expand,
                       children: [
                         thumbnailUrl != null
-                            ? CameraThumbnailImage(
-                                thumbnailUrl: thumbnailUrl,
-                                fit: BoxFit.cover,
-                                placeholderBuilder: () => _thumbnailPlaceholder(
+                            ? Hero(
+                                tag: 'camera_hero_${camera.id}',
+                                child: CameraThumbnailImage(
+                                  thumbnailUrl: thumbnailUrl,
+                                  fit: BoxFit.cover,
+                                  placeholderBuilder: () =>
+                                      _thumbnailPlaceholder(
+                                        colorScheme,
+                                        isDark,
+                                        iconSize: 22,
+                                      ),
+                                ),
+                              )
+                            : Hero(
+                                tag: 'camera_hero_${camera.id}',
+                                child: _thumbnailPlaceholder(
                                   colorScheme,
                                   isDark,
                                   iconSize: 22,
                                 ),
-                              )
-                            : _thumbnailPlaceholder(
-                                colorScheme,
-                                isDark,
-                                iconSize: 22,
                               ),
                         if (!camera.isOnline) _offlineOverlayCompact(camera),
                         if (widget.unreadAlertCount > 0)

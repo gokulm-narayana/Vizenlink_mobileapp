@@ -1,24 +1,40 @@
 import 'dart:typed_data';
 
+import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
+import '../../app_state/transport_preference.dart';
 import '../../models/camera.dart';
 import '../../widgets/drawable_zone.dart';
 import '../../widgets/fixed_preview_layout.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
+import '../../widgets/reload_settings_button.dart';
 import '../../widgets/saving_overlay.dart';
 import '../../widgets/settings_save_button.dart';
 
-/// Person Detection: an enable toggle, confidence-threshold slider, and up
-/// to 8 free-form polygon exclusion zones drawn over regions of the
-/// preview — person detection ignores movement inside these zones (e.g. a
-/// street or a neighbor's yard visible in frame) and still detects
-/// normally everywhere else. Persisted through [HomesController] (see
-/// `updateCamera`) — see the note on `videoMode` in `lib/models/camera.dart`.
+/// Person Detection: an enable toggle, confidence-threshold slider, a
+/// loitering-duration slider, a detection-box overlay toggle, and up to 8
+/// free-form polygon exclusion zones drawn over regions of the preview —
+/// person detection ignores movement inside these zones (e.g. a street or a
+/// neighbor's yard visible in frame) and still detects normally everywhere
+/// else.
+///
+/// **Enable toggle, loitering duration, and bbox overlay are real**
+/// (`EventPreferencesClient`/`LoiteringDurationClient`/`BboxOverlayClient`
+/// over LAN, WAN counterparts via `callPreferringKnownTransport` — added
+/// 2026-09-08, closing the `ui-api-gap-audit` findings for this screen).
+/// Confidence threshold and exclusion zones stay local-only (persisted
+/// through [HomesController], see `updateCamera`) — no camera API exists for
+/// either yet, same as the note on `videoMode` in `lib/models/camera.dart`.
+/// Loitering duration's bounds always come from
+/// `CameraCapabilities.loiteringDurationMinSeconds`/`MaxSeconds`, never
+/// hardcoded; the bbox overlay toggle hides (not disables) when the camera
+/// reports `bboxOverlayCapable == false`, same hardware-gate convention
+/// `audio_screen.dart`'s hasMicrophone/hasSpeaker checks use.
 class PersonDetectionScreen extends StatefulWidget {
   const PersonDetectionScreen({
     super.key,
@@ -48,9 +64,28 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
       1;
   bool _isDirty = false;
   bool _isSaving = false;
+  bool _isLoading = false;
   bool _isRefreshing = false;
   int _previewReloadKey = 0;
   Uint8List? _wanPreviewBytes;
+
+  /// Loitering duration's real bounds (`CameraCapabilities.
+  /// loiteringDurationMinSeconds`/`MaxSeconds`) — the slider is hidden until
+  /// these have actually loaded (`_loiteringBoundsLoaded`), same convention
+  /// `storage_screen.dart`'s clip-duration slider already uses.
+  int _loiteringDurationMinSeconds = 0;
+  int _loiteringDurationMaxSeconds = 0;
+  bool get _loiteringBoundsLoaded =>
+      _loiteringDurationMaxSeconds > _loiteringDurationMinSeconds;
+  late int _loiteringDurationSeconds =
+      widget.camera.loiteringDurationSeconds ?? 0;
+
+  /// Whether the camera draws its AI bounding-box overlay — null means
+  /// "not yet verified", same fallback reasoning `night_mode_screen.dart`'s
+  /// `nightVisionColorCapable` already uses elsewhere in this app: every
+  /// control shows until proven otherwise.
+  bool? _bboxOverlayCapable;
+  late bool _bboxOverlayEnabled = widget.camera.bboxOverlayEnabled ?? false;
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -146,6 +181,118 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
     return widget.camera;
   }
 
+  @override
+  void initState() {
+    super.initState();
+    _loadRealPersonDetection();
+  }
+
+  /// Fetches the enable flag, loitering-duration bounds/value, and
+  /// bbox-overlay state from the real camera — LAN first, WAN fallback via
+  /// [callPreferringKnownTransport]. No-op (silently) when this camera has
+  /// no saved connection yet, same as every other real settings screen.
+  Future<void> _loadRealPersonDetection() async {
+    final connection = _camera.connection;
+    if (connection == null) return;
+    final thingName = connection.thingName;
+
+    setState(() => _isLoading = true);
+    final nuraeye = NuraeyeClient(connection);
+    // Capabilities (bounds + the bbox-overlay capability flag) have no WAN
+    // equivalent — every `GetCapabilities`-sourced field is LAN-only per
+    // `IotCommandClient`'s own doc, same reasoning `camera_sync.dart`'s
+    // `syncCameraFromDevice` already documents. LAN-only, no WAN fallback.
+    final results = await Future.wait([
+      CapabilitiesClient(nuraeye).getCapabilities(),
+      callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () => EventPreferencesClient(nuraeye).getEventPreferences(),
+        wan: () => WanEventPreferencesClient(thingName!).getEventPreferences(),
+      ),
+      callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () => LoiteringDurationClient(nuraeye).getLoiteringDuration(),
+        wan: () =>
+            WanLoiteringDurationClient(thingName!).getLoiteringDuration(),
+      ),
+      callPreferringKnownTransport(
+        camera: _camera,
+        thingName: thingName,
+        lan: () => BboxOverlayClient(nuraeye).isBboxOverlayEnabled(),
+        wan: () => WanBboxOverlayClient(thingName!).isBboxOverlayEnabled(),
+      ),
+    ]);
+    nuraeye.close();
+    if (!mounted) return;
+
+    final capsResult = results[0] as CameraResult<CameraCapabilities>;
+    final enabledResult = results[1] as CameraResult<Map<String, bool>>;
+    final loiteringResult = results[2] as CameraResult<int>;
+    final bboxResult = results[3] as CameraResult<bool>;
+
+    bool? enabled;
+    int? loiteringSeconds;
+    bool? bboxEnabled;
+    setState(() {
+      if (capsResult case CameraSuccess(:final value)) {
+        _loiteringDurationMinSeconds = value.loiteringDurationMinSeconds;
+        _loiteringDurationMaxSeconds = value.loiteringDurationMaxSeconds;
+        _bboxOverlayCapable = value.bboxOverlayCapable;
+      }
+      if (enabledResult case CameraSuccess(:final value)) {
+        enabled = value['PersonDetected'];
+        if (enabled != null) _enabled = enabled!;
+      }
+      if (loiteringResult case CameraSuccess(:final value)) {
+        loiteringSeconds = value;
+        _loiteringDurationSeconds = value;
+      }
+      if (bboxResult case CameraSuccess(:final value)) {
+        bboxEnabled = value;
+        _bboxOverlayEnabled = value;
+      }
+      // Real bug, guarded against: if the bounds loaded but the actual
+      // duration fetch above failed/timed out, `_loiteringDurationSeconds`
+      // could still be sitting at its pre-bounds-known default (0) — below
+      // a real camera's min bound. `Slider` asserts `value` is within
+      // `min`/`max`, so displaying it unclamped here would crash the whole
+      // screen the moment bounds load without the value itself loading too.
+      if (_loiteringBoundsLoaded) {
+        _loiteringDurationSeconds = _loiteringDurationSeconds.clamp(
+          _loiteringDurationMinSeconds,
+          _loiteringDurationMaxSeconds,
+        );
+      }
+      _isLoading = false;
+    });
+    widget.homesController.updateCamera(
+      widget.camera.id,
+      (camera) => camera.copyWith(
+        personDetectionEnabled: enabled,
+        loiteringDurationSeconds: loiteringSeconds,
+        bboxOverlayEnabled: bboxEnabled,
+      ),
+    );
+  }
+
+  /// Manual reload — re-fetches this screen's real fields from the camera,
+  /// for when a change made elsewhere (another client, the camera's own web
+  /// UI) hasn't shown up here yet. Distinct from [_save] (pushes local
+  /// edits).
+  Future<void> _reloadSettings() async {
+    if (_camera.connection == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No saved connection for this camera yet'),
+        ),
+      );
+      return;
+    }
+    await _loadRealPersonDetection();
+  }
+
   Future<void> _refreshPreview() async {
     final connection = _camera.connection;
     if (connection == null) {
@@ -189,8 +336,75 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
   }
 
   Future<void> _save() async {
+    final connection = _camera.connection;
     setState(() => _isSaving = true);
-    final succeeded = await simulateCameraSave();
+
+    final bool succeeded;
+    if (connection != null) {
+      // Only push fields that actually changed from the last
+      // camera-confirmed value — mobile-app-screen-conventions.md's Apply
+      // convention (see audio_screen.dart's own `_save` for the same
+      // pattern). Confidence and zones have no camera API yet, so they
+      // always stay local-only.
+      final thingName = connection.thingName;
+      final enabledChanged = _enabled != _camera.personDetectionEnabled;
+      final loiteringChanged =
+          _loiteringBoundsLoaded &&
+          _loiteringDurationSeconds != _camera.loiteringDurationSeconds;
+      final bboxChanged =
+          _bboxOverlayCapable != false &&
+          _bboxOverlayEnabled != _camera.bboxOverlayEnabled;
+
+      final nuraeye = NuraeyeClient(connection);
+      final results = <CameraResult<void>>[];
+      if (enabledChanged) {
+        results.add(
+          await callPreferringKnownTransport(
+            camera: _camera,
+            thingName: thingName,
+            lan: () => EventPreferencesClient(
+              nuraeye,
+            ).setEventPreferences({'PersonDetected': _enabled}),
+            wan: () => WanEventPreferencesClient(
+              thingName!,
+            ).setEventPreferences({'PersonDetected': _enabled}),
+          ),
+        );
+      }
+      if (loiteringChanged) {
+        results.add(
+          await callPreferringKnownTransport(
+            camera: _camera,
+            thingName: thingName,
+            lan: () => LoiteringDurationClient(
+              nuraeye,
+            ).setLoiteringDuration(_loiteringDurationSeconds),
+            wan: () => WanLoiteringDurationClient(
+              thingName!,
+            ).setLoiteringDuration(_loiteringDurationSeconds),
+          ),
+        );
+      }
+      if (bboxChanged) {
+        results.add(
+          await callPreferringKnownTransport(
+            camera: _camera,
+            thingName: thingName,
+            lan: () => BboxOverlayClient(
+              nuraeye,
+            ).setBboxOverlayEnabled(_bboxOverlayEnabled),
+            wan: () => WanBboxOverlayClient(
+              thingName!,
+            ).setBboxOverlayEnabled(_bboxOverlayEnabled),
+          ),
+        );
+      }
+      nuraeye.close();
+      succeeded = results.every((r) => r is CameraSuccess);
+    } else {
+      succeeded = await simulateCameraSave();
+    }
+
     if (!mounted) return;
     setState(() => _isSaving = false);
     if (succeeded) {
@@ -200,6 +414,12 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
           personDetectionEnabled: _enabled,
           personDetectionConfidence: _confidence,
           personDetectionZones: [..._zones],
+          loiteringDurationSeconds: _loiteringBoundsLoaded
+              ? _loiteringDurationSeconds
+              : null,
+          bboxOverlayEnabled: _bboxOverlayCapable != false
+              ? _bboxOverlayEnabled
+              : null,
         ),
       );
       setState(() => _isDirty = false);
@@ -236,6 +456,11 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
             key: const Key('PERSON-001'),
             title: const Text('Person Detection'),
             actions: [
+              ReloadSettingsButton(
+                settingsKey: const Key('PERSON-017'),
+                isBusy: _isLoading || _isSaving,
+                onPressed: _reloadSettings,
+              ),
               SettingsSaveButton(
                 settingsKey: const Key('PERSON-002'),
                 isDirty: _isDirty,
@@ -245,7 +470,8 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
             ],
           ),
           body: SavingOverlay(
-            isSaving: _isSaving,
+            isSaving: _isSaving || _isLoading,
+            label: _isLoading ? 'Loading…' : 'Saving…',
             child: FixedPreviewLayout(
               preview: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -310,6 +536,56 @@ class _PersonDetectionScreenState extends State<PersonDetectionScreen> {
                     ],
                   ),
                 ),
+                if (_loiteringBoundsLoaded) ...[
+                  const SizedBox(height: 12),
+                  GlassCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Text(
+                          'Alert after lingering for '
+                          '(${_loiteringDurationSeconds}s)',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        Text(
+                          'How long someone has to stay in frame before a '
+                          'Loitering event fires — independent of whether '
+                          'person detection above is on',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        Slider(
+                          key: const Key('PERSON-016'),
+                          value: _loiteringDurationSeconds.toDouble(),
+                          min: _loiteringDurationMinSeconds.toDouble(),
+                          max: _loiteringDurationMaxSeconds.toDouble(),
+                          divisions:
+                              _loiteringDurationMaxSeconds -
+                              _loiteringDurationMinSeconds,
+                          onChanged: (value) => _markDirty(
+                            () => _loiteringDurationSeconds = value.round(),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+                if (_bboxOverlayCapable != false) ...[
+                  const SizedBox(height: 12),
+                  GlassCard(
+                    padding: EdgeInsets.zero,
+                    child: SwitchListTile(
+                      key: const Key('PERSON-018'),
+                      title: const Text('Show detection box on video'),
+                      subtitle: const Text(
+                        'Draws the AI\'s detection box on the live feed and '
+                        'recordings',
+                      ),
+                      value: _bboxOverlayEnabled,
+                      onChanged: (value) =>
+                          _markDirty(() => _bboxOverlayEnabled = value),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 24),
                 Row(
                   children: [

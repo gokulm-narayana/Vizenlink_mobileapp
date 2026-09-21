@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:camera_api/camera_api.dart';
 import 'package:flutter/material.dart';
 
+import '../../app_state/camera_settings_cache.dart';
 import '../../app_state/camera_sync.dart';
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
@@ -273,7 +274,7 @@ class _ImagingScreenState extends State<ImagingScreen> {
     // timeout for nothing.
     final lanReachable = _camera.lastKnownWan == true
         ? false
-        : await WebRtcUriClient(nuraeye).checkReachable();
+        : await LiveStreamUriClient(nuraeye).checkReachable();
 
     final CameraResult<ImagingSettings> settingsResultRaw;
     final CameraResult<ImagingOptions> optionsResult;
@@ -283,7 +284,11 @@ class _ImagingScreenState extends State<ImagingScreen> {
     if (lanReachable) {
       final results = await Future.wait([
         imagingClient.getImagingSettings(),
-        imagingClient.getImagingOptions(),
+        NetworkAnswerCache.getOrFetch(
+          connection.host,
+          'imagingOptions',
+          fetch: imagingClient.getImagingOptions,
+        ),
         MirrorFlipClient(nuraeye).getMirrorFlip(),
         nuraeye.call('GetImageDefaults'),
         AntiFlickerClient(nuraeye).getAntiFlickerMode(),

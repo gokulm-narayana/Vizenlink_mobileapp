@@ -1,4 +1,4 @@
-# camera_api — Live View Streaming Guide (WebRTC LAN + KVS WAN)
+# camera_api — Live View Streaming Guide (WebRTC/RTSP LAN + KVS WAN)
 
 This file explains how to implement live-view playback end-to-end, on both transports. It exists
 because `API_REFERENCE.md` documents `camera_api`'s clients one class at a time (what each
@@ -12,14 +12,21 @@ Those two files are non-`flutter_webrtc`-package code specifically because `came
 pure-Dart with no `package:flutter` import — session-level WebRTC/video-player orchestration is
 intentionally left as app-level business logic, not something this package provides.
 
-## 1. Two transports, one decision rule
+## 1. Two transports, one decision rule (LAN itself has two sub-transports)
 
-| | LAN (WebRTC) | WAN (KVS) |
-|---|---|---|
-| When | Phone and camera on the same network | Phone away from home, or LAN unreachable |
-| Latency | Sub-second (real-time peer connection) | Several seconds (HLS segment buffering) |
-| Mechanism | Direct signaling to the camera, then a peer-to-peer media stream | Camera pushes to AWS Kinesis Video Streams; phone pulls an HLS URL from AWS |
-| Audio | Bidirectional-capable (two-way talk reuses this connection) | Playback only — no talk over WAN today (`FR-NE-081` is `Planned`) |
+| | LAN — WebRTC | LAN — RTSP fallback | WAN (KVS) |
+|---|---|---|---|
+| When | Phone and camera on the same network, camera build has `WEBRTC_STREAMING` | Same network, but `WEBRTC_STREAMING` disabled camera-side (current default) | Phone away from home, or LAN unreachable |
+| Latency | Sub-second (real-time peer connection) | Low (local remux, no cloud round trip) but not peer-to-peer real-time | Several seconds (HLS segment buffering) |
+| Mechanism | Direct signaling to the camera, then a peer-to-peer media stream | Real RTSP session, remuxed to fMP4 over a local HTTP loopback for `video_player` (§2.5) | Camera pushes to AWS Kinesis Video Streams; phone pulls an HLS URL from AWS |
+| Audio | Playback only (downlink) | Playback only (downlink) | Playback only (downlink) |
+
+Two-way talk is **not** part of any of these transports — it is a separate, dedicated audio-only
+RTSPS connection on its own port, described in [TWO_WAY_TALK_GUIDE.md](TWO_WAY_TALK_GUIDE.md). It
+works on LAN only (`FR-NE-081` WAN relay is `Planned`).
+
+Which of the two LAN sub-transports you get is **decided by the camera, not the app** —
+`GetLiveStreamUri`'s `output.transport` field says which one (§2.1). The app never chooses.
 
 **Which to use is decided by real connectivity, never by comparing IP addresses or guessing from
 network type.** Try LAN first; only fall back to WAN after a genuine LAN reachability failure
@@ -35,38 +42,71 @@ give a wrong answer.
 error. Treat an unknown/uncached value as capable (fail open) rather than blocking WAN for an
 already-onboarded camera.
 
-## 2. LAN path — WebRTC signaling
+## 2. LAN path — WebRTC signaling, or RTSP fallback
+
+**2026-09-07: the camera itself now picks the LAN transport** — WebRTC when its firmware build
+has `WEBRTC_STREAMING` compiled in, RTSP(S) otherwise (the current default: `WEBRTC_STREAMING`
+was disabled camera-side, module kept intact, not removed). This supersedes this guide's earlier
+"RTSP is reserved for VMS/NVR, WebRTC is the LAN mobile path" framing (root `CLAUDE.md`'s Stream
+consumer mapping) — that conclusion no longer holds, since a build with `WEBRTC_STREAMING` off
+has no other LAN transport, and this app now actually plays that RTSP stream too (§2.3).
 
 ### 2.1 Discovery
 
-There is no discovery mechanism built into the signaling socket itself — resolve it first via
-the NuraEye JSON action `GetWebRtcUri` (`camera_api`'s `WebRtcUriClient.getWebRtcUri`,
-`FR-NE-090`):
+There is no discovery mechanism built into the signaling socket (or the RTSP listener) itself —
+resolve the live-view target first via the NuraEye REST endpoint `POST /nuraeye/live-stream-uri`
+(`camera_api`'s `LiveStreamUriClient.getLiveStreamUri`, `FR-NE-127` — **replaces this guide's
+former separate `GetWebRtcUri`, `FR-NE-090`**, merged into this one endpoint the same day):
 
 ```
-Request:  {"action": "GetWebRtcUri", "params": {"profile_token": "Profile_1"}}
-Response: {"error_code": 0, "error_msg": "Success",
-           "output": {"port": <n>, "url": "http://<camera-ip>:<port>/webrtc"}}
+Request:  POST /nuraeye/live-stream-uri  {"profile_token": "Profile_3"}
+Response (WebRTC): {"error_code": 0, "error_msg": "Success",
+           "output": {"transport": "webrtc", "port": <n>, "path": "/webrtc",
+                      "url": "http://<camera-ip>:<port>/webrtc"}}
+Response (RTSP):    {"error_code": 0, "error_msg": "Success",
+           "output": {"transport": "rtsp", "port": <n>, "path": "/high"|"/medium"|"/low",
+                      "url": "rtsps://<camera-ip>:<port><path>"}}
 ```
 
-`profile_token` is `Profile_1`/`Profile_2`/`Profile_3` (Stream 0/1/2). This call, and the
-signaling socket it resolves, are **LAN-only by design** — there is no WAN counterpart and there
-never will be one, since the signaling socket has no WAN reachability regardless (see root
-`CLAUDE.md`'s Stream consumer mapping: RTSP is reserved for VMS/NVR, WebRTC is the LAN mobile
-path).
+`profile_token` is `Profile_1`/`Profile_2`/`Profile_3` (Stream 0/1/2, high/medium/low — all three
+are ordinary ONVIF profiles, reachable via `GetStreamUri` too, `FR-CF-010`). This call, and both
+transports it can resolve, are **LAN-only by design** — there is no WAN counterpart and there
+never will be one for either.
 
-The resolved URL is **plain `http://`, not `https://`** — the signaling socket is unauthenticated
-and unencrypted by firmware design. This is acceptable because it never leaves the LAN.
+**This app's own live view defaults to `Profile_3` and only auto-adjusts within one session
+manually** — background: a real bug (2026-09-08) once shipped a bare `'Profile_1'` string literal
+as the default, so live view requested the NVR/VMS-facing main stream instead of the stream built
+for this app. Fixed by introducing named constants (`kMobileOnlyStreamProfileToken` etc.,
+`live_stream_uri_client.dart`) so the choice is self-documenting at every call site, and by
+disabling `LiveViewController`'s FR-MOB-037 LAN-trouble-detection profile ladder (§10.8) for the
+Live tab's default session — that automatic ladder must never silently step a session from
+`Profile_3` to `Profile_1`/`Profile_2` (or back) on its own, since a background quality change the
+user didn't ask for is confusing regardless of direction.
+
+**Superseded 2026-09-11**: this does *not* mean live view is permanently pinned to `Profile_3` —
+`OnvifVideoEncoderClient.getProfiles()` (Media2 `GetProfiles`) now lets a caller discover every
+profile the camera actually has configured (token/name/resolution), and the Stream Quality picker
+(camera_live_screen.dart's LIVE-058/059) calls `LiveViewController.setPreferredProfile(token)` to
+request a *user-chosen* profile directly — a deliberate, explicit switch, not the old automatic
+ladder. `Profile_1`/`Profile_2` are legitimate choices for a user who explicitly picks "High"/etc.;
+what's still forbidden is the *automatic*, un-requested ladder ever moving the Live tab's default
+session off whatever profile the user (or the initial default) selected.
+
+Branch on `output.transport`, not on any assumption about which one you'll get:
+- `"webrtc"`: `url` is **plain `http://`, not `https://`** — the signaling socket is
+  unauthenticated and unencrypted by firmware design. This is acceptable because it never leaves
+  the LAN. Continue with §2.2 below.
+- `"rtsp"`: `url` is an RTSPS stream URL (RTSP-level Digest auth applies, same credentials as
+  `/nuraeye`/`/onvif`). See §2.5.
 
 ### 2.2 Offer/answer
 
 `POST` to the resolved URL (i.e. `POST /webrtc` on the camera) with:
 
 ```json
-{"type": "offer", "sdp": "<your SDP offer>", "talk": false}
+{"type": "offer", "sdp": "<your SDP offer>"}
 ```
 
-- `talk` is optional; omit it or set `false` for live-view-only. See §5 for the talk case.
 - On success: `HTTP 200`, `Content-Type: application/json`, body `{"type": "answer", "sdp":
   "<answer SDP>"}` — negotiate this as your `RTCPeerConnection`'s remote description exactly as
   you would any other WebRTC answer.
@@ -84,15 +124,14 @@ exceptions — "Check if a connection was already established; if so, tear it do
 new one" is literally what the firmware does on every offer (this is deliberate, to support rapid
 start/stop/start reconnect attempts from a client).
 
-**Practical consequence: never open a second, independent connection for a second purpose (e.g.
-two-way talk) while a live-view connection is already open on the same port.** Doing so will
-silently kill the first connection the moment the second offer is accepted — this app's own
-two-way-talk feature hit exactly this bug during development (talk opened a second connection,
-assumed it could coexist with live view, and the two connections evicted each other in a loop:
-starting talk killed live view, live view's own reconnect-on-drop logic then killed talk). The
-fix, and the pattern to follow for any future multi-purpose WebRTC feature on this camera: **renegotiate the existing connection** — send a fresh offer with a changed transceiver/`talk` flag
-over the *same* signaling exchange, never open a second connection to the same port. See §5 for
-how two-way talk does this.
+**Practical consequence: never open a second, independent connection to the same signaling port
+for a second purpose while a live-view connection is already open.** Doing so silently kills the
+first connection the moment the second offer is accepted — this app's original two-way-talk
+feature hit exactly this bug (talk opened a second connection, the two evicted each other in a
+loop). Any future multi-purpose WebRTC feature must **renegotiate the existing connection** (fresh
+offer, changed transceiver, same signaling exchange), never open a second one. (Two-way talk no
+longer uses WebRTC at all — it has its own dedicated RTSPS connection, see
+[TWO_WAY_TALK_GUIDE.md](TWO_WAY_TALK_GUIDE.md).)
 
 ### 2.4 Reconnect and health
 
@@ -108,38 +147,90 @@ how two-way talk does this.
   might be left camera-side, so a plain retry is the correct recovery, not something requiring
   special-casing.
 
+### 2.5 RTSP fallback (`transport: "rtsp"`)
+
+New 2026-09-07, added when the camera itself has no other LAN transport
+(`WEBRTC_STREAMING` disabled camera-side). The RTSP(S) listener speaks a real RTSP/1.0 protocol
+(`OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`/`TEARDOWN`, TCP-interleaved RTP, RFC 2617 Digest auth) — not
+directly consumable by `video_player`/ExoPlayer/AVPlayer, so this app doesn't speak RTSP straight
+to the player. Instead:
+
+1. `RtspLiveViewSession` (`mobile_app/lib/features/live_view/rtsp/rtsp_live_view_session.dart`)
+   is a real RTSP client — `DESCRIBE`+`SETUP`+`PLAY` against the resolved `url`, then depacketizes
+   H.264 (RFC 6184 single-NAL/FU-A) and, if present, AAC (RFC 3640 AAC-hbr) off the interleaved
+   RTP stream. **Adapted from** the pre-existing recorded-clip playback client
+   (`../recordings/rtsp/rtsp_replay_client.dart`'s `RtspReplaySession`, itself the reason this
+   app doesn't use `media_kit`/libmpv at all — see that file's own doc for the ten-iteration
+   real-hardware history) — same protocol engine, with clip-specific concepts (seek, a bound
+   clip's start/end epoch) dropped, since live view has neither.
+2. `RtspLiveViewProxy` (`rtsp_live_view_proxy.dart`, adapted from `rtsp_remux_proxy.dart`) remuxes
+   what that session reads into fragmented MP4 (`fmp4_muxer.dart`, reused unchanged — its
+   `totalDurationSeconds: null` is exactly the "unbounded live content" signal ExoPlayer needs)
+   and serves it over a local HTTP loopback server (`http://127.0.0.1:<port>/live.mp4`).
+3. `LiveViewScreen` points `VideoPlayerController.networkUrl()` at that loopback URL — from there
+   it's rendered, muted, and snapshotted through the exact same code path the WAN (KVS HLS)
+   transport already uses (both are just "a `video_player` session fed by a local/remote URI").
+
+No seek, no pause/resume at the RTSP level (the camera's live-view RTSPS listener has no `PAUSE`
+method — same limitation `../recordings/rtsp/rtsp_remux_proxy.dart`'s own doc describes for clip
+playback). A dropped connection surfaces as the proxy's `isSessionEnded` going true (or a
+`video_player` `hasError`) — reconnect by constructing a fresh `RtspLiveViewProxy` against a
+freshly-resolved `getLiveStreamUri()` target, mirroring §2.4's WebRTC reconnect posture (a plain
+retry, no special-casing).
+
 ## 3. WAN path — the four-step sequence
 
 There is no single "connect" call — WAN live view is a sequence of independent steps, each with
 its own failure modes. All four go through AWS IoT Core (MQTT command relay) and, for playback
 resolution, a Lambda proxy — never a direct-from-app AWS SDK call (see §4 for why).
 
-### Step 1 — `StartCloudStreaming`
+**`FR-CF-154` (2026-09-14): quality-selective, reference-counted, per-viewer leases.** Every KVS
+stream (`high`/`medium`/`low`, one per `StreamQuality` value, named `<thing_name>-high`/
+`-medium`/`-low` — the app must let the user pick which tier to watch, mirroring the LAN
+RTSPS `/high`/`/medium`/`/low` picker) is a real, independently-billed AWS resource. The camera
+never starts more than the requested tier, reference-counts concurrent viewers of the same tier
+so they share one AWS session, and issues each `StartCloudStreaming` caller its own lease
+**token** — `camera_api`'s `WanLiveViewClient` interface reflects this shape directly (see below);
+there is no fire-and-forget "just start it" call anymore.
 
-Fire-and-forget MQTT command (`camera_api`: `WanLiveViewClient.startCloudStreaming()`). Tells the
-camera to begin pushing Stream 1 (the low-resolution substream) to its configured KVS channel.
-This call succeeding only means the command was delivered — it does not mean video is flowing
-yet (see §4 on why `stream_status: active` isn't sufficient evidence either).
+### Step 1 — `StartCloudStreaming(quality)`
 
-### Step 2 — `GetCloudStreamingStatus`, with retry
+Request/response MQTT command (`WanLiveViewClient.startCloudStreaming(StreamQuality quality)`,
+`params.quality` = `"high"`/`"medium"`/`"low"`). Tells the camera to begin pushing that one
+quality tier to its configured KVS channel (or, if another viewer already has it running, just
+increments the camera-side reference count — no new AWS session). Returns the viewer's lease
+**token** (an `int`) on success — keep it, every later call for this session needs it. This call
+succeeding only means the command was delivered — it does not mean video is flowing yet (see §4
+on why `stream_status: active` isn't sufficient evidence either).
 
-Request/response MQTT command (`getCloudStreamingStatus()`) returning one of:
+### Step 2 — `GetCloudStreamingStatus(token)`, with retry — also the heartbeat
+
+Request/response MQTT command (`getCloudStreamingStatus(token)`) returning one of:
 
 | Value | Meaning |
 |---|---|
-| `active` | Camera believes it is currently pushing frames. **Does not guarantee AWS is accepting them** — see §4. |
+| `active` | Camera believes it is currently pushing frames for this viewer's tier. **Does not guarantee AWS is accepting them** — see §4. |
 | `idle` | Not streaming, no known failure — the normal resting state before any client requests it. Also a **normal transient state immediately after `StartCloudStreaming`** while the substream spins up — retry a couple of times before treating this as a real problem. |
 | `degraded` | Not streaming, and the last 3+ consecutive connection attempts failed. |
 | `notCompiled` | This firmware build doesn't have KVS support compiled in at all — don't retry, there's nothing to wait for. |
 
-### Step 3 — `resolvePlaybackUri` (via the Lambda relay)
+**This call is also the lease heartbeat.** Passing `token` refreshes the camera-side lease for
+that viewer; a token not refreshed within **30 seconds** is dropped automatically
+(`bsp_camera_pollKvsViewerLeases()`, firmware-side), and once the last viewer's reference drops,
+the camera tears the AWS session down to stop paying for it. Call this **at least every 30s**
+for the lifetime of the session, not just once at connect time — this app's own periodic WAN
+health poll (`LiveViewController._checkWanHealth`, default every 10s) does this for free, since
+its existing health check already calls `getCloudStreamingStatus` on that cadence.
 
-Once `active`, resolve a playable URL (`resolvePlaybackUri()`, backed by `KvsPlaybackClient` →
-the deployed `cloud_backend/kvs_playback_lambda` Function URL, which calls AWS KVS's
-`GetDataEndpoint`/`GetHLSStreamingSessionURL` under its own execution role — see §4). The
-returned HLS session URL is long-lived (12h, `Expires=43200` server-side) — you do not need to
-re-resolve it for every reconnect within that window, only when it's actually expired or invalid
-(see §5's caveat on when this assumption breaks).
+### Step 3 — `resolvePlaybackUri(quality)` (via the Lambda relay)
+
+Once `active`, resolve a playable URL (`resolvePlaybackUri(quality)`, backed by
+`KvsPlaybackClient` → the deployed `cloud_backend/kvs_playback_lambda` Function URL, which calls
+AWS KVS's `GetDataEndpoint`/`GetHLSStreamingSessionURL` under its own execution role for the
+`<thing_name>-<quality>` stream name — see §4). The returned HLS session URL is long-lived (12h,
+`Expires=43200` server-side) — you do not need to re-resolve it for every reconnect within that
+window, only when it's actually expired or invalid (see §5's caveat on when this assumption
+breaks).
 
 The substream can legitimately still be spinning up for a few seconds after `StartCloudStreaming`
 reports `active` — retry `resolvePlaybackUri` a few times (e.g. 3 attempts, ~2s apart) before
@@ -153,19 +244,30 @@ resolves everything down to a plain HLS URL).
 
 ### Ending the session
 
-`StopCloudStreaming` (fire-and-forget, same shape as Start) — available on **both** transports:
-the WAN/MQTT command, and (added for exactly this reason) a LAN `/nuraeye` action of the same
-name (`CloudStreamingLanClient.stopCloudStreaming()`). If you've just confirmed the camera is
-reachable on LAN (e.g. switching back from WAN because the phone came back onto the home network),
-prefer the LAN stop call — it avoids an unnecessary AWS/Lambda round trip for a camera you can
-already reach directly. Fall back to the WAN stop only if the LAN attempt itself fails.
+`stopCloudStreaming(token)` (fire-and-forget, same shape as the pre-`FR-CF-154` Stop) — available
+on **both** transports: the WAN/MQTT command, and (added for exactly this reason) a LAN
+`/nuraeye` action of the same name (`CloudStreamingLanClient.stopCloudStreaming()` — no token,
+LAN's own action is the older blunt "stop every quality" behavior, unaffected by this rework). If
+you've just confirmed the camera is reachable on LAN (e.g. switching back from WAN because the
+phone came back onto the home network), prefer the LAN stop call — it avoids an unnecessary
+AWS/Lambda round trip for a camera you can already reach directly. Fall back to the WAN stop only
+if the LAN attempt itself fails.
 
-**Send `StopCloudStreaming` even if your session never fully reached "playing."** A real bug
-found in this app: if `startCloudStreaming()` succeeds but the session is torn down before
-playback resolution completes (steps 2-3 still in flight), the camera has *already* started
-publishing — skipping the stop call in that window left it publishing to KVS indefinitely with no
-viewer. Track "did I send Start" as a fact independent of whatever UI/connection state your app
-happens to be in, and always pair it with a Stop.
+**Send `stopCloudStreaming(token)` even if your session never fully reached "playing."** A real
+bug found in this app: if `startCloudStreaming()` succeeds but the session is torn down before
+playback resolution completes (steps 2-3 still in flight), the camera has *already* incremented
+its reference count for this viewer. Skipping the stop call in that window leaves the lease to
+expire on its own via the 30s heartbeat timeout rather than releasing it immediately — track "did
+I get a token back from Start" as a fact independent of whatever UI/connection state your app
+happens to be in, and always pair it with a Stop using that same token.
+
+### Switching quality tier mid-session
+
+There is no "change quality" command — switching tiers means stopping the current lease
+(`stopCloudStreaming(oldToken)`) and starting a fresh one on the new quality
+(`startCloudStreaming(newQuality)` → new token), same as a reconnect. See
+`LiveViewController.setWanQuality` for the reference implementation (tears down the old lease,
+re-runs the connect sequence above on the new tier).
 
 ## 4. What `stream_status` does and doesn't tell you
 
@@ -212,36 +314,44 @@ not yet answer correctly: is a player-visible error/stall recoverable by reconne
 
 The "same URL is fine" assumption holds for a transient phone-side network/decoder hiccup — the
 underlying KVS session hasn't changed, so reconnecting to the identical long-lived URL (§3 step 3)
-recovers cleanly. It does **not** reliably hold for a different, real scenario: **the camera can
-legitimately restart its own KVS producer mid-session** — this happens, among other triggers,
-whenever a client toggles the camera's mic on/off while WAN streaming is active (see §7), since
-the KVS producer needs to rebuild its stream to reflect the new audio-track composition. This is
+recovers cleanly. It does **not** hold for a different, real scenario: **the camera can
+legitimately stop the KVS stream outright mid-session** — this happens, among other triggers,
+whenever a client toggles the camera's mic on/off while WAN streaming is active (see §6). This is
 expected, correct camera-side behavior, not corruption — but from the app's perspective it looks
 identical to a stall (playback freezes, or an HLS player may throw a hard platform-level
-exception), and the underlying PUT MEDIA session genuinely changed underneath the already-issued
-HLS URL. This app's current recovery path (`live_view_screen.dart`'s `_recoverWanPlayback`)
-assumes the same-URL case always applies and does not yet distinguish the two — real-device
-testing found this requires the user to manually retry a few times before playback resumes after
-a producer restart, rather than the app recovering on its own within its normal retry budget.
-**This is a known, unresolved gap as of 2026-08-13** — not a solved pattern to copy as-is.
-Recommend building in an explicit fallback: if a same-URL reconnect fails its own retry budget,
-fall through to a fresh §3 sequence (re-check status, re-resolve a new URL) rather than giving up
-or looping the same stale URL indefinitely.
+exception), and (since `FR-CF-154`, 2026-09-14) the camera does **not** bring the stream back on
+its own — a fresh §3 sequence from Step 1 is required, not a same-URL reconnect. This app's
+current recovery path (`live_view_screen.dart`'s `_recoverWanPlayback`) does not yet distinguish
+a transient phone-side hiccup from a real camera-initiated stop — real-device testing (pre-dating
+`FR-CF-154`, back when the camera still self-reconnected) found this required the user to
+manually retry a few times before playback resumed. **This remains a known, unresolved gap** —
+not a solved pattern to copy as-is. Recommend building in an explicit fallback: if a same-URL
+reconnect fails its own retry budget, fall through to a fresh §3 sequence (re-check status,
+re-`startCloudStreaming`, re-resolve a new URL) rather than giving up or looping the same stale
+URL indefinitely — and prefer reacting to `CloudStreamStopped` (§6) over waiting to notice via a
+failed reconnect at all.
 
-## 6. The audio-track/mic-toggle interaction
+## 6. The audio-track/mic-toggle interaction, and camera-initiated stops in general
 
 `SetAudioRecording`/`GetAudioRecording` (`FR-NE-078`, `AudioVolumeClient`/`WanAudioVolumeClient`
 in `camera_api`) toggles whether the camera is capturing microphone audio at all — the same
 underlying camera state on both LAN and WAN transports ("one state, two transports"). **If cloud
-streaming is currently active, toggling this forces the camera to immediately restart its KVS
-producer** so the stream's track composition (whether an audio track is declared at all) stays
-consistent with what's actually being fed to it — this is deliberate and correct (the alternative,
+streaming is currently active, toggling this forces the camera to immediately stop the affected
+KVS stream(s)** so the stream's track composition (whether an audio track is declared at all)
+never drifts out of sync with what's actually being fed to it (the failure this guards against,
 found and fixed in `BUG-023`, was a stream stuck declaring an audio track nobody was feeding,
-which AWS rejects outright). A WAN viewer should expect a brief playback interruption/reconnect
-as a normal consequence of anyone toggling this setting — camera-app, another mobile client, or
-this one — not treat it as an error to surface to the user beyond the usual "reconnecting"
-indicator. See §5 for the current, unresolved gap in how reliably playback actually resumes
-afterward.
+which AWS rejects outright). A stream resolution change (video re-init) stops any of that specific
+tier's active stream the same way.
+
+**`FR-CF-154` (2026-09-14): the camera no longer self-reconnects after either trigger** — it was
+a self-managed `STOP`+`RECONNECT` before, adding complexity the camera doesn't need to carry;
+now it's a plain stop, matching how a LAN RTSP client is simply disconnected and left to redial
+itself. A WAN viewer whose stream was stopped this way must reconnect from Step 1
+(`startCloudStreaming`) — same as any other WAN session start — not assume the camera will bring
+it back. To reconnect promptly rather than waiting for the next `GetCloudStreamingStatus` poll to
+notice, subscribe to the `CloudStreamStopped` alert-topic event (fired once per stop, cause-
+agnostic — covers both the audio toggle and a resolution change) and treat it as a trigger to
+restart the connect sequence immediately.
 
 ## 7. Client reference
 
@@ -250,12 +360,12 @@ for exact method signatures:
 
 | Purpose | Class |
 |---|---|
-| LAN signaling discovery (`GetWebRtcUri`) | `WebRtcUriClient` |
-| LAN reachability probe | `WebRtcUriClient.checkReachable` |
+| LAN live-view discovery (`GetLiveStreamUri` — resolves WebRTC or RTSP) | `LiveStreamUriClient` |
+| LAN reachability probe | `LiveStreamUriClient.checkReachable` |
 | LAN cloud-streaming status/stop | `CloudStreamingLanClient` |
 | WAN command relay (low-level) | `IotCommandClient` |
 | WAN KVS playback URL resolution | `KvsPlaybackClient` |
-| WAN live-view session (Start/Stop/Status/resolve, one interface) | `WanLiveViewClient` / `AwsWanLiveViewClient` |
+| WAN live-view session (quality-selective Start/Stop/Status/resolve, lease token, one interface) | `WanLiveViewClient` / `AwsWanLiveViewClient` |
 | WAN audio-recording toggle | `WanAudioVolumeClient` |
 
 None of these implement the offer/answer negotiation, the reconnect state machine, or the
@@ -263,10 +373,14 @@ transport-selection logic described above — that's the layer you build on top,
 own `LiveViewController`/`LiveViewScreen` do (not shipped as reusable `camera_api` code — see the
 note at the top of this file for why).
 
-## 8. Known limitations (as of 2026-08-13)
+## 8. Known limitations (as of 2026-09-14)
 
-- **§5's reconnect gap** — same-URL-reconnect-only recovery doesn't reliably handle a
-  camera-initiated KVS producer restart. Unresolved.
+- **§5's reconnect gap** — same-URL-reconnect-only recovery doesn't distinguish a transient
+  phone-side hiccup from a real camera-initiated stop, which (since `FR-CF-154`) needs a fresh
+  Start, not a same-URL retry. Unresolved.
+- `FR-CF-154`'s server-side pieces (quality-selective start/stop, reference counting, 30s lease
+  timeout, `CloudStreamStopped` event) are build-verified firmware-side only — **not yet
+  hardware-verified** as of this writing.
 - No WAN talk (two-way audio) — see `TWO_WAY_TALK_GUIDE.md`.
 - `stream_status: active` is not sufficient evidence of a healthy stream (§4) — no fix planned,
   this is inherent to what the status derivation observes; build your own diagnostics around it

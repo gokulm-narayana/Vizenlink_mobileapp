@@ -34,11 +34,29 @@ class SplashScreen extends StatefulWidget {
   State<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends State<SplashScreen> {
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late final _entranceController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 400),
+  );
+  late final _entranceOpacity = CurvedAnimation(
+    parent: _entranceController,
+    curve: Curves.easeOut,
+  );
+  late final _entranceScale = Tween<double>(begin: 0.9, end: 1.0).animate(
+    CurvedAnimation(parent: _entranceController, curve: Curves.easeOut),
+  );
+
   @override
   void initState() {
     super.initState();
-    widget.appReady.then((_) {
+    _entranceController.forward();
+    widget.appReady.then((_) async {
+      if (!mounted) return;
+      // Fade back out before handing off so the transition isn't an
+      // instant cut to the next screen.
+      await _entranceController.reverse(from: 1.0).orCancel.catchError((_) {});
       if (!mounted) return;
       final destination =
           widget.authController.status == AuthStatus.authenticated
@@ -49,18 +67,49 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   @override
+  void dispose() {
+    _entranceController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       key: const Key('SPLASH-001'),
       backgroundColor: isDark ? AppColors.darkBase : AppColors.lightBase,
       body: Center(
-        child: Image.asset(
-          key: const Key('SPLASH-002'),
-          isDark
-              ? 'assets/branding/vizenlink_dark.png'
-              : 'assets/branding/vizenlink_light.png',
-          width: 320,
+        child: FadeTransition(
+          opacity: _entranceOpacity,
+          child: ScaleTransition(
+            scale: _entranceScale,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Image.asset(
+                  key: const Key('SPLASH-002'),
+                  isDark
+                      ? 'assets/branding/vizenlink_dark.png'
+                      : 'assets/branding/vizenlink_light.png',
+                  width: 320,
+                ),
+                const SizedBox(height: 32),
+                SizedBox(
+                  key: const Key('SPLASH-003'),
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.5,
+                    valueColor: AlwaysStoppedAnimation(
+                      (isDark ? Colors.white : Colors.black).withValues(
+                        alpha: 0.35,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

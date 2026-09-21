@@ -49,3 +49,35 @@ The screen mapping below predates most of the integration work above and elsewhe
 - WAN classes consistently mirror a LAN counterpart one-for-one (per their own doc comments) — when integrating a setting, check both clients for that feature and confirm with the user which transport a given screen should call (or both, with fallback).
 - `rest_*.dart` files under `lan/nuraeye/` are machine-generated (marked `DO NOT HAND-EDIT` in `camera_api.dart`) — never touch those directly even under the "unavoidable change" exception; flag to the senior instead.
 - Several doc comments reference `FR-NE-*`/`FR-MOB-*` IDs — these likely correspond to entries in this workspace's `features/` — worth cross-referencing during `scenario-gap-audit`.
+
+## New in the 2026-09-07 client_code_inbox drop — documented only, not yet integrated
+
+This package is shared with a sibling app (`nuraeye-rt/mobile_app`, referenced elsewhere in this
+repo e.g. the Force LAN/WAN test menu) — the drop's own `SETTINGS_API_GUIDE.md`/`API_REFERENCE.md`
+describe screens that exist *there* (`EventSettingsScreen`, `recordings_screen.dart`) but not in
+*this* app. The mapping below is this app's own candidate screens, not the sibling's. Full
+method-level detail for all of these already lives in the package's own updated
+`API_REFERENCE.md`/`SETTINGS_API_GUIDE.md` (`packages/camera_api/` once synced from the inbox) —
+not duplicated here, same reasoning as this doc's header note about the package "not decomposing
+into a single copyable file."
+
+| Client class(es) | LAN / WAN pair | What it does | Candidate screen in *this* app |
+|---|---|---|---|
+| `RecordingsClient` (`lib/src/lan/nuraeye/recordings_client.dart`) | LAN only, no WAN counterpart yet | `GetRecordings` + a `Range`-capable clip playback/download URI, plain REST (`FR-NE-117`/`FR-NE-118`) — a real recordings list, replacing job-polling ONVIF Search after the sibling app found that a poor fit for a phone client | `camera_live_screen.dart`'s Playback tab — currently plays a single bundled ~1-minute dummy clip on a mocked day-timeline (`_mockRecordedRanges`); this is the real data source that timeline is standing in for |
+| `HealthClient` / `WanHealthClient` | LAN + WAN, same `HealthStatus` wire vocabulary | Read-only camera health/vitals (`FR-HLT-009`) — no matching Set | `camera_info_screen.dart`'s Health section (CAMINFO-031) — currently reads `Camera.healthConditionMessages`, mock data with no real API call behind it yet (per [camera_info_screen.md](../screens/camera_settings/camera_info_screen.md)) |
+| `LoiteringDurationClient` / `WanLoiteringDurationClient` | LAN + WAN | Dwell-time threshold (seconds) before a `Loitering` event fires, independent of `PersonDetected`'s own enable toggle (`FR-CF-150`/`FR-NE-121`); bounds come from `CapabilitiesClient` (`loiteringDurationMinSeconds`/`MaxSeconds`), not a separate Options command | No matching UI in this app yet — `person_detection_screen.dart` is the natural home (mirrors the sibling's `EventSettingsScreen` "Loitering" card), but that screen doesn't currently expose a duration control; flag as a gap for `scenario-gap-audit`/`ui-api-gap-audit` |
+| `BboxOverlayClient` / `WanBboxOverlayClient` | LAN + WAN | Whether the camera burns the AI detection bounding box into the video OSD (`FR-CF-151`/`FR-NE-123`) — purely a display toggle, independent of whether detection/alerts still fire (`bbox` keeps arriving in event payloads regardless); gated on `CameraCapabilities.bboxOverlayCapable` | Same gap as above — `person_detection_screen.dart`, no existing switch for this |
+| `onvif_recording_client.dart`, `onvif_replaycontrol_client.dart`, `onvif_search_client.dart` | LAN, ONVIF Recording/ReplayControl/Search services | **Superseded, not for integration** — the drop's own `recordings_client.dart` doc comment says the team moved *away* from this ONVIF Recording/Search-based design to the plain-REST `RecordingsClient` above, after finding ONVIF Search's async job-polling browse model a poor fit for a phone client. Kept here for reference/completeness of the drop, not because they're the intended integration path |
+
+**Other files in this drop with in-place edits** (not new classes — same class, updated
+behavior): `capabilities_client.dart`, `network_info_client.dart`, `nuraeye_client.dart`,
+`nuraeye_rest_client.dart`, `rest_capabilities_client.dart`, `rest_storage_client.dart`,
+`audio_capability_client.dart`, `mask_client.dart`, `onvif_imaging_client.dart`,
+`onvif_video_encoder_client.dart`, `osd_client.dart`, `speaker_volume_client.dart`,
+`iot_command_client.dart`, `camera_connection.dart`, `camera_api.dart` (exports). Not
+individually diffed/documented here — re-check each against its currently-integrated behavior
+before/while integrating, since some carry real behavior changes (e.g. `SETTINGS_API_GUIDE.md`'s
+diff shows `getImagingOptions()`/`getMaskOptions()` moving from client-internal caching to
+required app-layer caching — see `.claude/rules/mobile-app-screen-conventions.md`'s caching
+convention, which this app's `MaskClient` usage already follows per that file's own doc, so this
+may just be the drop catching up to a convention this app already implemented independently).

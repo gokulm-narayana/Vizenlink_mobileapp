@@ -5,6 +5,10 @@ class _FakeTransport implements IotTransport {
   final List<Map<String, dynamic>> published = [];
   final List<Map<String, dynamic>> publishedAndWaited = [];
 
+  /// Every `timeout` this transport was actually handed, in call order — backs the
+  /// timeout-pass-through tests below.
+  final List<Duration> timeouts = [];
+
   /// Queue of responses `publishAndWait` returns, in call order — `null` means "no reply"
   /// (timeout). Defaults to a single `{"status": "ok"}` reply if left empty.
   final List<Map<String, dynamic>?> replies = [];
@@ -21,33 +25,67 @@ class _FakeTransport implements IotTransport {
     Duration timeout = const Duration(seconds: 12),
   }) async {
     publishedAndWaited.add(body);
+    timeouts.add(timeout);
     if (replies.isEmpty) return {'status': 'ok'};
     return replies.removeAt(0);
   }
 }
 
 void main() {
-  test('sendStartCloudStreaming publishes command=0, no request_id (fire-and-forget)', () async {
-    final transport = _FakeTransport();
-    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+  test(
+    'sendStartCloudStreaming (FR-CF-154) goes through publishAndWait with params.quality, '
+    'returns the reply',
+    () async {
+      final transport = _FakeTransport()
+        ..replies.add({
+          'status': 'ok',
+          'output': {'token': 42, 'quality': 'high'},
+        });
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    await client.sendStartCloudStreaming();
+      final reply = await client.sendStartCloudStreaming('high');
 
-    expect(transport.published, [
-      {'command': IotCommandClient.startCloudStreaming},
-    ]);
-  });
+      expect(
+        transport.publishedAndWaited.single['command'],
+        IotCommandClient.startCloudStreaming,
+      );
+      expect(transport.publishedAndWaited.single['params'], {
+        'quality': 'high',
+      });
+      expect(reply, {'token': 42, 'quality': 'high'});
+    },
+  );
 
-  test('sendStopCloudStreaming publishes command=1', () async {
-    final transport = _FakeTransport();
-    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+  test(
+    'sendStopCloudStreaming publishes command=1 with params.token when given',
+    () async {
+      final transport = _FakeTransport();
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    await client.sendStopCloudStreaming();
+      await client.sendStopCloudStreaming(token: 42);
 
-    expect(transport.published, [
-      {'command': IotCommandClient.stopCloudStreaming},
-    ]);
-  });
+      expect(transport.published, [
+        {
+          'command': IotCommandClient.stopCloudStreaming,
+          'params': {'token': 42},
+        },
+      ]);
+    },
+  );
+
+  test(
+    'sendStopCloudStreaming with no token omits params (legacy stop-everything)',
+    () async {
+      final transport = _FakeTransport();
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+      await client.sendStopCloudStreaming();
+
+      expect(transport.published, [
+        {'command': IotCommandClient.stopCloudStreaming},
+      ]);
+    },
+  );
 
   test(
     'getCloudStreamingStatus goes through the generic publishAndWait request/response path '
@@ -60,9 +98,14 @@ void main() {
         });
       final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-      final output = await client.sendCommandWithResponse(IotCommandClient.getCloudStreamingStatus);
+      final output = await client.sendCommandWithResponse(
+        IotCommandClient.getCloudStreamingStatus,
+      );
 
-      expect(transport.publishedAndWaited.single['command'], IotCommandClient.getCloudStreamingStatus);
+      expect(
+        transport.publishedAndWaited.single['command'],
+        IotCommandClient.getCloudStreamingStatus,
+      );
       expect(output, {'stream_status': 'active'});
     },
   );
@@ -83,7 +126,11 @@ void main() {
       final transport = _FakeTransport()
         ..replies.add({
           'status': 'ok',
-          'output': {'type': 'Grey', 'color_capable': true, 'smart_capable': false},
+          'output': {
+            'type': 'Grey',
+            'color_capable': true,
+            'smart_capable': false,
+          },
         });
       final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
@@ -96,7 +143,11 @@ void main() {
       expect(body['command'], IotCommandClient.setNightVisionType);
       expect(body['params'], {'type': 'Grey'});
       expect(body['request_id'], isNotNull);
-      expect(output, {'type': 'Grey', 'color_capable': true, 'smart_capable': false});
+      expect(output, {
+        'type': 'Grey',
+        'color_capable': true,
+        'smart_capable': false,
+      });
     },
   );
 
@@ -112,25 +163,30 @@ void main() {
         });
       final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-      final output = await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
+      final output = await client.sendCommandWithResponse(
+        IotCommandClient.getMirrorFlip,
+      );
 
       expect(transport.publishedAndWaited.length, 2);
       expect(output, {'mode': 'Both'});
     },
   );
 
-  test('a second consecutive timeout is not retried again — it is surfaced', () async {
-    final transport = _FakeTransport()
-      ..replies.add(null)
-      ..replies.add(null);
-    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+  test(
+    'a second consecutive timeout is not retried again — it is surfaced',
+    () async {
+      final transport = _FakeTransport()
+        ..replies.add(null)
+        ..replies.add(null);
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    await expectLater(
-      client.sendCommandWithResponse(IotCommandClient.getMirrorFlip),
-      throwsA(predicate((e) => e.toString().contains('timed out'))),
-    );
-    expect(transport.publishedAndWaited.length, 2);
-  });
+      await expectLater(
+        client.sendCommandWithResponse(IotCommandClient.getMirrorFlip),
+        throwsA(predicate((e) => e.toString().contains('timed out'))),
+      );
+      expect(transport.publishedAndWaited.length, 2);
+    },
+  );
 
   test('a genuine camera-side failure is not retried', () async {
     final transport = _FakeTransport()..replies.add({'status': 'error'});
@@ -143,18 +199,24 @@ void main() {
     expect(transport.publishedAndWaited.length, 1);
   });
 
-  test('sendCommandWithResponse omits params entirely when none are given', () async {
-    final transport = _FakeTransport()
-      ..replies.add({
-        'status': 'ok',
-        'output': {'type': 'Grey'},
-      });
-    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+  test(
+    'sendCommandWithResponse omits params entirely when none are given',
+    () async {
+      final transport = _FakeTransport()
+        ..replies.add({
+          'status': 'ok',
+          'output': {'type': 'Grey'},
+        });
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-    await client.sendCommandWithResponse(IotCommandClient.getNightVisionType);
+      await client.sendCommandWithResponse(IotCommandClient.getNightVisionType);
 
-    expect(transport.publishedAndWaited.single.containsKey('params'), isFalse);
-  });
+      expect(
+        transport.publishedAndWaited.single.containsKey('params'),
+        isFalse,
+      );
+    },
+  );
 
   test(
     'a successful reply with no output field (every Set*/Delete* command\'s real shape) '
@@ -166,7 +228,9 @@ void main() {
       final transport = _FakeTransport()..replies.add({'status': 'ok'});
       final client = IotCommandClient('VZL-CAM-000001', transport: transport);
 
-      final output = await client.sendCommandWithResponse(IotCommandClient.setCameraLocation);
+      final output = await client.sendCommandWithResponse(
+        IotCommandClient.setCameraLocation,
+      );
 
       expect(output, isNotNull);
       expect(output, <String, dynamic>{});
@@ -180,7 +244,94 @@ void main() {
     await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
     await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
 
-    final ids = transport.publishedAndWaited.map((b) => b['request_id']).toSet();
+    final ids = transport.publishedAndWaited
+        .map((b) => b['request_id'])
+        .toSet();
     expect(ids.length, 2);
   });
+
+  test(
+    'sendCommandWithResponse defaults to a 12s wait when given no timeout',
+    () async {
+      final transport = _FakeTransport();
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+      await client.sendCommandWithResponse(IotCommandClient.getMirrorFlip);
+
+      expect(transport.timeouts.single, const Duration(seconds: 12));
+    },
+  );
+
+  test(
+    'sendCommandWithResponse passes timeoutSeconds through to the transport',
+    () async {
+      final transport = _FakeTransport();
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+      await client.sendCommandWithResponse(
+        IotCommandClient.getDeviceIdentity,
+        timeoutSeconds: 5,
+      );
+
+      expect(transport.timeouts.single, const Duration(seconds: 5));
+    },
+  );
+
+  test(
+    'retryOnTimeout: false makes a no-reply a single attempt instead of two — the Dashboard '
+    'reachability ping polls on its own schedule, so an inline retry only doubles its latency',
+    () async {
+      final transport = _FakeTransport()..replies.addAll([null]);
+      final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+      await expectLater(
+        client.sendCommandWithResponse(
+          IotCommandClient.getDeviceIdentity,
+          retryOnTimeout: false,
+        ),
+        throwsA(isA<Exception>()),
+      );
+      expect(transport.publishedAndWaited.length, 1);
+    },
+  );
+
+  test('retryOnTimeout still defaults to one retry on a no-reply', () async {
+    final transport = _FakeTransport()..replies.addAll([null, null]);
+    final client = IotCommandClient('VZL-CAM-000001', transport: transport);
+
+    await expectLater(
+      client.sendCommandWithResponse(IotCommandClient.getDeviceIdentity),
+      throwsA(isA<Exception>()),
+    );
+    expect(transport.publishedAndWaited.length, 2);
+  });
+
+  test(
+    'WanDeviceIdentityClient.getDeviceIdentity honours its own timeout parameter — real bug '
+    '2026-09-15: it was declared but never passed on, so a 5s ping silently waited 12s (x2 with '
+    'the retry), overrunning the Dashboard poll interval and marking healthy cameras offline',
+    () async {
+      final transport = _FakeTransport()
+        ..replies.addAll([
+          {
+            'status': 'ok',
+            'output': {'name': 'Front', 'location': 'Porch', 'timezone': 'UTC'},
+          },
+        ]);
+      final client = WanDeviceIdentityClient(
+        'VZL-CAM-000001',
+        iotCommandClient: IotCommandClient(
+          'VZL-CAM-000001',
+          transport: transport,
+        ),
+      );
+
+      final result = await client.getDeviceIdentity(
+        timeout: const Duration(seconds: 5),
+      );
+
+      expect(result, isA<CameraSuccess<dynamic>>());
+      expect(transport.timeouts.single, const Duration(seconds: 5));
+    },
+  );
 }

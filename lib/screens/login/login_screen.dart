@@ -24,19 +24,15 @@ class LoginScreen extends StatefulWidget {
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen>
-    with SingleTickerProviderStateMixin {
-  late final TabController _identifierTabController;
+class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
-  final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _isSubmitting = false;
 
   @override
   void initState() {
     super.initState();
-    _identifierTabController = TabController(length: 2, vsync: this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final expiredMessage = AuthController.instance.sessionExpiredMessage;
       if (expiredMessage != null && mounted) {
@@ -50,9 +46,7 @@ class _LoginScreenState extends State<LoginScreen>
 
   @override
   void dispose() {
-    _identifierTabController.dispose();
     _emailController.dispose();
-    _phoneController.dispose();
     _passwordController.dispose();
     super.dispose();
   }
@@ -64,17 +58,6 @@ class _LoginScreenState extends State<LoginScreen>
     return null;
   }
 
-  String? _validatePhone(String? value) {
-    if (value == null || value.trim().isEmpty) {
-      return 'Phone number is required';
-    }
-    final phonePattern = RegExp(r'^\+?[0-9]{7,15}$');
-    if (!phonePattern.hasMatch(value.trim())) {
-      return 'Enter a valid phone number';
-    }
-    return null;
-  }
-
   String? _validatePassword(String? value) {
     if (value == null || value.isEmpty) return 'Password is required';
     if (value.length < 6) return 'Password must be at least 6 characters';
@@ -83,15 +66,6 @@ class _LoginScreenState extends State<LoginScreen>
 
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
-
-    if (_identifierTabController.index != 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Phone sign-in is not available yet — use email.'),
-        ),
-      );
-      return;
-    }
 
     final email = _emailController.text.trim();
     final password = _passwordController.text;
@@ -182,51 +156,15 @@ class _LoginScreenState extends State<LoginScreen>
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(14),
-                            child: TabBar(
-                              key: const Key('LOGIN-002'),
-                              controller: _identifierTabController,
-                              tabs: const [
-                                Tab(text: 'Email'),
-                                Tab(text: 'Phone'),
-                              ],
+                          TextFormField(
+                            key: const Key('LOGIN-003'),
+                            controller: _emailController,
+                            keyboardType: TextInputType.emailAddress,
+                            decoration: const InputDecoration(
+                              labelText: 'Email',
+                              prefixIcon: Icon(Icons.mail_outline),
                             ),
-                          ),
-                          const SizedBox(height: 16),
-                          SizedBox(
-                            height: 72,
-                            child: TabBarView(
-                              controller: _identifierTabController,
-                              children: [
-                                TextFormField(
-                                  key: const Key('LOGIN-003'),
-                                  controller: _emailController,
-                                  keyboardType: TextInputType.emailAddress,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Email',
-                                    prefixIcon: Icon(Icons.mail_outline),
-                                  ),
-                                  validator: (value) =>
-                                      _identifierTabController.index == 0
-                                      ? _validateEmail(value)
-                                      : null,
-                                ),
-                                TextFormField(
-                                  key: const Key('LOGIN-004'),
-                                  controller: _phoneController,
-                                  keyboardType: TextInputType.phone,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Phone number',
-                                    prefixIcon: Icon(Icons.phone_outlined),
-                                  ),
-                                  validator: (value) =>
-                                      _identifierTabController.index == 1
-                                      ? _validatePhone(value)
-                                      : null,
-                                ),
-                              ],
-                            ),
+                            validator: _validateEmail,
                           ),
                           const SizedBox(height: 4),
                           PasswordFormField(
@@ -284,7 +222,7 @@ class _LoginScreenState extends State<LoginScreen>
                           OutlinedButton.icon(
                             key: const Key('LOGIN-008'),
                             onPressed: _submitWithGoogle,
-                            icon: const Icon(Icons.g_mobiledata, size: 28),
+                            icon: const Icon(Icons.account_circle_outlined),
                             label: const Text('Continue with Google'),
                           ),
                         ],

@@ -3,7 +3,6 @@ import 'package:go_router/go_router.dart';
 
 import '../../app_state/homes_controller.dart';
 import '../../models/camera.dart';
-import '../../utils/duration_format.dart';
 import '../../widgets/glass_card.dart';
 import '../../widgets/gradient_background.dart';
 import '../../widgets/navigation_leave_guard.dart';
@@ -79,18 +78,6 @@ class _RecordingScreenState extends State<RecordingScreen> {
       widget.camera.lineCrossingEnabled ||
       widget.camera.personDetectionEnabled ||
       widget.camera.vehicleDetectionEnabled;
-
-  String get _footageEstimate {
-    if (_mode == RecordingStatus.off) return 'No new footage is being recorded';
-    if (!widget.camera.sdStorageEnabled || !widget.camera.sdCardPresent) {
-      return 'No local storage available — see Storage settings';
-    }
-    final estimate = formatApproxDuration(
-      widget.camera.estimatedRecordingTimeRemaining,
-    );
-    return 'Approximately $estimate of footage can be stored locally at '
-        'current usage';
-  }
 
   void _markDirty(VoidCallback update) {
     setState(() {
@@ -314,19 +301,6 @@ class _RecordingScreenState extends State<RecordingScreen> {
                           ),
                       ],
                     ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                GlassCard(
-                  child: Row(
-                    children: [
-                      const Icon(Icons.sd_storage_outlined),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        key: const Key('REC-004'),
-                        child: Text(_footageEstimate),
-                      ),
-                    ],
                   ),
                 ),
                 if (showEventTriggeredWarning) ...[

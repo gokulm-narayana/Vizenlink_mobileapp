@@ -25,9 +25,7 @@ const _presetItems = [
 const _tapSelectionFraction = 0.22;
 
 /// Example questions shown in the empty state (AIMODE-023) to hint at what
-/// AI Mode can be asked beyond the "lost item" preset picker — same
-/// tap-to-send quick-prompt convention as the camera chatbot's
-/// `_quickPrompts` (`lib/widgets/camera_chatbot.dart`).
+/// AI Mode can be asked beyond the "lost item" preset picker.
 const _suggestedPrompts = [
   'What is this object?',
   'Who is this person?',

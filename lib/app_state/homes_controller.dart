@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/camera.dart';
 import '../models/home.dart';
 import 'camera_credentials_store.dart';
+import 'camera_settings_cache.dart';
 
 /// Marks a persisted `thumbnailUrl` as a filename under this app's own
 /// `camera_snapshots` documents subfolder (written by
@@ -71,6 +72,7 @@ Map<String, dynamic> _persistedCameraJson(String homeId, Camera camera) => {
   'warningCapable': camera.warningCapable,
   'thumbnailUrl': _persistableThumbnailUrl(camera.thumbnailUrl),
   'timezone': camera.timezone,
+  'location': camera.location,
 };
 
 ({String homeId, Camera camera})? _cameraFromPersistedJson(
@@ -104,12 +106,19 @@ Map<String, dynamic> _persistedCameraJson(String homeId, Camera camera) => {
       warningCapable: json['warningCapable'] as bool?,
       thumbnailUrl: json['thumbnailUrl'] as String?,
       timezone: json['timezone'] as String? ?? 'UTC',
+      location: json['location'] as String?,
     ),
   );
 }
 
 const maxHomes = 10;
 const maxRoomsPerHome = 10;
+
+/// Id of the debug-only test camera seeded by `HomesController._seedState`.
+/// Never persisted (see `HomesController._persistCameras`/`.load`) so it
+/// doesn't duplicate itself across app restarts — it's re-seeded fresh from
+/// `_seedState` every debug launch instead.
+const _debugTestCameraId = 'debug-test-camera';
 
 class HomesState {
   const HomesState({required this.homes, required this.selectedHomeId});
@@ -146,19 +155,25 @@ class HomesController extends ValueNotifier<HomesState> {
   /// Restores previously-added cameras (see [_persistedCameraJson]'s doc for
   /// what's actually saved) into the seeded homes/rooms. Call once at
   /// startup, awaited before the splash screen hands off — same convention
-  /// as [ThemeController.load]/`AiModelManager.load`. A camera whose saved
-  /// `homeId` no longer exists (e.g. a future seed change) is dropped rather
-  /// than crashing.
+  /// as [ThemeController.load]. A camera whose saved `homeId` no longer
+  /// exists (e.g. a future seed change) is dropped rather than crashing.
   Future<void> load() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_prefsKey);
       if (raw != null) {
         final decoded = jsonDecode(raw) as List<dynamic>;
-        final restored = [
-          for (final entry in decoded)
-            _cameraFromPersistedJson(entry as Map<String, dynamic>),
-        ].nonNulls.toList();
+        final restored =
+            [
+                  for (final entry in decoded)
+                    _cameraFromPersistedJson(entry as Map<String, dynamic>),
+                ].nonNulls
+                // Defensive: drop any pre-existing persisted copy of the
+                // debug-only seed camera from an install predating the guard
+                // in `_persistCameras`, so it can't duplicate the fresh one
+                // `_seedState` already added.
+                .where((r) => r.camera.id != _debugTestCameraId)
+                .toList();
         final docsDir = await getApplicationDocumentsDirectory();
         final withPasswords = <({String homeId, Camera camera})>[];
         for (final r in restored) {
@@ -200,6 +215,58 @@ class HomesController extends ValueNotifier<HomesState> {
     }
   }
 
+  /// Adds a debug-only test camera to the first home so screens (e.g. one
+  /// with no real hardware wired up yet) can be exercised without a real
+  /// camera — no `host`/`username`/connection, so it exercises every
+  /// screen's already-supported "no saved connection yet" local-only save
+  /// path, not a fake video/thumbnail standing in for real footage (which
+  /// this repo removed outright, see CLAUDE.md's dummy-video removal).
+  ///
+  /// Deliberately **not** part of [_seedState] — that runs for every
+  /// `HomesController()` instance, including ones built directly in tests,
+  /// which assert on specific camera counts/lists. Call this once from the
+  /// real app's own bootstrap (`main.dart`, guarded by `kDebugMode`) after
+  /// [load], never from a test. Idempotent — a second call is a no-op if
+  /// the debug camera is already present. Never persisted (see
+  /// [_persistCameras]) so it doesn't survive into a release build's data
+  /// and doesn't duplicate itself across debug-build restarts.
+  void addDebugTestCameraIfNeeded() {
+    final homes = value.homes;
+    if (homes.isEmpty) return;
+    final alreadyPresent = homes.any(
+      (home) => home.cameras.any((camera) => camera.id == _debugTestCameraId),
+    );
+    if (alreadyPresent) return;
+    final target = homes.first;
+    value = value.copyWith(
+      homes: [
+        for (final home in homes)
+          if (home.id == target.id)
+            home.copyWith(
+              cameras: [
+                ...home.cameras,
+                const Camera(
+                  id: _debugTestCameraId,
+                  name: 'Test Camera (Debug)',
+                  // `isOnline: true` despite having no real connection —
+                  // real bug found testing this: `camera_settings_screen.
+                  // dart` disables every settings section (Detections
+                  // included) whenever `isOnline` is false, which made this
+                  // fixture unusable for exactly what it exists for. Every
+                  // screen already falls back to its local-only save path
+                  // correctly when `connection` is null, regardless of
+                  // `isOnline` — so this doesn't skip any real code path.
+                  isOnline: true,
+                  room: 'Living Room',
+                ),
+              ],
+            )
+          else
+            home,
+      ],
+    );
+  }
+
   @override
   set value(HomesState newValue) {
     super.value = newValue;
@@ -211,7 +278,8 @@ class HomesController extends ValueNotifier<HomesState> {
     final entries = [
       for (final home in value.homes)
         for (final camera in home.cameras)
-          _persistedCameraJson(home.id, camera),
+          if (camera.id != _debugTestCameraId)
+            _persistedCameraJson(home.id, camera),
     ];
     await prefs.setString(_prefsKey, jsonEncode(entries));
   }
@@ -620,6 +688,21 @@ class HomesController extends ValueNotifier<HomesState> {
   }
 
   void deleteCamera(String homeId, String cameraId) {
+    // Captured before filtering: a stale NetworkAnswerCache entry for this
+    // host must not leak forward if the same camera (or another with the
+    // same IP) gets re-added later, possibly with different firmware/
+    // capabilities.
+    String? removedHost;
+    for (final home in value.homes) {
+      if (home.id != homeId) continue;
+      for (final camera in home.cameras) {
+        if (camera.id == cameraId) {
+          removedHost = camera.connection?.host;
+          break;
+        }
+      }
+    }
+
     final updated = [
       for (final home in value.homes)
         if (home.id == homeId)
@@ -633,6 +716,7 @@ class HomesController extends ValueNotifier<HomesState> {
     ];
     value = value.copyWith(homes: updated);
     unawaited(_credentialsStore.deletePassword(cameraId));
+    if (removedHost != null) NetworkAnswerCache.clearForHost(removedHost);
   }
 
   void reorderCameras(String homeId, int oldIndex, int newIndex) {

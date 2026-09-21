@@ -4,14 +4,13 @@ import 'dart:io' show Platform;
 import 'package:alerts_api/alerts_api.dart';
 import 'package:auth_api/auth_api.dart';
 import 'package:camera_api/camera_api.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 
-import 'app_state/ai_model_manager.dart';
 import 'app_state/alerts_controller.dart';
-import 'app_state/chat_controller.dart';
 import 'app_state/events_controller.dart';
 import 'app_state/homes_controller.dart';
 import 'app_state/preview_key_store.dart';
@@ -49,6 +48,7 @@ import 'screens/camera_settings/line_crossing_screen.dart';
 import 'screens/camera_settings/motion_detection_screen.dart';
 import 'screens/camera_settings/night_mode_screen.dart';
 import 'screens/camera_settings/on_screen_display_screen.dart';
+import 'screens/camera_settings/parking_monitoring_screen.dart';
 import 'screens/camera_settings/person_detection_screen.dart';
 import 'screens/camera_settings/privacy_mode_screen.dart';
 import 'screens/camera_settings/tags_screen.dart';
@@ -56,6 +56,7 @@ import 'screens/camera_settings/vehicle_detection_screen.dart';
 import 'screens/camera_settings/video_display_screen.dart';
 import 'screens/camera_settings/video_encoder_screen.dart';
 import 'screens/camera_settings/video_mode_screen.dart';
+import 'screens/camera_settings/video_stream_encoder_screen.dart';
 import 'screens/camera_settings/wifi_config_screen.dart';
 import 'screens/dashboard/dashboard_screen.dart';
 import 'screens/events/event_detail_screen.dart';
@@ -194,8 +195,6 @@ class _MobileCctvAppState extends State<MobileCctvApp>
   final _eventsController = EventsController();
   final _profileController = ProfileController();
   final _navigationGuard = NavigationGuardController();
-  final _aiModelManager = AiModelManager();
-  final _chatController = ChatController();
   late final GoRouter _router;
   late final Future<void> _appReady;
 
@@ -222,13 +221,21 @@ class _MobileCctvAppState extends State<MobileCctvApp>
     // 15-second minimum regardless of how fast loading actually finished,
     // making every app launch wait 15s even though this work normally
     // completes in milliseconds.
-    _appReady = Future.wait([
-      _themeController.load(),
-      _aiModelManager.load(),
-      _homesController.load(),
-      AuthController.instance.restore(),
-      _ensureRuntimePermissions(),
-    ]).then((_) => _syncAlertsListenerToAuthStatus());
+    _appReady =
+        Future.wait([
+          _themeController.load(),
+          _homesController.load(),
+          AuthController.instance.restore(),
+          _ensureRuntimePermissions(),
+        ]).then((_) {
+          _syncAlertsListenerToAuthStatus();
+          // Debug-only test fixture (see HomesController's own doc) — never
+          // runs in a release build, since kDebugMode is compiled out entirely
+          // there. Deliberately after `load()` above, not inside
+          // `HomesController`'s own constructor/seed, so tests that construct
+          // a bare `HomesController()` directly don't get it.
+          if (kDebugMode) _homesController.addDebugTestCameraIfNeeded();
+        });
     _router = _buildRouter();
   }
 
@@ -289,7 +296,6 @@ class _MobileCctvAppState extends State<MobileCctvApp>
     _alertsController.dispose();
     _eventsController.dispose();
     _navigationGuard.dispose();
-    _aiModelManager.dispose();
     super.dispose();
   }
 
@@ -339,8 +345,6 @@ class _MobileCctvAppState extends State<MobileCctvApp>
                     homesController: _homesController,
                     alertsController: _alertsController,
                     eventsController: _eventsController,
-                    aiModelManager: _aiModelManager,
-                    chatController: _chatController,
                   ),
                   routes: [
                     GoRoute(
@@ -436,6 +440,24 @@ class _MobileCctvAppState extends State<MobileCctvApp>
                                         camera: state.extra as Camera,
                                         homesController: _homesController,
                                       ),
+                                  routes: [
+                                    GoRoute(
+                                      path: VideoStreamEncoderScreen.routeName,
+                                      builder: (context, state) {
+                                        final args =
+                                            state.extra
+                                                as ({
+                                                  Camera camera,
+                                                  VideoStream stream,
+                                                });
+                                        return VideoStreamEncoderScreen(
+                                          camera: args.camera,
+                                          homesController: _homesController,
+                                          stream: args.stream,
+                                        );
+                                      },
+                                    ),
+                                  ],
                                 ),
                                 GoRoute(
                                   path: TagsScreen.routeName,
@@ -488,6 +510,14 @@ class _MobileCctvAppState extends State<MobileCctvApp>
                                   path: VehicleDetectionScreen.routeName,
                                   builder: (context, state) =>
                                       VehicleDetectionScreen(
+                                        camera: state.extra as Camera,
+                                        homesController: _homesController,
+                                      ),
+                                ),
+                                GoRoute(
+                                  path: ParkingMonitoringScreen.routeName,
+                                  builder: (context, state) =>
+                                      ParkingMonitoringScreen(
                                         camera: state.extra as Camera,
                                         homesController: _homesController,
                                       ),

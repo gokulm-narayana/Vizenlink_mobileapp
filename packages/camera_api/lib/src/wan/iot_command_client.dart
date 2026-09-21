@@ -195,13 +195,43 @@ class IotCommandClient {
   /// mirror of the LAN `GET /nuraeye/deterrence/durations/options` REST resource.
   static const getDeterrenceDurationOptions = 64;
 
-  /// `StartCloudStreaming`/`StopCloudStreaming` — fire-and-forget, no `request_id` (older command
-  /// shape, predates `FR-NE-053`'s request/response pattern — matches the reference exactly).
-  Future<void> _publish(int command) => _transport.publish(thingName, {'command': command});
+  /// `FR-HLT-009` (Stage 3, first slice), 2026-08-25 — WAN mirror of the LAN
+  /// `GET /nuraeye/health` REST resource. Read-only, no matching Set command.
+  static const getDeviceHealth = 70;
 
-  Future<void> sendStartCloudStreaming() => _publish(startCloudStreaming);
+  /// `FR-CF-150`/`FR-NE-121`: loitering-detection dwell threshold, in whole seconds — WAN
+  /// mirror of the LAN `GET`/`POST /nuraeye/events/loitering-duration` REST resource. Valid
+  /// range comes from `CameraCapabilities.loitering_duration_min_seconds`/`max_seconds` (fixed
+  /// compile-time bounds, not camera-reported per-value — no separate Options command, same as
+  /// `RecordingsClient`'s clip-duration setting).
+  static const setLoiteringDuration = 71;
+  static const getLoiteringDuration = 72;
 
-  Future<void> sendStopCloudStreaming() => _publish(stopCloudStreaming);
+  /// `FR-CF-151`/`FR-NE-123`: whether the camera draws the AI detection bounding-box overlay
+  /// (OSD burn-in) on the video stream — WAN mirror of the LAN `GET`/`POST
+  /// /nuraeye/events/bbox-overlay` REST resource. Independent of detection/alerts themselves;
+  /// no separate Options command — gate the UI on `CameraCapabilities.bboxOverlayCapable`
+  /// instead (a fixed build-time flag, not a per-value camera-reported range).
+  static const setBboxOverlayEnabled = 73;
+  static const getBboxOverlayEnabled = 74;
+
+  /// `StopCloudStreaming` stays fire-and-forget (older command shape, predates `FR-NE-053`'s
+  /// request/response pattern) — [token] is optional: omitting it falls back to the camera's
+  /// legacy blunt "stop every quality" behavior (`bsp_camera_setCloudStreaming(false)`).
+  Future<void> sendStopCloudStreaming({int? token}) =>
+      _transport.publish(thingName, {
+        'command': stopCloudStreaming,
+        if (token != null) 'params': {'token': token},
+      });
+
+  /// `FR-CF-154` (2026-09-14): unlike `StopCloudStreaming`, `StartCloudStreaming` now requires
+  /// `params.quality` and replies with the viewer's lease token — switched to request/response so
+  /// the app can read that token back, matching `GetCloudStreamingStatus`'s existing shape.
+  Future<Map<String, dynamic>?> sendStartCloudStreaming(String quality) =>
+      sendCommandWithResponse(
+        startCloudStreaming,
+        params: {'quality': quality},
+      );
 
   /// [isRetry] is internal — set by the one-shot retry below, never pass it explicitly.
   ///
@@ -232,7 +262,12 @@ class IotCommandClient {
       if (isRetry) {
         throw Exception('No response from camera (timed out)');
       }
-      return _publishAndWait(command, params: params, timeout: timeout, isRetry: true);
+      return _publishAndWait(
+        command,
+        params: params,
+        timeout: timeout,
+        isRetry: true,
+      );
     }
     if (reply['status'] != 'ok') {
       throw Exception('Command $command failed on camera');
@@ -249,10 +284,18 @@ class IotCommandClient {
   /// [timeoutSeconds], if given, overrides the default ~12s wait for the camera's reply — for a
   /// command known to legitimately take longer (e.g. [getPreviewSnapshot]'s on-device capture +
   /// RSA-2048 encrypt), not a general escape hatch.
+  ///
+  /// [retryOnTimeout] (default `true`) opts out of the one-shot retry documented on
+  /// [_publishAndWait]. Only pass `false` from a caller that already polls on its own schedule —
+  /// the Dashboard's 15s reachability ping, where the retry doubles worst-case latency to buy a
+  /// second chance the next tick provides anyway. Every user-initiated Get/Set should keep the
+  /// retry: for those, a missing reply is a one-shot failure the user would otherwise have to
+  /// notice and redo manually.
   Future<Map<String, dynamic>?> sendCommandWithResponse(
     int command, {
     Map<String, dynamic>? params,
     double? timeoutSeconds,
+    bool retryOnTimeout = true,
   }) async {
     final reply = await _publishAndWait(
       command,
@@ -260,6 +303,9 @@ class IotCommandClient {
       timeout: timeoutSeconds != null
           ? Duration(milliseconds: (timeoutSeconds * 1000).round())
           : const Duration(seconds: 12),
+      // `isRetry: true` on the first attempt makes the no-reply path below throw immediately
+      // instead of scheduling the retry — same branch, no duplicate logic.
+      isRetry: !retryOnTimeout,
     );
     if (reply == null) return null; // genuine timeout — no reply arrived at all
     // [AI Fix] Get/Set response asymmetry (see `.claude/rules/cloud-components.md` — the exact

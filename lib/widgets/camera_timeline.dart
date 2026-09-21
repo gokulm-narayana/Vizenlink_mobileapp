@@ -7,6 +7,11 @@ import 'glass_card.dart';
 /// used by either screen.
 const kRecordedBandColor = Color(0xFF38BDF8);
 
+/// Floor on how narrow a single recorded-range segment (`_buildRecordingBand`)
+/// is ever allowed to render, regardless of the real clip's own proportional
+/// width at the current zoom level — see that method's own doc comment.
+const _minRecordedBandWidth = 6.0;
+
 /// A contiguous span of the day (as a 0..1 fraction) for which footage
 /// exists. Anything not covered by a [TimelineRange] renders as a gray dead
 /// zone instead of the blue "recorded" band.
@@ -98,6 +103,7 @@ class CameraTimeline extends StatefulWidget {
     required this.needleFraction,
     required this.onNeedleFractionChanged,
     this.enforceRecordingBounds = false,
+    this.showTickLabels = true,
     this.selectionStartFraction,
     this.selectionEndFraction,
     this.onSelectionChanged,
@@ -124,6 +130,20 @@ class CameraTimeline extends StatefulWidget {
   final ValueChanged<double> onNeedleFractionChanged;
 
   final bool enforceRecordingBounds;
+
+  /// Whether each ruler tick shows its own "HH:MM" text label beneath it.
+  /// **Off for Playback** (`camera_live_screen.dart`, 2026-09-07 — direct
+  /// user request: "remove that line... only auto scroll the line bar") —
+  /// a tick label sitting at the exact edge of the scrolled-to viewport
+  /// could render as a stray clipped fragment (e.g. a bare "0" or "1"
+  /// instead of a real "13:30"), read as the needle/playback position
+  /// being out of sync when it never actually was. Removing the labels
+  /// entirely (keeping the tick lines and the single big time-of-day
+  /// readout in the header) sidesteps that whole class of bug rather than
+  /// patching the clipping further. **Still on for Events** (unchanged,
+  /// [events_screen.md]'s EVT-007), where hour markers along the bar are
+  /// more useful than they are for Playback's own always-visible needle.
+  final bool showTickLabels;
 
   final double? selectionStartFraction;
   final double? selectionEndFraction;
@@ -159,6 +179,23 @@ class _CameraTimelineState extends State<CameraTimeline> {
   bool _didSetInitialOffset = false;
   double _viewportWidth = 0;
   _ActiveHandle? _activeHandle;
+
+  /// True for the duration of a programmatic `_centerOn(..., animate:
+  /// true)` scroll (e.g. re-centering on an externally-driven
+  /// [needleFraction] change, like the Playback tab's video advancing
+  /// during normal playback). [_onScroll] fires on every intermediate
+  /// frame of that animation the same as a real user scroll, since
+  /// `ScrollController.animateTo` posts scroll notifications throughout —
+  /// without this guard, each of those intermediate frames re-emitted
+  /// [onNeedleFractionChanged] with a value ahead of where the video
+  /// actually was, and `_PlaybackTabState._seekToFraction` seeking on each
+  /// one compounded into the video visibly playing at roughly 2x speed
+  /// with stutter ("gaps") — a feedback loop between this widget centering
+  /// itself on the video's position and its own centering motion being
+  /// mistaken for a fresh user-driven position to seek to. Real bug, not
+  /// video-encoding related — found 2026-08-28 after ruling out the
+  /// bundled sample clip's frame rate.
+  bool _isProgrammaticCenter = false;
 
   TimelineZoomLevel get _level => kCameraTimelineZoomLevels[_levelIndex];
   double get _totalWidth => _level.pixelsPerHour * 24;
@@ -224,17 +261,46 @@ class _CameraTimelineState extends State<CameraTimeline> {
     final centerX = _controller.offset + viewport / 2;
     final fraction = (centerX / _totalWidth).clamp(0.0, 1.0);
     setState(() => _fraction = fraction);
+    // Don't echo this frame back as a "new" position while we're the ones
+    // driving the scroll (see [_isProgrammaticCenter]'s doc) — otherwise
+    // every intermediate animation frame re-triggers a seek ahead of where
+    // the video/needle actually is.
+    if (_isProgrammaticCenter) return;
     _lastEmittedFraction = fraction;
     widget.onNeedleFractionChanged(fraction);
   }
 
+  /// Real bug, found 2026-09-07 via a stack-overflow crash with real
+  /// (sparse, short-clip) recording data: `ScrollController.animateTo`
+  /// short-circuits to a synchronous `jumpTo` whenever the target is
+  /// already at/near the current offset (Flutter's own "nearEqual" check),
+  /// and `jumpTo` *unconditionally* fires a new `ScrollEndNotification`
+  /// before returning — which re-enters this exact method. If the computed
+  /// snap target lands back on the same not-recorded fraction (e.g. we're
+  /// already sitting at whichever timeline edge is nearest to a gap with
+  /// nothing recorded on either side), every call recomputes the identical
+  /// target, `animateTo` takes the identical `jumpTo` shortcut, and the
+  /// notification fires again — infinite synchronous recursion until the
+  /// call stack overflows. The old mocked ranges (always wide, tens-of-
+  /// minutes blocks) essentially never left the scrubber sitting exactly at
+  /// an unrecorded edge with no closer target to converge to; real clip
+  /// data does. This guard makes a re-entrant call while already handling
+  /// one a no-op instead of recursing.
+  bool _isHandlingScrollEnd = false;
+
   void _onScrollEnd() {
+    if (_isHandlingScrollEnd) return;
     if (!widget.enforceRecordingBounds) return;
     if (_isRecorded(_fraction)) return;
-    final snapped = _nearestRecordedFraction(_fraction);
-    _centerOn(snapped * 24 * 60, animate: true);
-    _lastEmittedFraction = snapped;
-    widget.onNeedleFractionChanged(snapped);
+    _isHandlingScrollEnd = true;
+    try {
+      final snapped = _nearestRecordedFraction(_fraction);
+      _centerOn(snapped * 24 * 60, animate: true);
+      _lastEmittedFraction = snapped;
+      widget.onNeedleFractionChanged(snapped);
+    } finally {
+      _isHandlingScrollEnd = false;
+    }
   }
 
   void _centerOn(double minutes, {bool animate = false}) {
@@ -243,11 +309,14 @@ class _CameraTimelineState extends State<CameraTimeline> {
     final offset = (minutes / (24 * 60)) * _totalWidth - sidePadding;
     final clamped = offset.clamp(0.0, _totalWidth);
     if (animate) {
-      _controller.animateTo(
-        clamped,
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeOut,
-      );
+      _isProgrammaticCenter = true;
+      _controller
+          .animateTo(
+            clamped,
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+          )
+          .whenComplete(() => _isProgrammaticCenter = false);
     } else {
       _controller.jumpTo(clamped);
     }
@@ -467,18 +536,32 @@ class _CameraTimelineState extends State<CameraTimeline> {
         clipBehavior: Clip.none,
         children: [
           for (final range in widget.recordedRanges)
-            Positioned(
-              left: range.start * _totalWidth,
-              width: (range.end - range.start) * _totalWidth,
-              top: 0,
-              bottom: 0,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: kRecordedBandColor.withValues(alpha: 0.55),
-                  borderRadius: BorderRadius.circular(6),
+            if (range.end > range.start)
+              Positioned(
+                // A short real clip (event-triggered recordings are often
+                // just seconds long) can compute to well under a pixel wide
+                // at a zoomed-out level like Day (70px/hour here) —
+                // clamping to a minimum width keeps every real recording
+                // visibly represented as at least a thin tick, instead of
+                // silently disappearing. The old mocked ranges never
+                // exposed this since they were always tens of minutes wide.
+                left: (range.start * _totalWidth).clamp(
+                  0.0,
+                  _totalWidth - _minRecordedBandWidth,
+                ),
+                width: ((range.end - range.start) * _totalWidth).clamp(
+                  _minRecordedBandWidth,
+                  _totalWidth,
+                ),
+                top: 0,
+                bottom: 0,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: kRecordedBandColor.withValues(alpha: 0.85),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
                 ),
               ),
-            ),
         ],
       ),
     );
@@ -489,6 +572,35 @@ class _CameraTimelineState extends State<CameraTimeline> {
     final pixelsPerMinute = _level.pixelsPerHour / 60;
     final widgets = <Widget>[];
     final subdivide = _level.tickMinutes >= 5;
+
+    // Real bug, found 2026-09-07 from a direct user report ("scroll time
+    // and line is not sync") — a tick label sitting right at the edge of
+    // the currently-scrolled-to viewport rendered as just a stray
+    // fragment (e.g. "0", later "1" at the opposite edge, instead of a
+    // real "13:30"), read as the needle and playback position being out
+    // of sync when they weren't (the video's own burned-in timestamp
+    // matched the needle's real time exactly). The label box itself was
+    // never actually wrong — only *partially* visible, clipped by the
+    // scroll viewport's own edge, the same way any horizontally-scrolling
+    // ruler clips content mid-scroll. Skipping a label entirely (keeping
+    // its tick line) whenever its own 48px box wouldn't render fully
+    // on-screen avoids ever showing that confusing fragment.
+    //
+    // First attempt at this fix (same day) compared a tick's content-local
+    // `left` directly against `_controller.offset` — still visibly broken
+    // (confirmed via a follow-up screenshot showing a bare "1" at the
+    // *right* edge this time) because `_controller.offset` is measured in
+    // the scroll view's own coordinate space, which is `sidePadding`
+    // (`_viewportWidth / 2`) ahead of a tick's content-local `left` — the
+    // `SingleChildScrollView`'s own `padding: EdgeInsets.symmetric(
+    // horizontal: sidePadding)` shifts everything inside it right by that
+    // amount relative to scroll offset 0. Converting the visible window
+    // into that same content-local space (`offset - sidePadding` ..
+    // `offset + sidePadding`) before comparing is what actually fixes it.
+    final sidePadding = _viewportWidth / 2;
+    final offset = _controller.hasClients ? _controller.offset : sidePadding;
+    final visibleLeft = offset - sidePadding;
+    final visibleRight = offset + sidePadding;
 
     for (var m = 0; m <= 24 * 60; m += _level.tickMinutes) {
       final left = m * pixelsPerMinute;
@@ -514,18 +626,24 @@ class _CameraTimelineState extends State<CameraTimeline> {
           ),
         ),
       );
-      widgets.add(
-        Positioned(
-          left: left - 24,
-          bottom: 0,
-          width: 48,
-          child: Text(
-            _tickLabel(m, _level.tickMinutes),
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium,
+      final labelLeft = left - 24;
+      final labelFullyVisible =
+          _viewportWidth <= 0 ||
+          (labelLeft >= visibleLeft && labelLeft + 48 <= visibleRight);
+      if (widget.showTickLabels && labelFullyVisible) {
+        widgets.add(
+          Positioned(
+            left: labelLeft,
+            bottom: 0,
+            width: 48,
+            child: Text(
+              _tickLabel(m, _level.tickMinutes),
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
           ),
-        ),
-      );
+        );
+      }
       if (subdivide && m < 24 * 60) {
         final subLeft = left + (_level.tickMinutes / 2) * pixelsPerMinute;
         widgets.add(
